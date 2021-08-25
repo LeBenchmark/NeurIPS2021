@@ -19,5 +19,5 @@ Our benchmark tasks are available on the following directories:
 
 [AST: Automatic Speech Translation](https://github.com/LeBenchmark/Interspeech2021/tree/main/AST)
 
-Detailed descriptions of experiments and results are given in on our paper: https://arxiv.org/pdf/2104.11462.pdf
+Detailed descriptions of experiments and results are given in on our paper: TBC !
 
