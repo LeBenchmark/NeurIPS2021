@@ -1,0 +1,6 @@
+# ninja log v5
+1	371	1621967936898660074	/home/sina/Programs/fairseq/build/temp.linux-x86_64-3.8/fairseq/clib/libbleu/module.o	403192de4a7ee9f6
+0	509	1621967937034660485	/home/sina/Programs/fairseq/build/temp.linux-x86_64-3.8/fairseq/clib/libbleu/libbleu.o	652abffc59593f56
+0	3621	1621967940782671807	/home/sina/Programs/fairseq/build/temp.linux-x86_64-3.8/fairseq/data/data_utils_fast.o	c3023a94690f057c
+0	3753	1621967944650683503	/home/sina/Programs/fairseq/build/temp.linux-x86_64-3.8/fairseq/data/token_block_utils_fast.o	6d24d362c1078cd8
+0	13759	1621967958530725555	/home/sina/Programs/fairseq/build/temp.linux-x86_64-3.8/fairseq/clib/libnat/edit_dist.o	dedd3862d7afae0c
