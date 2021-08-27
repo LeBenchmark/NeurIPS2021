@@ -11,13 +11,13 @@ Our pre-trained SSL models for French are available through this HuggingFace lin
 
 Our benchmark tasks are available on the following directories:
 
-[ASR: Automatic Speech Recognition](https://github.com/LeBenchmark/Interspeech2021/tree/main/ASR)
+[ASR: Automatic Speech Recognition](https://github.com/LeBenchmark/NeurIPS2021/tree/main/ASR)
 
-[SLU: Spoken Language Understanding](https://github.com/LeBenchmark/Interspeech2021/tree/main/SLU)
+[SLU: Spoken Language Understanding](https://github.com/LeBenchmark/NeurIPS2021/tree/main/SLU)
 
-[AER: Automatic Emotion Recognition](https://github.com/LeBenchmark/Interspeech2021/tree/main/AER)
+[AER: Automatic Emotion Recognition](https://github.com/LeBenchmark/NeurIPS2021/tree/main/AER)
 
-[AST: Automatic Speech Translation](https://github.com/LeBenchmark/Interspeech2021/tree/main/AST)
+[AST: Automatic Speech Translation](https://github.com/LeBenchmark/NeurIPS2021/tree/main/AST)
 
 Detailed descriptions of experiments and results are given in on our paper: TBC !
 
