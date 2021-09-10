@@ -14,6 +14,7 @@ class Experiment():
             "feature": "", # which feature to read (if needed, e.g. if not wav as input, can be left as "")
             "annotation": "" # path to data.json file (if needed, can be left as "")
             }
+        self.testOn = "test"
         self.device = "cpu" # "cpu" or "cuda"
         self.batchSize = 1
         self.model = "Transformer"
@@ -26,6 +27,8 @@ class Experiment():
         self.minForTolerance = 20
         self.inputDim = 40
         self.outputDim = 1
+        self.limitTrainData = False
+        self.limitDevData   = False
         self.evaluation = {"CCC":0.0, "MSE":0.0}
         if loadPath!="": self.loadFromJson(loadPath)
 
