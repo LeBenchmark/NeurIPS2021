@@ -131,5 +131,6 @@ fi
 if [ $stage -le 12 ]; then
   local/chain/run_tdnn_w2v.sh || exit 1
 fi
+
 echo "$0: success."
 exit 0
