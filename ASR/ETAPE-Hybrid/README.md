@@ -10,7 +10,13 @@ ETAPE-1,2 French corpus: 30 hours of French radio and TV data
 https://catalogue.elra.info/en-us/repository/browse/ELRA-E0046/
 
 ## Results
-Results are reported in https://arxiv.org/pdf/2104.11462.pdf, Table 2.
+
+### Results obtained using a scoring script ...link to be added... (with normalization)  and reported in https://openreview.net/pdf?id=TSvj5dmuSd, Table 2:
+
+...table to be added...
+
+### Results with the default Kaldi scoring (without normalization):
+
 <table>
   <thead>
     <tr>
@@ -38,7 +44,7 @@ Results are reported in https://arxiv.org/pdf/2104.11462.pdf, Table 2.
     <td>37.73</td>
    </tr>
    <tr> 
-    <td><a href=https://huggingface.co/LeBenchmark/wav2vec2-FR-M-large>W2V2-Fr-M-large</a></td>
+    <td><a href=https://huggingface.co/LeBenchmark/wav2vec2-FR-3K-large>W2V2-Fr-3K-large</a></td>
     <td>32.19</td>
     <td>33.87</td>
     <td>28.53</td>
