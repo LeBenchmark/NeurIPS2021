@@ -13,9 +13,6 @@ https://catalogue.elra.info/en-us/repository/browse/ELRA-E0046/
 
 #### Results obtained using a scoring script ...link to be added... (with normalization)  and reported in https://openreview.net/pdf?id=TSvj5dmuSd, Table 2:
 
-...table to be updated...
-
-
 <table>
   <thead>
     <tr>
