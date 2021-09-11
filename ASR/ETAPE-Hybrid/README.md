@@ -43,7 +43,7 @@ https://catalogue.elra.info/en-us/repository/browse/ELRA-E0046/
     <td>35.60</td>
     <td>37.73</td>
    </tr>
-     <tr>
+   <tr>
     <td><a href=https://dl.fbaipublicfiles.com/fairseq/wav2vec/libri960_big.pt>W2V2-En-large</a></td>
     <td>39.93</td>
     <td>42.30</td>
@@ -57,24 +57,25 @@ https://catalogue.elra.info/en-us/repository/browse/ELRA-E0046/
     <td>32.81</td>
     <td>35.17</td>
    </tr>
-    <tr> 
+   <tr> 
     <td><a href=https://huggingface.co/LeBenchmark/wav2vec2-FR-1K-base>W2V2-Fr-1K-base</a></td>
     <td>40.79</td>
     <td>43.75</td>
-    <td>37.61</td
+    <td>37.61</td>
     <td>41.11</td>
    </tr>
-    <tr> 
+   <tr> 
     <td><a href=https://huggingface.co/LeBenchmark/wav2vec2-FR-1K-large>W2V2-Fr-1K-large</a></td>
     <td>39.84</td>
     <td>42.06</td>
     <td>36.31</td>
     <td>39.09</td>
    </tr>
+    <tr>
    <td><a href=https://huggingface.co/LeBenchmark/wav2vec2-FR-2.6K-base>W2V2-Fr-2.6K-base</a></td>
     <td>33.83</td>
     <td>35.78</td>
-    <td>30.34</td
+    <td>30.34</td>
     <td>33.05</td>
    </tr>
    <tr> 
