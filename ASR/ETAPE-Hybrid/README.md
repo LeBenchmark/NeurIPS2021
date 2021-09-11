@@ -99,5 +99,19 @@ https://catalogue.elra.info/en-us/repository/browse/ELRA-E0046/
     <td>26.58</td>
     <td>28.73</td>
    </tr>
+   <tr>
+    <td>W2V2-Fr-3K-large (fine-tuned on ETAPE, E2E task)</a></td>
+    <td>30.36</td>
+    <td>31.77</td>
+    <td>27.03</td>
+    <td>29.17</td>
+   </tr>
+    <tr> 
+    <td>W2V2-Fr-7K-large (fine-tuned on ETAPE, E2E task)</a></td>
+    <td>30.02</td>
+    <td>31.43</td>
+    <td>26.43</td>
+    <td>28.65</td>
+   </tr>
   </tbody>
 </table>
