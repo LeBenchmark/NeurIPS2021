@@ -8,7 +8,7 @@ Automatic speech-to-text translation (AST) consists in translating a speech utte
 &nbsp;&nbsp;&nbsp;&nbsp;2.1. [Dataset](#21-dataset)   
 &nbsp;&nbsp;&nbsp;&nbsp;2.2. [Installation](#22-installation)  
 **3. [Feature preparation](#3-feature-preparation)**  
-&nbsp;&nbsp;&nbsp;&nbsp;3.1. [Task-agnostic pre-training](#31-Task-agnostic-pre-training)  
+&nbsp;&nbsp;&nbsp;&nbsp;3.1. [Task-agnostic pre-training](#31-task-agnostic-pre-training)  
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3.1.1. [log-Mel filterbank features](#311-log-mel-filterbank-features)  
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3.1.2. [wav2vec features](#312-wav2vec-features)   
 &nbsp;&nbsp;&nbsp;&nbsp;3.2. [Self-supervised fine-tuning on mTEDx](#32-self-supervised-fine-tuning-on-mtedx)   
@@ -16,8 +16,7 @@ Automatic speech-to-text translation (AST) consists in translating a speech utte
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3.2.2. [Extract features from obtained wav2vec models](#322-extract-features-from-obtained-wav2vec-models)   
 &nbsp;&nbsp;&nbsp;&nbsp;3.3. [Supervised fine-tuning for ASR on mTEDx](#33-supervised-fine-tuning-for-asr-on-mtedx)   
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3.3.1. [Perform supervised fine-tuning for ASR on mTEDx](#331-perform-supervised-fine-tuning-for-asr-on-mtedx)   
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3.3.2. [Extract features from obtained wav2vec models](#332-extract-features-from-obtained-wav2vec-models)
-
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3.3.2. [Extract features from obtained wav2vec models](#332-extract-features-from-obtained-wav2vec-models)   
 **4. [Training ST models](#4-training-st-models)**  
 **5. [Decoding](#5-decoding)**  
 
@@ -33,7 +32,6 @@ The baselines in our experiments are models using log-Mel filterbank features (`
       <th colspan="3">Valid data</th>
       <th colspan="3">Test data</th>
 	  <th colspan="2">Links to models</th>
-      <th></th>
     </tr>
   </thead>
     <thead>
@@ -62,9 +60,7 @@ The baselines in our experiments are models using log-Mel filterbank features (`
 	 <td><a href=https://zenodo.org/record/5502207/files/mtedx_fr2en_log_mel_fbank.pt?download=1>fr-en</a>,<a href=https://zenodo.org/record/5502207/files/mtedx_fr2es_log_mel_fbank.pt?download=1>fr-es</a>,<a href=https://zenodo.org/record/5502207/files/mtedx_fr2pt_log_mel_fbank.pt?download=1>fr-pt</a></td>
 </tr>
     <tr>
-      <th></th>
-      <th colspan="10">(a) Task agnostic pre-training</th>
-      <th></th>
+      <th colspan="9">(a) Task agnostic pre-training</th>
     </tr>
 <tr>
 	 <td>En-base</td>
@@ -177,9 +173,7 @@ The baselines in our experiments are models using log-Mel filterbank features (`
 	 <td><a href=https://zenodo.org/record/5502207/files/mtedx_fr2en_xlsr53.pt?download=1>fr-en</a>,<a href=https://zenodo.org/record/5502207/files/mtedx_fr2es_xlsr53.pt?download=1>fr-es</a>,<a href=https://zenodo.org/record/5502207/files/mtedx_fr2pt_xlsr53.pt?download=1>fr-pt</a></td>
 </tr>
 	<tr>
-      <th></th>
-      <th colspan="10">(b) Task specific pre-training (self-supervised on mTEDX)</th>
-      <th></th>
+      <th colspan="9">(b) Task specific pre-training (self-supervised on mTEDX)</th>
     </tr>
 <tr>
 	 <td>Fr-3K-large</td>
@@ -216,9 +210,7 @@ The baselines in our experiments are models using log-Mel filterbank features (`
 </tr>
 </tr>
 	<tr>
-      <th></th>
-      <th colspan="10">(c) Task specific pre-training (fine-tuned for ASR on mTEDX)</th>
-      <th></th>
+      <th colspan="9">(c) Task specific pre-training (fine-tuned for ASR on mTEDX)</th>
     </tr>
 <tr>
 	 <td>Fr-3K-large</td>
@@ -298,9 +290,9 @@ pip install -e .
 ### 3.1.1. log-Mel filterbank features
 ```bash
 python examples/speech_to_text/prep_mtedx_data.py --data-root ${MTEDX_ROOT} \
-												  --vocab-type unigram \
-												  --vocab-size 1000 \
-												  --task st
+						  --vocab-type unigram \
+						  --vocab-size 1000 \
+						  --task st
 ```
 ### 3.1.2. wav2vec features
 ```bash
@@ -353,13 +345,13 @@ where
 To perform self-supervised fine-tuning on mTEDx, please run the following command:
 ```bash
 fairseq-hydra-train \
-			common.tensorboard_logdir=${TENSORBOARD_DIR} \
-			checkpoint.save_dir=${SAVE_DIR} \
-			checkpoint.restore_file=${PRETRAINED_W2V2_PATH} \
-			checkpoint.reset_meters=true \
-			task.data=${DATA_DIR} \
-			--config-dir NeurIPS2021/AST/configs \
-			--config-name ${MODEL_CONFIG}
+	common.tensorboard_logdir=${TENSORBOARD_DIR} \
+	checkpoint.save_dir=${SAVE_DIR} \
+	checkpoint.restore_file=${PRETRAINED_W2V2_PATH} \
+	checkpoint.reset_meters=true \
+	task.data=${DATA_DIR} \
+	--config-dir NeurIPS2021/AST/configs \
+	--config-name ${MODEL_CONFIG}
 ```
 where 
 - `$TENSORBOARD_DIR$` is path to save the tensorboard, 
@@ -367,7 +359,7 @@ where
 - `${MODEL_CONFIG}` is the training configuration. The main hyperparameters are the same as in `example/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml` for self-supervised fine-tuning and `example/wav2vec/config/pretraining/vox100h.yaml` for supervised fine-tuning. Please refer to `NeurIPS2021/AST/configs` for the configuration files that we used in our experiments.
 
 
-### 3.2.2. Extracting features from obtained wav2vec models
+### 3.2.2. Extract features from obtained wav2vec models
 Please follow [Section 3.1.2](#312-wav2vec-features) to extract features from the obtained self-supervised fine-tuned wav2vec models. `$W2V2_PATH` is the path to the best checkpoint (`checkpoint_best.pt`) obtained from the training in [Section 3.2.1](#321-perform-self-supervised-fine-tuning-on-mtedx).
 
 
@@ -386,16 +378,16 @@ then copy the obtained dictionary to `$DATA_DIR/dict.ltr.txt`.
 To perform supervised fine-tuning for ASR on mTEDx, please run the following command:
 ```bash
 fairseq-hydra-train \
-		common.tensorboard_logdir=${TENSORBOARD_DIR} \
-		checkpoint.save_dir=${SAVE_DIR} \
-		task.data=${DATA_DIR} \
-		model.w2v_path=${PRETRAINED_W2V2_PATH} \
-		--config-dir NeurIPS2021/AST/configs \
-		--config-name ${MODEL_CONFIG}
+	common.tensorboard_logdir=${TENSORBOARD_DIR} \
+	checkpoint.save_dir=${SAVE_DIR} \
+	task.data=${DATA_DIR} \
+	model.w2v_path=${PRETRAINED_W2V2_PATH} \
+	--config-dir NeurIPS2021/AST/configs \
+	--config-name ${MODEL_CONFIG}
 ```
 
 
-### 3.3.2. Extracting features from obtained wav2vec models
+### 3.3.2. Extract features from obtained wav2vec models
 Please refer to [Section 3.1.2](#312-wav2vec-features) for the feature extraction step.
 
 **NOTE:** Please add `--w2v-ctc` to the command line in [Section 3.1.2](#312-wav2vec-features) to extract features from supervised fine-tuned wav2vec models.
@@ -408,29 +400,29 @@ run the following command:
 
 ```bash
 fairseq-train ${MTEDX_ROOT}/${LANG_PAIR} \
-    --train-subset train_st \
-    --valid-subset valid_st\
-    --config-yaml config_st.yaml \
-    --save-dir ${ST_SAVE_DIR} \
-    --num-workers 4 \
+	--train-subset train_st \
+	--valid-subset valid_st\
+	--config-yaml config_st.yaml \
+	--save-dir ${ST_SAVE_DIR} \
+	--num-workers 4 \
 	--max-tokens 40000 \
 	--max-source-positions 150000 \
 	--max-target-positions 8192 \
-    --task speech_to_text \
-    --criterion label_smoothed_cross_entropy \
-    --report-accuracy \
-    --max-epoch 500 \
-    --arch s2t_transformer_xs \
-    --optimizer adam \
-    --lr 2e-3 \
-    --lr-scheduler inverse_sqrt \
-    --warmup-updates 10000 \
-    --clip-norm 10.0 \
-    --seed 1 \
-    --log-interval 1000 \
-    --update-freq 8 \
-    --tensorboard-logdir ${TENSORBOARD_DIR} \
-    --use-linear-before-cnn
+	--task speech_to_text \
+	--criterion label_smoothed_cross_entropy \
+	--report-accuracy \
+	--max-epoch 500 \
+	--arch s2t_transformer_xs \
+	--optimizer adam \
+	--lr 2e-3 \
+	--lr-scheduler inverse_sqrt \
+	--warmup-updates 10000 \
+	--clip-norm 10.0 \
+	--seed 1 \
+	--log-interval 1000 \
+	--update-freq 8 \
+	--tensorboard-logdir ${TENSORBOARD_DIR} \
+	--use-linear-before-cnn
 ```
 where 
 - `${LANG_PAIR}` is the language pair (for example, `fr-en`, `fr-es`, or `fr-pt`) on which to train the models. 
