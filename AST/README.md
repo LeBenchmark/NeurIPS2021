@@ -295,6 +295,12 @@ python examples/speech_to_text/prep_mtedx_data.py --data-root ${MTEDX_ROOT} \
 						  --task st
 ```
 ### 3.1.2. wav2vec features
+Before extracting features from wav2vec models, it is necessary to convert `.flac` files into `.wav` files. You can use `ffmpeg` for such conversion under the `AST/tools` directory in this repo.
+```bash
+bash tools/flac2wav.sh $FLAC_DIR ${MTEDX_ROOT}/wav
+```
+where `$FLAC_DIR` is path to the directory containing `.flac` files. 
+
 ```bash
 python examples/speech_to_text/prep_mtedx_data_w2v_feats.py \
     --data-root ${MTEDX_ROOT} \
