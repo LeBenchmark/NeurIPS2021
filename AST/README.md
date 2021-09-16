@@ -471,6 +471,7 @@ fairseq-train ${MTEDX_ROOT}/${LANG_PAIR} \
 where 
 - `${LANG_PAIR}` is the language pair (for example, `fr-en`, `fr-es`, or `fr-pt`) on which to train the models. 
 - `${ST_SAVE_DIR}` is the path to save checkpoints.
+
 **IMPORTANT:** Please add `--use-linear-before-cnn` when training ST models using features extracted from wav2vec models.
 
 
