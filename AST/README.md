@@ -284,6 +284,19 @@ pip install -e .
 ```
 (remove `-e` in the above if you don't want to install in the editable mode).
 
+Finally, the following libraries are necessary for this recipe: **sndfile**, **ffmpeg**, **pandas**, **soundfile**, **sentencepiece** and **torchaudio**. These can be installed as follows.
+
+* With sudo privileges:
+```bash
+sudo apt-get install libsndfile1-dev ffmpeg 
+pip install pandas soundfile sentencepiece torchaudio
+```
+
+* On a virtual environment:
+```bash
+conda install -y libsndfile ffmpeg
+pip install pandas soundfile sentencepiece torchaudio
+```
 
 # 3. Feature preparation
 ## 3.1. Task-agnostic pre-training
