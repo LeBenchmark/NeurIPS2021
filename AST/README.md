@@ -299,6 +299,32 @@ pip install pandas soundfile sentencepiece torchaudio
 ```
 
 # 3. Feature preparation
+In the following, please have separate `${MTEDX_ROOT}` for each type of features since the output files (features, manifest, dictionary etc.) will be overwitten if they are under the same folder. For example, below is the structure of the downloaded data after extracting:
+
+```bash
+${DOWNLOAD_DIR}
+└──fr-en
+    └──data
+    	└──train
+	└──valid
+	└──test
+└──fr-es
+    └──data
+    	└──train
+	└──valid
+	└──test
+...
+```
+Then you can create a folder named `${MTEDX_ROOT}` having similar structure as above for each type of feature and create symlinks to the data downloaded for each ${MTEDX_ROOT} folder as below.
+```bash
+${MTEDX_ROOT}
+└──fr-en
+    └──data -> ${DOWNLOAD_DIR}/fr-en/data
+└──fr-es
+    └──data -> ${DOWNLOAD_DIR}/fr-es/data
+...
+```
+
 ## 3.1. Task-agnostic pre-training
 ### 3.1.1. log-Mel filterbank features
 ```bash
@@ -316,17 +342,17 @@ where `$FLAC_DIR` is path to the directory containing `.flac` files.
 
 ```bash
 python examples/speech_to_text/prep_mtedx_data_w2v_feats.py \
-    --data-root ${MTEDX_ROOT} \
-    --vocab-type unigram --vocab-size 1000 --task st \
-    --use-w2v-feats \
-    --w2v-path ${W2V2_PATH} \
+	--data-root ${MTEDX_ROOT} \
+	--vocab-type unigram --vocab-size 1000 --task st \
+	--use-w2v-feats \
+	--w2v-path ${W2V2_PATH} \
 	--src fr --tgt ${TGT_LANG}
 ```
 where:
 - `${W2V2_PATH}` is path to the wav2vec 2.0 model from which you want to extract features, 
 - `${TGT_LANG}` is chosen among `[en, es, pt]`.
 
-**NOTE:** If you extract features from `large` models, please add `--normalize-signal` to the above command line.
+**IMPORTANT:** If you extract features from `large` models, please add `--normalize-signal` to the above command line.
 
 
 ## 3.2. Self-supervised fine-tuning on mTEDx
@@ -440,12 +466,12 @@ fairseq-train ${MTEDX_ROOT}/${LANG_PAIR} \
 	--seed 1 \
 	--log-interval 1000 \
 	--update-freq 8 \
-	--tensorboard-logdir ${TENSORBOARD_DIR} \
-	--use-linear-before-cnn
+	--tensorboard-logdir ${TENSORBOARD_DIR}
 ```
 where 
 - `${LANG_PAIR}` is the language pair (for example, `fr-en`, `fr-es`, or `fr-pt`) on which to train the models. 
 - `${ST_SAVE_DIR}` is the path to save checkpoints.
+**IMPORTANT:** Please add `--use-linear-before-cnn` when training ST models using features extracted from wav2vec models.
 
 
 # 5. Decoding
