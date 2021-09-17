@@ -202,7 +202,7 @@ Once you have a running installation of Fairseq, you just have to copy files in 
 
 Input features used for our [Interspeech 2021 paper](https://arxiv.org/abs/2104.11462), and for our NeurIPS submission are available [here](http://www.marcodinarelli.it/is2021.php), so that you don't need the original data or to extract features on your own.
 
-If you want extract to features on your own with your wav2vec 2.0 models, you can use the **extract_flowbert_features.py** script.
+If you want to extract features on your own with your wav2vec 2.0 models, you can use the **extract_flowbert_features.py** script.
 Since features are extracted once for all, I did not add command line options to the script, you need to modify flags and variables in the script.
 Some models used to extract features are reachable via links in the table above, or from our [HuggingFace repository](https://huggingface.co/LeBenchmark).
 
@@ -218,26 +218,52 @@ Flags:
 
 Variables:
 - **prefix_list**: the input list, one file per line with absolute path, with or without extension. If the extension is not given, the script will assume '.wav' as the signal extension
-- **flowbert_path**: the absolute path to the wav2vec 2.0 model to use for extracting features. **NOTE**: if you want to extract features with a model finetuned with the [supervised finetuning procedure](https://github.com/pytorch/fairseq/blob/master/examples/wav2vec/README.md#fine-tune-a-pre-trained-model-with-ctc), because of the way Fairseq instantiate and load models, you will need to specify also the model used as fine-tunning starting point in the variable **sv_starting_point**. Since in the end Fairseq initialize parameters with the model specified in **flowbert_path**, the second model can be identical to the first.
+- **flowbert_path**: the absolute path to the wav2vec 2.0 model to use for extracting features. **NOTE**: if you want to extract features with a model finetuned with the [supervised finetuning procedure](https://github.com/pytorch/fairseq/blob/master/examples/wav2vec/README.md#fine-tune-a-pre-trained-model-with-ctc), because of the way Fairseq instantiate and load models, you will need to specify also the model used as fine-tuning starting point in the variable **sv_starting_point**. Since in the end Fairseq initialize parameters with the model specified in **flowbert_path**, the second model can be identical to the first.
 
 Once flags and variables have been set properly, you can run the script simply as **python extract_flowbert_features.py** from command line, making sure the correct python environement with Fairseq 0.10 is active.
 
 ### Training
 
-In order to train a model with a Basic decoder (a linear layer), run the script **run_end2end_slu_train_basic.sh** (you need to modify environment variables in the script so that to match your installation, your home, etc. on your machine).
+In order to train a model with a Basic decoder (a linear layer), run the script **run_end2end_slu_train_basic.sh**.
+
+You need to modify environment variables in the script so that to match installation, home, input, etc. on your machine.
+
+In particular:
+- the line **source ${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/activate** must be changed to activate your python virtual env
+- **FAIRSEQ_PATH** must set to point the folder where the Fairseq tools are located (fairseq-train, fairseq-generate, etc.)
+- **WORK_PATH** must be set to any working directory on your machine
+- **DATA_PATH** must be set to the directory containing the input data. This can be any directory, even empty, if you have already serialized input features
+- **SERIALIZED_CORPUS** is the common prefix to all serialized input features files (train, dev, test and dict), see [here](http://www.marcodinarelli.it/is2021.php).
+
+The **SERIALIZED_CORPUS** prefix is actually automatically created based on a couple of other variables specified right above in the script: **FEATURES_TYPE**, **FEATURES_SPEC**, **FEATURES_LANG**, **NORMFLAG**.
+
+- **FEATURES_TYPE** can be ***spectro*** for spectrograms, ***FlowBERT*** for wav2vec 2.0 large features, ***FlowBBERT*** for wav2vec 2.0 base features, and son on. See the script itself and/or file names [here](http://www.marcodinarelli.it/is2021.php).
+- **FEATURES_SPEC** is used to specify additional information in the file name, e.g. 3Kl for the French wav2vec 2.0 large model trained on 3K hours of speech.
+- **FEATURES_LANG** is used for the language of the wav2vec 2.0 model (use ***ML*** for the XLSR53 model features)
+- **NORMFLAG** is set always to ***Normalized***.
+
+Note that the values of these variables is completly arbitrary. However they must match those used when creating serialized feature files if you want to (re-)use serialized feature files like those available [here](http://www.marcodinarelli.it/is2021.php).
+
+There are 3 additional variables in the script in the same section: **FEATURES_EXTN**, **SUBTASK**, and **CORPUS**.
+
+- **FEATURES_EXTN** is the file extension of feature files. This is used when you don't have (yet) serialized feature files and you want to read-in input data
+- **SUBTASK** can be ***token*** or ***concept*** and is used to specify which units the model should be trained to predict: ***token*** for ASR, ***concept*** for SLU. See also below.
+- **CORPUS** is an ID for the corpus used in the experiments. You should leave it set to ***media*** if you are using the MEDIA corpus.
 
 Pay attention to the option **--slu-subtask**: with a value **'token'** you will train an ASR model (token decoding); with a value **'concept'** you will train a SLU model where the expected output format is **SOC** <img src="https://render.githubusercontent.com/render/math?math=w_1^1 \dots w_N^1 C_1"> **EOC** ... **SOC** <img src="https://render.githubusercontent.com/render/math?math=w_1^M \dots w_N^M C_M"> **EOC**.
 **SOC** and **EOC** are start and end of concept markers, <img src="https://render.githubusercontent.com/render/math?math=w_1^i \dots w_N^i C_i"> are the words instantiating the concept <img src="https://render.githubusercontent.com/render/math?math=C_i">, followed by the concept itself.
 
-In order to train a model with a LSTM decoder (the version of LSTM decoder described above), run the script **run_end2end_slu_train_icassplstm.sh** (again, you need to modify environment variables in the script so that to match your installation, your home, etc. on your machine).
+In order to train a model with a LSTM decoder (the version of LSTM decoder described above), run the script **run_end2end_slu_train_icassplstm.sh**.
+Again, you need to modify environment variables in the script so that to match installation, home, etc. on your machine. See above.
 In this script also you need to set properly the option **--slu-subtask**:
 
 In order to train a model pre-initializing parameters with a previously trained model, use the option:
 ```--load-fairseq-encoder <model file>```
 
-This option is intended to pre-initilize the encoder as explained in the paper. However the system detects automatically if the decoder's type is the same in the instantiated and loaded models, and in that case it pre-initializes also the decoder.
+This option is intended to pre-initilize the encoder as explained in the paper. However the system detects automatically if the decoder's type is the same in the instantiated and loaded models, and in that case it pre-initializes also the decoder. This is especially useful when pre-initializing a SLU model with a linear decoder with a ASR model with a linear decoder.
+Pay attention to remove this option when training an ASR model from scratch.
 
-At the first run, the system will read data and save them in a serialized format, containing all the tensors needed for training (and generation). At following runs you can use such data with the option **--serialized-corpus \<data prefix>**. _\<data prefix\>_ is the prefix in common to all the generated files (train, validation, test data plus the dictionary).
+At the first run, the system will read data and save them in a serialized format, containing all the tensors needed for training (and generation). At following runs you can use such data with the option **--serialized-corpus \<data prefix>**. _\<data prefix\>_ is the prefix in common to all the generated files (train, validation, test data plus the dictionary). See also the **SERIALIZED_CORPUS** variable above.
 This makes data loading much faster, especially when using _wav2vec_ features as input.
 
 Input features are available [here](http://www.marcodinarelli.it/is2021.php), so that you don't need the original data or to extract features on your own.
@@ -246,7 +272,8 @@ Input features are available [here](http://www.marcodinarelli.it/is2021.php), so
 
 ```run_end2end_slu_test.sh <checkpoint path> <serialized corpus> <sub-task>```
 
-This will generate an output in the same folder as the checkpoint.
+This will generate an output in the same folder as the checkpoint. Once again, you need to set properly some environment variable in the script like for training scripts.
+
 Pay attention to the **\<\<sub-task\>\>** argument which will initialize the **--slu-subtask** option in the script to generate the correct reference to compare the system output with.
 
 ### Scoring
