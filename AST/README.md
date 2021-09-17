@@ -376,13 +376,21 @@ filename0.wav	nframes
 filename1.wav	nframes
 ...
 ```
-To prepare data according to this format, please run the following command
+To prepare data according to this format, please run the following command to first obtain the manifest files
+```bash
+python examples/speech_to_text/prep_mtedx_data_w2v_feats.py \
+	--data-root ${MTEDX_ROOT} \
+	--vocab-type unigram --vocab-size 1000 \
+	--task st --src fr  --tgt en \
+	--get-manifest-only
+```
+Then run
 ```bash
 python examples/speech_to_text/prep_ft_w2v2.py --audio-root ${AUDIO_ROOT} --tsv-path ${TSV_PATH} --dest ${DATA_DIR}
 ```
 where 
 - `${AUDIO_ROOT}` is path to the folder where split audio files from (1) are saved, 
-- `${TSV_PATH}` is path to the `.tsv` files (`train_st.tsv`, `valid_st.tsv`, and `test_st.tsv`) obtained from [Section 3.1.1](#311-log-mel-filterbank-features), 
+- `${TSV_PATH}` is path to the `.tsv` files (`train_st.tsv`, `valid_st.tsv`, and `test_st.tsv`) obtained as above, 
 - `${DATA_DIR}` is where you want to store the output files, including the `.tsv` file having the above format, the `.ltr` and `.wrd` files which include the transcripts pre-tokenized at the letter and word level, repectively. This `${DATA_DIR}` will be the input folder for task-specific pre-training (both self-supervised and supervised one).
 
 
