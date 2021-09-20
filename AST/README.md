@@ -334,7 +334,7 @@ python examples/speech_to_text/prep_mtedx_data.py --data-root ${MTEDX_ROOT} \
 						  --task st
 ```
 ### 3.1.2. wav2vec features
-Before extracting features from wav2vec models, it is necessary to convert `.flac` files into `.wav` files. You can use `ffmpeg` for such conversion under the `AST/tools` directory in this repo.
+Before extracting features from wav2vec models, it is necessary to convert `.flac` files to `.wav` files. You can use `ffmpeg` for such conversion under the `AST/tools` directory in this repo.
 ```bash
 bash tools/flac2wav.sh $FLAC_DIR ${MTEDX_ROOT}/wav
 ```
@@ -356,6 +356,13 @@ where:
 
 
 ## 3.2. Self-supervised fine-tuning on mTEDx
+The input to wav2vec models needs to be single channel with sampling rate of 16kHz. Therefore, we first need to downsample the audio files before training. Similar to [Section 3.1.2](#312-wav2vec-features), you can run the following command to convert `.flac` files to `.wav` files.
+
+```bash
+bash tools/flac2wav.sh $FLAC_DIR ${MTEDX_ROOT}/wav
+```
+where `$FLAC_DIR` is path to the directory containing `.flac` files. 
+
 ### 3.2.1. Perform self-supervised fine-tuning on mTEDx
 #### (1) Split audio files
 Since it is recommended to split each file into separate files each having smaller length when training wav2vec models, we first split the audio files (for each talk) into smaller files (each containing one sentence) based on the segment information provided in the released mTEDx dataset.
