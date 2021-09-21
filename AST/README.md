@@ -251,7 +251,7 @@ The baselines in our experiments are models using log-Mel filterbank features (`
 
 [`En-base/large`](https://arxiv.org/abs/2006.11477) and [`XLSR-53`](https://arxiv.org/abs/2006.13979) are off-the-shelf wav2vec models trained on English and multilingual speech, respectively. The ones whose prefixes are `Fr` are the wav2vec models that we trained on our collected French datasets of different sizes (1K, 2.6K, 3K, and 7K). Except for the one trained on 2.6K hours, each model has both `base` and `large` configurations.
 
-For the two task-specific pre-training methods (self-supervised and supervised fine-tuning on mTEDx), since the French speech is overlapped between the language pairs, we selected the pair having the most speech data (`fr-en`) to perform task-specific pre-training and used the obtained models to extract features for the remaining pairs (`fr-es` and `fr-pt`). For a fair comparison, we did not use additional data augmentation technique nor ASR encoder pre-training in the experiments.
+**NOTE:** For the two task-specific pre-training methods (self-supervised and supervised fine-tuning on mTEDx), since the French speech is overlapped between the language pairs, we selected the pair having the most speech data (`fr-en`) to perform task-specific pre-training and used the obtained models to extract features for the remaining pairs (`fr-es` and `fr-pt`). For a fair comparison, we did not use additional data augmentation technique nor ASR encoder pre-training in the experiments.
 
 
 # 2. Dataset and installation
@@ -402,6 +402,8 @@ where
 
 
 #### (3) Training wav2vec model
+**NOTE:** The self-supervised fine-tuning on mTEDx is resumed from the last optimizer's state of the corresponding pre-trained model, hence the number of updates will be picked up from where it left off previously. For example, your self-supervised fine-tuning should start at step around 180k for `Fr-1K-base`, 158k for `Fr-1K-large`, and around 496K or 500K for the remaining wav2vec `Fr` models. The `max_update` in the configuration file is hence the sum of previous training steps in the pre-trained model and the training steps to be performed on the task data. All of the self-supervised fine-tuned models in our experiments were trained for an additional 10K steps on `fr-en` pair of mTEDx.
+
 To perform self-supervised fine-tuning on mTEDx, please run the following command:
 ```bash
 fairseq-hydra-train \
