@@ -284,6 +284,15 @@ pip install -e .
 ```
 (remove `-e` in the above if you don't want to install in the editable mode).
 
+In addition, please also install NVIDIA's `apex` library as instructed in [`fairseq`](https://github.com/pytorch/fairseq#requirements-and-installation).
+```bash
+git clone https://github.com/NVIDIA/apex
+cd apex
+pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" \
+  --global-option="--deprecated_fused_adam" --global-option="--xentropy" \
+  --global-option="--fast_multihead_attn" ./
+```
+
 Finally, the following libraries are necessary for this recipe: **sndfile**, **ffmpeg**, **pandas**, **soundfile**, **sentencepiece** and **torchaudio**. These can be installed as follows.
 
 * With sudo privileges:
