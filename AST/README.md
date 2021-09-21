@@ -268,7 +268,7 @@ After downloading data, please unzip and save them under `${MTEDX_ROOT}`.
 
 
 ## 2.2. Installation
-Our implementation is based on [fairseq S2T](https://github.com/pytorch/fairseq/tree/master/examples/speech_to_text). 
+The experiments are performed using `Python 3.8.2`, `torch 1.8.1`, `torchaudio 0.8.1`. Our implementation is based on [fairseq S2T](https://github.com/pytorch/fairseq/tree/master/examples/speech_to_text). 
 Please clone [our fork](https://github.com/formiel/fairseq/tree/LeBenchmark) (`LeBenchmark` branch)
 as there are modifications made for LeBenchmark:
 
