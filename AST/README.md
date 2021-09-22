@@ -498,7 +498,11 @@ where
 - `${LANG_PAIR}` is the language pair (for example, `fr-en`, `fr-es`, or `fr-pt`) on which to train the models. 
 - `${ST_SAVE_DIR}` is the path to save checkpoints.
 
-**IMPORTANT:** Please add `--use-linear-before-cnn` when training ST models using features extracted from wav2vec models.
+**IMPORTANT:** 
+1. Please add `--use-linear-before-cnn` when training ST models using features extracted from wav2vec models.
+2. **Multi-GPU training:** Training on multiple GPUs requires some modifications of the above command:
+- Replace `fairseq-train` with `python -u -m torch.distributed.launch --nproc_per_node=${NGPUS_PER_NODE} $(which fairseq-train)` where `${NGPUS_PER_NODE}` is the number of GPUs.
+- Scale the effective batch size accordingly. For example, on 4 GPUs, you can set `--update-freq 2` (instead of `--update-freq 8`).
 
 
 # 5. Decoding
