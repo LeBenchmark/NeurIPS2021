@@ -411,7 +411,7 @@ where
 
 
 #### (3) Training wav2vec model
-**NOTE:** The self-supervised fine-tuning on mTEDx is resumed from the last optimizer's state of the corresponding pre-trained model, hence the number of updates will be picked up from where it left off previously. For example, your self-supervised fine-tuning should start at step around 180k for `Fr-1K-base`, 158k for `Fr-1K-large`, and around 496K or 500K for the remaining wav2vec `Fr` models. The `max_update` in the configuration file is hence the sum of previous training steps in the pre-trained model and the training steps to be performed on the task data. All of the self-supervised fine-tuned models in our experiments were trained for an additional 10K steps on `fr-en` pair of mTEDx.
+**NOTE:** The self-supervised fine-tuning on mTEDx is resumed from the last optimizer's state of the corresponding pre-trained model, hence the number of updates will be picked up from where it left off previously. For example, your self-supervised fine-tuning should start at step around 180k for `Fr-1K-base`, 158k for `Fr-1K-large`, and around 496K or 500K for the remaining wav2vec `Fr` models. The `max_update` in the configuration file is hence the sum of previous training steps in the pre-trained model and the training steps to be performed on the task data. All of the self-supervised fine-tuned models in our experiments were trained for an additional 20K steps on `fr-en` pair of mTEDx.
 
 To perform self-supervised fine-tuning on mTEDx, please run the following command:
 ```bash
