@@ -429,6 +429,8 @@ where
 - `${SAVE_DIR}` is path to save the checkpoints, 
 - `${MODEL_CONFIG}` is the training configuration. The main hyperparameters are the same as in `example/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml` for self-supervised fine-tuning and `example/wav2vec/config/pretraining/vox100h.yaml` for supervised fine-tuning. Please refer to `NeurIPS2021/AST/configs` for the configuration files that we used in our experiments.
 
+**IMPORTANT:** If your are resuming the training from a previous job (in case the previous run is stopped for some reason, such as time limit etc.), please modify the `checkpoint.restore_file` to be the last checkpoint (`checkpoint_last.pt`) of the previous training so that the model continues to train properly. Otherwise, it will load the pre-trained model from `${PRETRAINED_W2V2_PATH}` and run the previous training again.
+
 
 ### 3.2.2. Extract features from obtained wav2vec models
 Please follow [Section 3.1.2](#312-wav2vec-features) to extract features from the obtained self-supervised fine-tuned wav2vec models. `$W2V2_PATH` is the path to the best checkpoint (`checkpoint_best.pt`) obtained from the training in [Section 3.2.1](#321-perform-self-supervised-fine-tuning-on-mtedx).
