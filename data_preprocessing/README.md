@@ -44,7 +44,7 @@ Contact: _sina.alisamir at univ-grenoble-alpes.fr_
 
 - For questions regarding the preprocessing of **MLS, CFPP2000, TCOF, VOXPOPULI**.
 
-Contact: _solene.evans at univ-grenoble-alpes.fr_
+Contact: _solene.evain at univ-grenoble-alpes.fr_
 
 
 - For questions regarding the preprocessing of **EPAC, MPF, MaSS, NCCFr**.
