@@ -6,7 +6,8 @@
   It not only includes ASR (high and low resource) tasks but also spoken language understanding, speech translation and emotion recognition. Also, it targets speech technologies in a language different than English: French. 
   SSL models of different sizes are trained from carefully sourced and documented datasets.
   
-  
+The scripts for data preparation are available [here](https://github.com/LeBenchmark/NeurIPS2021/tree/main/data_preprocessing). 
+
 Our pre-trained SSL models for French are available through this HuggingFace link: https://huggingface.co/LeBenchmark
 
 Our benchmark tasks are available on the following directories:
