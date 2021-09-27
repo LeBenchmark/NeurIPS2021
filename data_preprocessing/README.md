@@ -20,6 +20,13 @@ The following table presents the downloading links and licenses for the corpora.
 | [MEDIA][]                          | 699-856-029-354-6              |  1,258 d   | speech, written |       SLU       | ELRA NC           |
 | [MLS (French)][]                   |                                |  1,096 h   | speech, written |       SSL       | CC BY 4.0         |
 | [MPF][]                            |                                |    78 h    | speech, written |       SSL       | CC BY-NC-SA 4.0   |
+| [mTEDx (fr-\*)][]                            | SLR100            | 25h - 50h |   speech, written   | AST | CC BY-NC-ND 4.0            |
+| [NCCFr][]                                    |                   |   35 h    | Multimedia, written | SSL | academic only, NC          |
+| [Portmedia (PM_DOM)][]                       | 135-793-959-390-8 |  40.5 h   |   speech, written   | SSL | ELRA NC                    |
+| [RECOLA][]                                   |                   |   9.5 h   | Multimedia, written | AER | End User License Agreement |
+| [TCOF][]                                     |                   |   146 h   |   speech, written   | SSL | CC BY-NC-SA                |
+| [Voxpopuli unlabeled][]                      |                   | ≈ 4.5k h  |       speech        | SSL | CC0                        |
+| [Voxpopuli transcribed][Voxpopuli unlabeled] |                   |  ≈ 215 h  |   speech, written   | SSL | CC0                        |
 
   [African Accented French]: https://www.openslr.org/57/
   [Allosat]: https://lium.univ-lemans.fr/allosat/
@@ -35,6 +42,13 @@ The following table presents the downloading links and licenses for the corpora.
   [MEDIA]: https://catalogue.elra.info/en-us/repository/browse/ELRA-S0272/
   [MLS (French)]: http://www.openslr.org/94/
   [MPF]: https://www.ortolang.fr/market/corpora/mpf
+  [MPF]: https://www.ortolang.fr/market/corpora/mpf
+  [mTEDx (fr-\*)]: http://www.openslr.org/100
+  [NCCFr]: https://mirjamernestus.nl/Ernestus/NCCFr/index.php
+  [Portmedia (PM_DOM)]: https://catalogue.elra.info/en-us/repository/browse/ELRA-S0371/
+  [RECOLA]: https://diuf.unifr.ch/main/diva/recola/download.html
+  [TCOF]: https://www.ortolang.fr/market/corpora/tcof?path=%2FCorpus%2FAdultes
+  [Voxpopuli unlabeled]: https://github.com/facebookresearch/voxpopuli
 
 
 - For questions regarding the preprocessing of **African Accented French, Att_Hack, CaFE, ESLO, PORTMEDIA**. 
