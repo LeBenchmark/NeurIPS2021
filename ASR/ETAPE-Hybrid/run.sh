@@ -19,6 +19,7 @@ stage=0
 #if [ $stage -le 0 ]; then
   #TODO
   # download and prepare data: dev, test, train and lang for ETAPE-1,2
+  # https://catalogue.elra.info/en-us/repository/browse/ELRA-E0046/
 #fi 
 
 if [ $stage -le 1 ]; then
