@@ -188,8 +188,10 @@ The system was developped under **python 3.7, pytorch 1.4.0 and Fairseq 0.9**, i
 If you clone the whole NeurIPS repository, in the SLU subfolder (this repository) there is already the version of Fairseq 0.9 used for our experiments.
 For installation you just need to activate the the correct python environment and then:
 
-```cd SLU/fairseq/
-pip install -e .```
+```
+cd SLU/fairseq/
+pip install -e .
+```
 
 The other python scripts contained in the SLU folder:
 **compute_error_rate.py** is used from command line (see Usage below) to compute the error rate on the model output.
