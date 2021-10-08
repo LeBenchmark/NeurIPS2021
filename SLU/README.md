@@ -184,15 +184,14 @@ For more details please see the [paper accepted at Interspeech 2021](https://arx
 
 # Installation
 
-The system was developped under **python 3.7, pytorch 1.4.0 and Fairseq 0.9**, it can probably work with other version of python and pytorch, but it will not work for sure under Fariseq 0.10 or more recent. Tha's why we recommend, in order to reproduce our results, to download and install [Fairseq 0.9](https://github.com/pytorch/fairseq/releases/tag/v0.9.0).
-Once you have a running installation of Fairseq, you just have to copy files in the correct directories:
+The system was developped under **python 3.7, pytorch 1.4.0 and Fairseq 0.9**, it can probably work with other version of python and pytorch, but it will not work for sure under Fariseq 0.10 or more recent. Tha's why we recommend, in order to reproduce our results, to install [this version of Fairseq 0.9](https://github.com/pytorch/fairseq/tree/d5618e9ecd05a1edaba5c0991efb3503f121d132).
+If you clone the whole NeurIPS repository, in the SLU subfolder (this repository) there is already the version of Fairseq 0.9 used for our experiments.
+For installation you just need to activate the the correct python environment and then:
 
-- **End2EndSLU.py** in fairseq/tasks/
-- **End2EndSLUDataset.py** in fairseq/data/
-- **End2EndSLUModels.py** in fairseq/models/
-- **SLU_CTC_loss.py** in examples/speech_recognition/criterions/ (Fairseq 0.9)
-- **globals.py** in fairseq/
+```cd SLU/fairseq/
+pip install -e .```
 
+The other python scripts contained in the SLU folder:
 **compute_error_rate.py** is used from command line (see Usage below) to compute the error rate on the model output.
 **extract_flowbert_features.py** is used from command line (see Usage below) to extract features from wav signals with wav2vec 2.0 models. **NOTE**: for using this script Fairseq 0.10 or more recent is needed (you can install different versions of Fairseq in different virtual env), as wav2vec 2.0 has been deployed with such Fairseq version.
 
