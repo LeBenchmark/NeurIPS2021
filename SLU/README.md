@@ -194,6 +194,7 @@ pip install -e .
 ```
 
 The other python scripts contained in the SLU folder:
+
 **compute_error_rate.py** is used from command line (see Usage below) to compute the error rate on the model output.
 **extract_flowbert_features.py** is used from command line (see Usage below) to extract features from wav signals with wav2vec 2.0 models. **NOTE**: for using this script Fairseq 0.10 or more recent is needed (you can install different versions of Fairseq in different virtual env), as wav2vec 2.0 has been deployed with such Fairseq version.
 
