@@ -92,7 +92,8 @@ if [[ $# -ge 2 ]]; then
 fi
 
 warmup_opt="" #"--warmup-updates 5393"
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-train ${DATA_PATH} --corpus-name ${CORPUS} --feature-extension ${FEATURES_EXTN} \
+#CUDA_VISIBLE_DEVICES=1
+PYTHONPATH=${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-train ${DATA_PATH} --corpus-name ${CORPUS} --feature-extension ${FEATURES_EXTN} \
 	--task end2end_slu --arch end2end_slu_arch --criterion ${CRITERION} --num-workers=0 --distributed-world-size 1 \
 	--decoder ${DECODER} --padded-reference \
 	--save-dir ${SAVE_PATH} --patience 20 --no-epoch-checkpoints \
