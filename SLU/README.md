@@ -186,7 +186,7 @@ For more details please see the [paper accepted at Interspeech 2021](https://arx
 
 The system was developped under **python 3.7, pytorch 1.4.0 and Fairseq 0.9**, it can probably work with other version of python and pytorch, but it will not work for sure under Fariseq 0.10 or more recent. Tha's why we recommend, in order to reproduce our results, to install [this version of Fairseq 0.9](https://github.com/pytorch/fairseq/tree/d5618e9ecd05a1edaba5c0991efb3503f121d132).
 If you clone the whole NeurIPS repository, in the SLU subfolder (this repository) there is already the version of Fairseq 0.9 used for our experiments.
-For installation you just need to activate the the correct python environment and then:
+For installation you just need to activate the correct python environment and then:
 
 ```
 cd SLU/fairseq/
@@ -273,9 +273,9 @@ Input features are available [here](http://www.marcodinarelli.it/is2021.php), so
 
 ### Generation
 
-```run_end2end_slu_test.sh <checkpoint path> <serialized corpus> <sub-task>```
+```run_end2end_slu_test.sh <checkpoint path> <serialized corpus prefix> <sub-task>```
 
-This will generate an output in the same folder as the checkpoint. Once again, you need to set properly some environment variable in the script like for training scripts.
+This will generate an output in the same folder as the checkpoint. Once again, you need to set properly some environment variable in the script like for training scripts. See above for **\<serialized corpus prefix\>**.
 
 Pay attention to the **\<sub-task\>** argument which will initialize the **--slu-subtask** option in the script to generate the correct reference to compare the system output with.
 
