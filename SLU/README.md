@@ -277,7 +277,7 @@ Input features are available [here](http://www.marcodinarelli.it/is2021.php), so
 
 This will generate an output in the same folder as the checkpoint. Once again, you need to set properly some environment variable in the script like for training scripts.
 
-Pay attention to the **\<\<sub-task\>\>** argument which will initialize the **--slu-subtask** option in the script to generate the correct reference to compare the system output with.
+Pay attention to the **\<sub-task\>** argument which will initialize the **--slu-subtask** option in the script to generate the correct reference to compare the system output with.
 
 ### Scoring
 
