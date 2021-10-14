@@ -2,7 +2,6 @@
 
 source ${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/activate 
 export FAIRSEQ_PATH=${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/
-export PYTHONPATH=${PYTHONPATH}:${HOME}/work/tools/fairseq/
 
 echo " ---"
 echo " * Using python: `which python`"
@@ -39,14 +38,14 @@ BASIC_OPTIONS="--beam 1 --iter-decode-max-iter 1 --prefix-size 0 --match-source-
 GENERATE_OPTIONS="--beam 1 --iter-decode-max-iter 1 --max-len-a 1.0 --max-len-b 0 --prefix-size 0"	# Average max-len-a for MEDIA (computed on train): 0.123
 
 CHECKPOINT_DIR=`dirname ${CHECKPOINT}`
-CUDA_VISIBLE_DEVICES=1 ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
+PYTHONPATH=${PYTHONPATH}:${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
 	--path ${CHECKPOINT} ${GENERATE_OPTIONS} --max-sentences 1 --num-workers=0 \
 	--task end2end_slu --criterion ${CRITERION} --padded-reference \
 	--serialized-data ${SERIALIZED_CORPUS} --slu-subtask ${SUBTASK} --user-only \
 	--gen-subset valid --results-path ${CHECKPOINT_DIR} \
 	| tee ${CHECKPOINT_DIR}/generate-valid.txt
 
-CUDA_VISIBLE_DEVICES=1 ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
+PYTHONPATH=${PYTHONPATH}:${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
         --path ${CHECKPOINT} ${GENERATE_OPTIONS} --max-sentences 1 --num-workers=0 \
         --task end2end_slu --criterion ${CRITERION} --padded-reference \
         --serialized-data ${SERIALIZED_CORPUS} --slu-subtask ${SUBTASK} --user-only \
