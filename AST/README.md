@@ -531,7 +531,8 @@ fairseq-generate ${MTEDX_ROOT}/${LANG_PAIR} \
     --task speech_to_text \
     --path ${ST_SAVE_DIR}/${CHECKPOINT_FILENAME} \
     --max-tokens 50000 --beam 5 --scoring sacrebleu \
-    --results-path ${RESULT_PATH}
+    --results-path ${RESULT_PATH} \
+    --max-source-positions 50000
 ```
 where:
 - `${GEN_SUBSET}` is the name of the subset you want to decode.
