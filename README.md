@@ -20,5 +20,15 @@ Our benchmark tasks are available on the following directories:
 
 [AST: Automatic Speech Translation](https://github.com/LeBenchmark/NeurIPS2021/tree/main/AST)
 
-Detailed descriptions of experiments and results are given in on our paper: TBC !
+Detailed descriptions of experiments and results are given in on our paper: 
+[Task Agnostic and Task Specific Self-Supervised Learning from Speech with LeBenchmark](https://openreview.net/pdf?id=TSvj5dmuSd)
+
+```
+@inproceedings{evain2021task,
+  title={Task Agnostic and Task Specific Self-Supervised Learning from Speech with LeBenchmark},
+  author={Evain, Sol{\`e}ne and Nguyen, Ha and Le, Hang and Boito, Marcely Zanon and Mdhaffar, Salima and Alisamir, Sina and Tong, Ziyi and Tomashenko, Natalia and Dinarelli, Marco and Parcollet, Titouan and others},
+  booktitle={Thirty-fifth Conference on Neural Information Processing Systems Datasets and Benchmarks Track (Round 2)},
+  year={2021}
+}
+```
 
