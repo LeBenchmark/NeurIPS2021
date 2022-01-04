@@ -360,12 +360,12 @@ def read_dialog_data(TurnList, args):
                     sys.stderr.write(' *** read_dialog_data WARNING: turn_id {} is not unic\n'.format(turn_id))
             elif args.corpus_name == 'fsc':
                 turn_sem = read_txt(turn.strip() + '.sem')
-                tt = turn_sem.split()
+                #tt = turn_sem.split()
                 #c1, c2, c3 = '-'.join(tt[:-2]), tt[-2], tt[-1]
-                c1 = slu_start_concept_mark + ' ' + ' '.join(tt[:-2]) + ' ' + slu_end_concept_mark
-                c2 = tt[-2]
-                c3 = tt[-1]
-                turn_data.append( c1 + ' ' + c2 + ' ' + c3 )
+                #c1 = slu_start_concept_mark + ' ' + ' '.join(tt[:-2]) + ' ' + slu_end_concept_mark
+                #c2 = tt[-2]
+                #c3 = tt[-1]
+                turn_data.append( turn_sem ) #c1 + ' ' + c2 + ' ' + c3 )
                 turn_data.append( user_ID )
             else:
                 raise NotImplementedError 
@@ -519,6 +519,9 @@ class End2EndSLU(FairseqTask):
         parser.add_argument('--feature-extension', type=str, default='.20.0ms-spg', help='Extenion of the feature file name')
         parser.add_argument('--character-level-slu', action='store_true', default=False, help='Perform SLU from character-level transcription')
         parser.add_argument('--constrained-output-length', type=int, default=-1, help='Constrain the decoded output of the LSTM decoder to the specified length')
+        parser.add_argument('--max-padding-len', type=int, default=60, help='Max length of input sequences that are padded in order to avoid input/output length missmatch')
+        parser.add_argument('--max-padding-ratio', type=float, default=7.0, help='Factor by which input sequences shorter than max-padding-len are stretched to avoid input/output length missmatch')
+        parser.add_argument('--padding-active', action='store_true', default=False, help='Determine if padding should be done or not')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -731,6 +734,99 @@ class End2EndSLU(FairseqTask):
         #spk_mark = torch.zeros_like(feats).fill_(spk_val)
         #return feats + spk_mark
 
+    def pad_short_sequences(self, corpus, split):
+
+        length_missmatch = 0
+        missmatches = []
+        total = 0
+        max_turn_length = 0
+        comp_t_idx = 0
+        if self.args.slu_subtask == 'char':
+            comp_t_idx = 2
+        elif self.args.slu_subtask == 'token':
+            comp_t_idx = 3
+        elif self.args.slu_subtask == 'concept':
+            comp_t_idx = 4 
+        in_red_factor = (self.args.num_lstm_layers-1)*2
+
+        # 1. First scan, detect sequences shorter than the expected output, once reduced by the LSTM pyramidal architecture
+        for did in corpus[split]:
+            total = total + len(corpus[split][did])
+            for t_idx in range(len(corpus[split][did])):
+                t = corpus[split][did][t_idx]
+
+                if self.args.character_level_slu:
+                    char_slu_turn = get_character_level_slu_turn(t[4], self.label_vocab, self.args.padded_reference)
+                    char_t = char_slu_turn.split()
+
+                    if len(char_t) > max_turn_length:
+                        max_turn_length = len(char_t)
+                        if max_turn_length > 1024:
+                            print(' ### Got strangely long turn ({}): {}'.format(max_turn_length, char_slu_turn))
+
+                    slu_t = torch.LongTensor( [self.label_vocab.add_symbol(c) for c in char_t] ) 
+                    if t[1].size(0)//in_red_factor < slu_t.size(0): 
+                        length_missmatch += 1
+                        missmatches.append( (t[1].size(0)//in_red_factor, slu_t.size(0)) )
+
+                    turn_tuple = (t[0], t[1], t[2], t[3], slu_t, t[5])
+                    corpus[split][did][t_idx] = turn_tuple
+                else:
+                    if t[comp_t_idx].size(0) > max_turn_length:
+                        max_turn_length = t[comp_t_idx].size(0)
+
+                    if t[1].size(0)//in_red_factor < t[comp_t_idx].size(0):
+                        length_missmatch += 1
+                        missmatches.append( (t[1].size(0)//in_red_factor, t[comp_t_idx].size(0)) )
+
+        if split == 'train': # Ignore input/output length missmatch statistics if this is the test set
+            max_len = 0
+            max_ratio = 0.0
+            for p in missmatches:
+                if p[1] > max_len:
+                    max_len = p[1]
+                if p[1]/p[0] > max_ratio:
+                    max_ratio = p[1]/p[0]
+            if max_len > self.args.max_padding_len:
+                self.args.max_padding_len = max_len
+            if max_ratio > self.args.max_padding_ratio:
+                self.args.max_padding_ratio = max_ratio
+
+        '''if split == 'train' and len(missmatches) > 0:
+            print(' * End2EndSLU: padding sequences shorter than {}, stretching by a factor {}'.format(self.args.max_padding_len, self.args.max_padding_ratio))
+            sys.stdout.flush()
+            self.args.padding_active = True'''
+
+        # 2. Second scan, pad short input sequences.
+        padded_sequences = 0
+        if split == 'train':
+            for did in corpus[split]: 
+                for t_idx in range(len(corpus[split][did])):
+                    t = corpus[split][did][t_idx]
+
+                    input_tsr = t[1]
+                    if t[1].size(0)//in_red_factor < t[comp_t_idx].size(0):
+ 
+                        pad_len = t[comp_t_idx].size(0) * in_red_factor
+                        T, C = t[1].size()
+                        lratio = float(pad_len) / float(T)
+
+                        input_tsr = torch.zeros(pad_len,C).to(t[1])
+                        for i in range(pad_len):
+                            input_tsr[i,:] = t[1][int(i/lratio),:].clone()
+                        padded_sequences += 1
+
+                   
+                    assert input_tsr.size(0)//in_red_factor >= t[comp_t_idx].size(0), ' input-output sequence lengths missmatch after padding: {} vs. {}'.format(input_tsr.size(0)//in_red_factor, t[comp_t_idx].size(0))
+
+                    turn_tuple = (t[0], input_tsr, t[2], t[3], t[4], t[5])
+                    corpus[split][did][t_idx] = turn_tuple
+ 
+        print(' * End2EndSLU: padded {} sequences'.format(padded_sequences))
+        sys.stdout.flush()
+
+        return corpus[split], (length_missmatch, missmatches, max_turn_length, total)
+
     def load_dataset(self, split, **kwargs):
     
         """Load a given dataset split (e.g., train, valid, test)."""
@@ -812,7 +908,10 @@ class End2EndSLU(FairseqTask):
 
         #debug_idx = 0
         if hasattr(self.args, 'num_lstm_layers'):
-            length_missmatch = 0
+            print(' * End2EndSLU: checking for input-output sequence length incompatibility...')
+            sys.stdout.flush()
+
+            '''length_missmatch = 0
             missmatches = []
             total = 0
             max_turn_length = 0
@@ -823,8 +922,8 @@ class End2EndSLU(FairseqTask):
                 comp_t_idx = 3
             elif self.args.slu_subtask == 'concept':
                 comp_t_idx = 4
-            print(' * End2EndSLU: checking for input-output sequence length incompatibility...')
-            sys.stdout.flush()
+            
+            in_red_factor = (self.args.num_lstm_layers-1)*2
             for did in corpus[my_split]:
                 total = total + len(corpus[my_split][did])
                 for t_idx in range(len(corpus[my_split][did])):
@@ -838,29 +937,81 @@ class End2EndSLU(FairseqTask):
                             if max_turn_length > 1024:
                                 print(' ### Got strangely long turn ({}): {}'.format(max_turn_length, char_slu_turn))
                         slu_t = torch.LongTensor( [self.label_vocab.add_symbol(c) for c in char_t] )
-                        turn_tuple = (t[0], t[1], t[2], t[3], slu_t, t[5])
-                        corpus[my_split][did][t_idx] = turn_tuple
-                        if t[1].size(0)//self.args.num_lstm_layers < slu_t.size(0):
+                        #turn_tuple = (t[0], t[1], t[2], t[3], slu_t, t[5])
+                        #corpus[my_split][did][t_idx] = turn_tuple
+                        input_tsr = t[1]
+                        if t[1].size(0)//in_red_factor < slu_t.size(0):
                             #print('    - found missmatch: {} vs. {}'.format(t[1].size(0)//4, slu_t.size(0)))
                             length_missmatch += 1
-                            missmatches.append( (t[1].size(0)//self.args.num_lstm_layers, slu_t.size(0)) )
+                            missmatches.append( (t[1].size(0)//in_red_factor, slu_t.size(0)) )
+
+                            if my_split != 'test' and self.args.decoder != 'ctclstm':
+                                pad_len = slu_t.size(0) * in_red_factor #(slu_t.size(0) - t[1].size(0)//in_red_factor +1) * in_red_factor
+                                T, C = t[1].size()
+                                lratio = float(pad_len) / float(T)
+                                input_tsr = torch.zeros(pad_len,C).to(t[1])
+                                #input_tsr = torch.cat( [t[1], pad_tsr], 0 )
+                                for i in range(pad_len):
+                                    input_tsr[i,:] = t[1][int(i/lratio),:].clone()
+
+                        assert my_split == 'test' or self.args.decoder == 'ctclstm' or input_tsr.size(0)//in_red_factor >= slu_t.size(0)
+                        turn_tuple = (t[0], input_tsr, t[2], t[3], slu_t, t[5])
+                        corpus[my_split][did][t_idx] = turn_tuple
                     else: 
                         if t[comp_t_idx].size(0) > max_turn_length:
                             max_turn_length = t[comp_t_idx].size(0)
-                        if t[1].size(0)//self.args.num_lstm_layers < t[comp_t_idx].size(0):
+                        input_tsr = t[1]
+                        if t[1].size(0)//in_red_factor < t[comp_t_idx].size(0):
                             length_missmatch += 1
-                            missmatches.append( (t[1].size(0)//self.args.num_lstm_layers, t[comp_t_idx].size(0)) )
+                            missmatches.append( (t[1].size(0)//in_red_factor, t[comp_t_idx].size(0)) )
+
+                            if my_split != 'test' and self.args.decoder != 'ctclstm':
+                                #pad_len = (t[comp_t_idx].size(0) - t[1].size(0)//in_red_factor +1) * in_red_factor
+                                pad_len = t[comp_t_idx].size(0) * in_red_factor
+                                T, C = t[1].size()
+
+                                #print(' * Padding from length {} to {}'.format(T, pad_len))
+                                #sys.stdout.flush()
+
+                                lratio = float(pad_len) / float(T)
+                                input_tsr = torch.zeros(pad_len,C).to(t[1])
+                                #input_tsr = torch.cat( [t[1], pad_tsr], 0 )
+                                for i in range(pad_len):
+                                    input_tsr[i,:] = t[1][int(i/lratio),:].clone()
+
+                        assert my_split == 'test' or self.args.decoder == 'ctclstm' or input_tsr.size(0)//in_red_factor >= t[comp_t_idx].size(0), ' input-output sequence lengths missmatch after padding: {} vs. {}'.format(input_tsr.size(0)//in_red_factor, t[comp_t_idx].size(0))
+                        turn_tuple = (t[0], input_tsr, t[2], t[3], t[4], t[5])
+                        corpus[my_split][did][t_idx] = turn_tuple'''
+
                     #if debug_idx >= 10:
                     #    sys.exit(0)
                     #debug_idx += 1
+
+            cc, infos = self.pad_short_sequences(corpus, my_split)
+            corpus[my_split] = cc
+            length_missmatch, missmatches, max_turn_length, total = infos
+
+            # DEBUG SANITY CHECK
+            '''for did in corpus[my_split]: 
+                for t_idx in range(len(corpus[my_split][did])):
+                    t = corpus[my_split][did][t_idx]
+
+                    assert t[1].size(0) >= t[3].size(0)
+                    assert t[1].size(0) >= t[4].size(0)
+            print(' SO FAR SO GOOD!')
+            sys.stdout.flush()'''
+
             if length_missmatch > 0:
+                msg = ''
+                if my_split == 'train':
+                    msg = ' (and solved by padding)'
                 if self.args.character_level_slu:
-                    print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected converting to character-level SLU output'.format(length_missmatch, total))
+                    print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected{} converting to character-level SLU output'.format(length_missmatch, total, msg))
                     print('     * Missmatches: {}'.format(missmatches))
                     print('   *** End2EndSLU: max character-level turn length is {}'.format(max_turn_length))
                     sys.stdout.flush()
                 else:
-                    print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected'.format(length_missmatch, total))
+                    print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected{}'.format(length_missmatch, total, msg))
                     print('     * Missmatches: {}'.format(missmatches))
                     print('   *** End2EndSLU: max turn length is {}'.format(max_turn_length))
                     sys.stdout.flush()

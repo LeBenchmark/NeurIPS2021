@@ -28,6 +28,7 @@ parser.add_argument('--show-progress-every', type=int, default=100, help='Show p
 parser.add_argument('--clean-hyp', action='store_true', default=False, help='Remove duplicates from hypotheses (generated especially when CTC loss is used)')
 parser.add_argument('--slu-scores', type=str, help='Use system scores for taking decisions, in case multiple concepts are found in the same chunk')
 parser.add_argument('--slu-out', action='store_true', default=False, help='Keep only SLU labels')
+parser.add_argument('--corpus', type=str, default='media', help='Specify the corpus name for task specific post-processing')
 parser.add_argument('--etape-slu-clean', action='store_true', default=False, help='Remove the bogus SLU annotation used in the ETAPE data')
 args = parser.parse_args()
 
@@ -221,9 +222,28 @@ def unpad_sequence(sequence):
         return sequence[start_idx:end_idx]
     return sequence
 
+def normalize_fsc_output(clist, indeces):
+
+    (blank_idx, start_concept_mark, end_concept_mark, null_idx, cleaning_flag, slu_flag) = indeces
+
+    start = -1
+    end = -1
+    for idx in range(len(clist)):
+        if clist[idx] == start_concept_mark:
+            start = idx
+        elif clist[idx] == end_concept_mark:
+            if start == -1:
+                start = 0
+            end = idx
+
+    rlist = clist[start:end+1] + clist[end+1:]
+
+    return rlist
+
 def compute_wer(hyp, scores, ref, indeces, concept_dict, inverse_dict):
     
-    (blank_idx, start_concept_mark, end_concept_mark, null_idx, cleaning_flag, slu_flag) = indeces 
+    (blank_idx, start_concept_mark, end_concept_mark, null_idx, cleaning_flag, slu_flag, corpus) = indeces
+    indeces = indeces[:-1]
     output_idx = hyp
 
     new_scores = scores
@@ -241,8 +261,7 @@ def compute_wer(hyp, scores, ref, indeces, concept_dict, inverse_dict):
                 for ndl_el in nodouble_lst:
                     els_idx = [i for i,el in enumerate(tmp_lst) if el == ndl_el]
                     new_scores.append( min( [scores[idx] for idx in els_idx] ) )
-                assert len(new_scores) == len(nodouble_lst) 
-
+                assert len(new_scores) == len(nodouble_lst)
             output_hyp = torch.LongTensor( nodouble_lst ) 
 
             # 1. We remove blanks
@@ -266,9 +285,13 @@ def compute_wer(hyp, scores, ref, indeces, concept_dict, inverse_dict):
     else:
         output_hyp = output_idx
     nodouble_lst = normalize_semantics( [i.item() for i in output_hyp], new_scores, indeces, concept_dict, inverse_dict )
+    if corpus == 'fsc':
+        nodouble_lst = normalize_fsc_output(nodouble_lst, indeces)
     clean_hyp = torch.LongTensor( unpad_sequence(nodouble_lst) )
 
     tmp_ref_lst = normalize_semantics( [i.item() for i in ref], None, indeces, concept_dict, inverse_dict )
+    if corpus == 'fsc':
+        tmp_ref_lst = normalize_fsc_output(tmp_ref_lst, indeces)
     unpadded_list = unpad_sequence(tmp_ref_lst)
     ref = torch.IntTensor( unpadded_list ).view( len(unpadded_list), 1 )
 
@@ -405,7 +428,7 @@ eoc_idx = dict[slu_end_concept_mark]
 clean_flag = args.clean_hyp
 slu_flag = args.slu_out
 scored_seqs = []
-indeces = (blank_idx, soc_idx, eoc_idx, null_idx, clean_flag, slu_flag)
+indeces = (blank_idx, soc_idx, eoc_idx, null_idx, clean_flag, slu_flag, args.corpus)
 processed_hyps = 0
 total_hyps = len(refs)
 progress_format_str = '{:' + str(len(str(total_hyps))+1) + '} of {}\n'

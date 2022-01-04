@@ -1,7 +1,16 @@
 #!/bin/bash
 
+#CUDA_VAR="CUDA_VISIBLE_DEVICES=1"
+# TO RUN ON DECORE AND OTHER SERVERS UNCOMMENT THE FOLLOWING LINES
+#export FAIRSEQ_PATH=${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/
+#export PYTHONPATH=${HOME}/anaconda3/
+
+# TO RUN ON THE LIG GRID WITH OAR UNCOMMENT THE FOLLOWING LINES
 source ${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/activate 
 export FAIRSEQ_PATH=${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/
+export PYTHONPATH=${PYTHONPATH}:${HOME}/work/tools/fairseq/
+
+#export RNNTAGGERPATH=${HOME}/work/tools/Seq2Biseq_End2EndSLU/
 
 echo " ---"
 echo " * Using python: `which python`"
@@ -19,7 +28,8 @@ if [[ $# -eq 3 ]]; then
 	SUBTASK=$3
 fi
 
-CRITERION='cross_entropy'
+CRITERION='cross_entropy' # Use 'slu_ctc_loss' for CTC loss, 'cross_entropy' for Cross Entropy loss
+
 CHECKPOINT=checkpoints/checkpoint_best.pt
 if [[ $# -ge 1 ]]; then
 	CHECKPOINT=$1
@@ -38,19 +48,22 @@ BASIC_OPTIONS="--beam 1 --iter-decode-max-iter 1 --prefix-size 0 --match-source-
 GENERATE_OPTIONS="--beam 1 --iter-decode-max-iter 1 --max-len-a 1.0 --max-len-b 0 --prefix-size 0"	# Average max-len-a for MEDIA (computed on train): 0.123
 
 CHECKPOINT_DIR=`dirname ${CHECKPOINT}`
-PYTHONPATH=${PYTHONPATH}:${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
-	--path ${CHECKPOINT} ${GENERATE_OPTIONS} --max-sentences 1 --num-workers=0 \
+CUDA_VISIBLE_DEVICES=1 ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
+	--path ${CHECKPOINT} ${GENERATE_OPTIONS} --max-sentences 20 --num-workers=0 \
 	--task end2end_slu --criterion ${CRITERION} --padded-reference \
 	--serialized-data ${SERIALIZED_CORPUS} --slu-subtask ${SUBTASK} --user-only \
 	--gen-subset valid --results-path ${CHECKPOINT_DIR} \
 	| tee ${CHECKPOINT_DIR}/generate-valid.txt
 
-PYTHONPATH=${PYTHONPATH}:${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
-        --path ${CHECKPOINT} ${GENERATE_OPTIONS} --max-sentences 1 --num-workers=0 \
+CUDA_VISIBLE_DEVICES=1 ${FAIRSEQ_PATH}/fairseq-generate ${DATA_PATH} \
+        --path ${CHECKPOINT} ${GENERATE_OPTIONS} --max-sentences 20 --num-workers=0 \
         --task end2end_slu --criterion ${CRITERION} --padded-reference \
         --serialized-data ${SERIALIZED_CORPUS} --slu-subtask ${SUBTASK} --user-only \
         --gen-subset test --results-path ${CHECKPOINT_DIR} \
 	| tee ${CHECKPOINT_DIR}/generate-test.txt
 
 deactivate
+#conda deactivate
+
+
 
