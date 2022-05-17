@@ -13,6 +13,9 @@ from fairseq.tarc_utils import *
 from fairseq.data import data_utils
 from fairseq.models import FairseqIncrementalDecoder
 from fairseq.models.TarcMultiTaskModels import TarcMultiTaskModel
+from fairseq.models.fairseq_encoder import EncoderOut
+
+_DEBUG_ = False
 
 class TarcSequenceGenerator(object):
     def __init__(
@@ -188,7 +191,12 @@ class TarcSequenceGenerator(object):
             if name not in buffers:
                 buffers[name] = type_of.new()   # Allocate a new empty tensor
             return buffers[name]
- 
+
+        def get_buffer(name, source_t):
+            if name not in buffers:
+                buffers[name] = torch.zeros_like(source_t)
+            return buffers[name]
+
         def is_finished(task, sent, step, unfin_idx):
             """
             Check whether we've finished generation for a given sentence, by
@@ -280,14 +288,57 @@ class TarcSequenceGenerator(object):
              
             return newly_finished
 
+        def copy_encoder_output(encoder_out):
+            '''
+                Used to restore the original encoder output after a decoder finishes generating its output, as the model.reorder_encoder_out may have changed it
+            '''
+
+            encoder_out_copy = None
+            #for el in encoder_out:
+            if isinstance(encoder_out, EncoderOut):
+                return EncoderOut(
+                    encoder_out=encoder_out.encoder_out.clone() if encoder_out.encoder_out is not None else None,
+                    encoder_padding_mask=encoder_out.encoder_padding_mask.clone() if encoder_out.encoder_padding_mask is not None else None,
+                    encoder_embedding=encoder_out.encoder_embedding.clone() if encoder_out.encoder_embedding is not None else None,
+                    encoder_states=[s.clone() for s in encoder_out.encoder_states] if encoder_out.encoder_states is not None else None
+                )
+            elif isinstance(encoder_out, list) or isinstance(encoder_out, tuple):
+                encoder_out_copy = []
+                for el in encoder_out:
+                    encoder_out_copy.append( copy_encoder_output(el) )
+            elif isinstance(encoder_out, dict):
+                encoder_out_copy = {}
+                for k, v in encoder_out.items():
+                    encoder_out_copy[k] = copy_encoder_output(v)
+            else:
+                if encoder_out is not None: 
+                    return encoder_out.clone()
+                else:
+                    return None
+            return encoder_out_copy
+
+        encoder_outs_backup = copy_encoder_output( encoder_outs )
+        src_lengths_backup = src_lengths.clone()
         for m in model.models:
-            m.decoder.reset_hidden_states() 
+            m.decoder.reset_hidden_states()
+            m.decoder.reset_finalized_hypos()
         for task_idx in range(num_of_tasks):
             reorder_state = None
             batch_idxs = None
             dec_shapes = None
-            for m in model.models:
+
+            if task_idx > 0:
+                encoder_outs = copy_encoder_output( encoder_outs_backup )
+                src_lengths = src_lengths_backup.clone()
+            for m in model.models: 
                 m.decoder.set_active_tasks(task_idx, task_idx+1)
+                m.decoder.set_current_decoder(task_idx)
+
+            if _DEBUG_:
+                print('[DEBUG] tarc multitask sequence generator, decoding for task {}'.format(task_idx))
+                print(' ---------------')
+                sys.stdout.flush()
+
             for step in range(max_len + 1):  # one extra step for EOS marker
                 # reorder decoder internal states based on the prev choice of beams
                 if reorder_state is not None:
@@ -295,18 +346,68 @@ class TarcSequenceGenerator(object):
                         # update beam indices to take into account removed sentences
                         corr = batch_idxs - torch.arange(batch_idxs.numel()).type_as(batch_idxs)
                         reorder_state.view(-1, beam_size).add_(corr.unsqueeze(-1) * beam_size)
-                    model.reorder_incremental_state(reorder_state)
-                    encoder_outs = model.reorder_encoder_out(encoder_outs, reorder_state) 
 
-                mt_target = [t[:, :step+1] for t in tokens]
+                    if _DEBUG_:
+                        print('[DEBUG] tarc multitask sequence generator, reordering incremental state')
+                        sys.stdout.flush()
+
+                    model.reorder_incremental_state(reorder_state)
+
+                    if _DEBUG_:
+                        print('[DEBUG] tarc multitask sequence generator, reordering encoder output')
+                        sys.stdout.flush()
+
+                    encoder_outs = model.reorder_encoder_out(encoder_outs, reorder_state)
+
+                    if _DEBUG_:
+                        print('[DEBUG] tarc multitask sequence generator, reordering done.')
+                        sys.stdout.flush()
+
+                #mt_target = [t[:, :step+1] for t in tokens]
+                mt_target = []
+                for i in range(num_of_tasks):
+                    if i == task_idx:
+                        mt_target.append( tokens[i][:,:step+1] )
+                    else:
+
+                        if _DEBUG_:
+                            print('[DEBUG] tarc multitask sequence generator, appending to mt_target: {}'.format(tokens[task_idx][:,:1]))
+                            sys.stdout.flush()
+
+                        mt_target.append( tokens[task_idx][:,:1] )
+
+                if reorder_state is not None and reorder_state.size(0) != mt_target[0].size(0):
+                    if _DEBUG_:
+                        print('[DEBUG] tarc multitask sequence generator, reordering previous outputs, new order: {}'.format(reorder_state))
+                        for t in mt_target:
+                            print('[DEBUG] tarc multitask sequence generator    * {}'.format(t.size()))
+                        print('[DEBUG] tarc multitask sequence generator .')
+                        sys.stdout.flush()
+ 
+                    mt_target = [torch.index_select(t, 0, reorder_state) for t in mt_target]
+
+                if _DEBUG_:
+                    print('[DEBUG] tarc multitask sequence generator, mt_target shapes ({}):'.format(len(mt_target)))
+                    for i in range(len(mt_target)):
+                        print(' * {}) {}'.format(i, mt_target[i].size()))
+                    sys.stdout.flush()
+
                 mtt_szs = [t.size(0) for t in mt_target]
                 mt_target = concat_with_sep(mt_target, model.models[0].sequence_separator, shapes=dec_shapes)
                 tok_char_mt_target = [mt_target, mt_target] 
+
+                if _DEBUG_:
+                    print('[DEBUG] concat_with_sep passed')
+                    sys.stdout.flush()
 
                 lprobs, avg_attn_scores = model.forward_decoder(
                     tok_char_mt_target, shapes=dec_shapes, tgt_tok_bounds=tgt_tok_bounds, sort_order=sort_order, encoder_outs=encoder_outs, temperature=self.temperature,
                 )
  
+                if _DEBUG_:
+                    print('[DEBUG] forward_decoder passed')
+                    sys.stdout.flush()
+
                 lprobs[task_idx][lprobs[task_idx] != lprobs[task_idx]] = -math.inf
                 lprobs[task_idx][:, self.pad] = -math.inf  # never select pad
                 lprobs[task_idx][:, self.unk] -= self.unk_penalty  # apply unk penalty
@@ -387,8 +488,8 @@ class TarcSequenceGenerator(object):
                     for bbsz_idx in range(bsz_val * beam_size):
                         lprobs[task_idx][bbsz_idx, banned_tokens[bbsz_idx][task_idx]] = -math.inf
                 
-                eos_bbsz_idx = buffer('eos_bbsz_idx')
-                eos_scores = buffer('eos_scores', type_of=scores[0])
+                #eos_bbsz_idx = buffer('eos_bbsz_idx')
+                #eos_scores = buffer('eos_scores', type_of=scores[0])
 
                 cand_scores, cand_indices, cand_beams = self.search.step(
                     step,
@@ -407,19 +508,50 @@ class TarcSequenceGenerator(object):
                 eos_mask[:, :beam_size][blacklist[task_idx]] = 0
 
                 # only consider eos when it's among the top beam_size indices
-                torch.masked_select(
+
+                #eos_bbsz_idx = buffer_ex('eos_bbsz_idx', cand_bbsz_idx[:,:beam_size])
+                #eos_scores = buffer_ex('eos_scores', cand_scores[:, :beam_size])
+
+                if _DEBUG_:
+                    print('[DEBUG] tmsg shapes check: cand_bbsz_idx {}'.format(cand_bbsz_idx.size()))
+                    print('[DEBUG]   ": eos_mask {}'.format(eos_mask.size()))
+                    #print('[DEBUG]   ": eos_bbsz_idx {}'.format(eos_bbsz_idx.size()))
+                    print(' -----')
+                    sys.stdout.flush()
+
+                eos_bbsz_idx = torch.masked_select(
                     cand_bbsz_idx[:, :beam_size],
-                    mask=eos_mask[:, :beam_size],
-                    out=eos_bbsz_idx,
+                    mask=eos_mask[:, :beam_size]
                 )
+                #    out=eos_bbsz_idx,
+                #)
+
+                if _DEBUG_:
+                    print('[DEBUG] eos_bbsz_idx after masked_select: {}'.format(eos_bbsz_idx.size()))
+                    sys.stdout.flush()
 
                 finalized_sents: List[int] = []
                 if eos_bbsz_idx.numel() > 0:
-                    torch.masked_select(
+
+                    if _DEBUG_:
+                        print('[DEBUG] ========== DETECTED END-OF-SENTENCE MARKERS ==========')
+                        print('[DEBUG] tmsg shapes check: cand_scores {}'.format(cand_scores.size()))
+                        print('[DEBUG]   ": eos_mask {}'.format(eos_mask.size()))
+                        #print('[DEBUG]   ": eos_scores {}'.format(eos_scores.size()))
+                        print(' -----')
+                        sys.stdout.flush()
+
+                    eos_scores = torch.masked_select(
                         cand_scores[:, :beam_size],
-                        mask=eos_mask[:, :beam_size],
-                        out=eos_scores,
+                        mask=eos_mask[:, :beam_size]
                     )
+                    #    out=eos_scores,
+                    #)
+
+                    if _DEBUG_:
+                        print('[DEBUG] eos_scores after masked_select: {}'.format(eos_scores.size()))
+                        sys.stdout.flush()
+
                     if num_remaining_sent[task_idx] > 0: 
                         finalized_sents = finalize_hypos(task_idx, step, eos_bbsz_idx, eos_scores) 
                         num_remaining_sent[task_idx] -= len(finalized_sents)
@@ -427,21 +559,46 @@ class TarcSequenceGenerator(object):
                 remain_sent_all = sum(num_remaining_sent) 
                 assert remain_sent_all >= 0
                 if num_remaining_sent[task_idx] == 0:
+                    if _DEBUG_:
+                        print('[DEBUG] ending decoding for task {}'.format(task_idx))
+                        sys.stdout.flush()
+
                     break
                 assert step < max_len
  
-                if len(finalized_sents) > 0: 
+                if len(finalized_sents) > 0:
+                    for m in model.models:
+                        m.add_finalized_hypos( finalized_sents, task_idx )
                     if num_remaining_sent[task_idx] > 0:
-                        bsz[task_idx] -= len(finalized_sents)
+                        #bsz[task_idx] -= len(finalized_sents)
+                        new_bsz = bsz[task_idx] - len(finalized_sents)  # NEW! before: bsz[task_idx] -= len(finalized_sents)
 
                         # construct batch_idxs which holds indices of batches to keep for the next pass
-                        batch_mask = cand_indices.new_ones(bsz_val)
+                        batch_mask = cand_indices.new_ones(bsz[task_idx])   # NEW! before: bsz_val instead of bsz[task_idx]
                         batch_mask[cand_indices.new(finalized_sents)] = 0
                         batch_idxs = batch_mask.nonzero().squeeze(-1)
 
+                        if _DEBUG_:
+                            print('* [DEBUG] ========== FINILIZING SENTENCES ==========')
+                            print('* [DEBUG] bsz[task_idx]: {}'.format(bsz[task_idx]))
+                            print('* [DEBUG] finalized_sents: {}'.format(finalized_sents))
+                            print('* [DEBUG] cand_indices (shape: {}): {}'.format(cand_indices.size(), cand_indices))
+                            print('* [DEBUG] cand_indices.new_ones(bsz_val): {}'.format(cand_indices.new_ones(bsz[task_idx])))
+                            print('* [DEBUG] cand_indices.new(finalized_sents): {}'.format(cand_indices.new(finalized_sents)))
+                            print('* [DEBUG] batch_mask: {}'.format(batch_mask))
+                            print('* [DEBUG] bsz[task_idx]: {}'.format(bsz[task_idx]))
+                            print('* [DEBUG] batch_idxs: {}'.format(batch_idxs))
+                            sys.stdout.flush()
+
                         eos_mask = eos_mask[batch_idxs]
                         cand_beams = cand_beams[batch_idxs] 
-                        bbsz_offsets[task_idx].resize_(bsz[task_idx], 1) 
+                        bbsz_offsets[task_idx].resize_(new_bsz, 1)  # NEW! before: bsz[task_idx] instead of new_bsz
+
+                        if _DEBUG_:
+                            print('* [DEBUG] bbsz_offsets[task_idx]: {}'.format(bbsz_offsets[task_idx].size()))
+                            print('* [DEBUG] cand_beams: {}'.format(cand_beams.size()))
+                            sys.stdout.flush()
+
                         cand_bbsz_idx = cand_beams.add(bbsz_offsets[task_idx])
                         cand_scores = cand_scores[batch_idxs]
                         cand_indices = cand_indices[batch_idxs] 
@@ -452,45 +609,57 @@ class TarcSequenceGenerator(object):
                         src_lengths = src_lengths[batch_idxs]
                         blacklist[task_idx] = blacklist[task_idx][batch_idxs]
  
-                        scores[task_idx] = scores[task_idx].view(bsz_val, -1)[batch_idxs].view(bsz[task_idx] * beam_size, -1)
+                        scores[task_idx] = scores[task_idx].view(bsz[task_idx], -1)[batch_idxs].view(new_bsz * beam_size, -1)   # NEW! before: bsz_val instead of bsz[task_idx] AND bsz[task_idx] instead of new_bsz
                         scores_buf[task_idx].resize_as_(scores[task_idx])
-                        tokens[task_idx] = tokens[task_idx].view(bsz_val, -1)[batch_idxs].view(bsz[task_idx] * beam_size, -1)
+                        tokens[task_idx] = tokens[task_idx].view(bsz[task_idx], -1)[batch_idxs].view(new_bsz * beam_size, -1)   # NEW! before: like above
                         tokens_buf[task_idx].resize_as_(tokens[task_idx])
                         if attn[task_idx] is not None:
-                            attn[task_idx] = attn[task_idx].view(bsz_val, -1)[batch_idxs].view(bsz[task_idx] * beam_size, attn.size(1), -1)
-                            attn_buf[task_idx].resize_as_(attn[task_idx]) 
+                            attn[task_idx] = attn[task_idx].view(bsz[task_idx], -1)[batch_idxs].view(new_bsz * beam_size, attn.size(1), -1) # NEW! before: like above
+                            attn_buf[task_idx].resize_as_(attn[task_idx])
+
+                        bsz[task_idx] = new_bsz
+
+                        if _DEBUG_:
+                            print('* [DEBUG] ========== SENTENCES FINALIZED ==========')
+                            sys.stdout.flush()
                 else:
+                    for m in model.models:
+                        m.add_finalized_hypos( [], task_idx )
                     batch_idxs = None
   
                 # Set active_mask so that values > cand_size indicate eos or
                 # blacklisted hypos and values < cand_size indicate candidate
                 # active hypos. After this, the min values per row are the top
                 # candidate active hypos.
-                active_mask = buffer('active_mask')
+                
+                #active_mask = buffer('active_mask')
                 eos_mask[:, :beam_size] |= blacklist[task_idx]
-                torch.add(
+                active_mask = torch.add(
                     eos_mask.type_as(cand_offsets[task_idx]) * cand_size,
-                    cand_offsets[task_idx][:eos_mask.size(1)],
-                    out=active_mask,
+                    cand_offsets[task_idx][:eos_mask.size(1)]
                 )
+                #    out=active_mask,
+                #)
 
                 # get the top beam_size active hypotheses, which are just the hypos
                 # with the smallest values in active_mask
-                active_hypos, new_blacklist = buffer('active_hypos'), buffer('new_blacklist')
-                torch.topk(
-                    active_mask, k=beam_size, dim=1, largest=False,
-                    out=(new_blacklist, active_hypos)
+                #active_hypos, new_blacklist = buffer('active_hypos'), buffer('new_blacklist')
+                active_hypos, new_blacklist = torch.topk(
+                    active_mask, k=beam_size, dim=1, largest=False
                 )
+                #    out=(new_blacklist, active_hypos)
+                #)
 
                 # update blacklist to ignore any finalized hypos
                 blacklist[task_idx] = new_blacklist.ge(cand_size)[:, :beam_size]
                 assert (~blacklist[task_idx]).any(dim=1).all()
 
-                active_bbsz_idx = buffer('active_bbsz_idx')
-                torch.gather(
-                    cand_bbsz_idx, dim=1, index=active_hypos,
-                    out=active_bbsz_idx,
+                #active_bbsz_idx = buffer('active_bbsz_idx')
+                active_bbsz_idx = torch.gather(
+                    cand_bbsz_idx, dim=1, index=active_hypos
                 )
+                #    out=active_bbsz_idx,
+                #)
                 active_scores = torch.gather(
                     cand_scores, dim=1, index=active_hypos,
                     out=scores[task_idx][:, step].view(bsz[task_idx], beam_size),

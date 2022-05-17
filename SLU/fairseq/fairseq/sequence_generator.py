@@ -263,7 +263,8 @@ class SequenceGenerator(object):
 
         reorder_state = None
         batch_idxs = None
-        for step in range(max_len + 1):  # one extra step for EOS marker
+        for step in range(max_len + 1):  # one extra step for EOS marker 
+
             # reorder decoder internal states based on the prev choice of beams
             if reorder_state is not None:
                 if batch_idxs is not None:

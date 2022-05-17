@@ -228,6 +228,10 @@ class TransformerDecoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
+
+        print(' * [DEBUG] TransformerDecoderLayer, prev_self_attn_state is None ? {}'.format(prev_self_attn_state is None))
+        sys.stdout.flush()
+
         if prev_self_attn_state is not None:
             prev_key, prev_value = prev_self_attn_state[:2]
             saved_state: Dict[str, Optional[Tensor]] = {
@@ -239,11 +243,19 @@ class TransformerDecoderLayer(nn.Module):
             assert incremental_state is not None
             self.self_attn._set_input_buffer(incremental_state, saved_state)
         _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
+
+        print(' * [DEBUG] TransformerDecoderLayer, _self_attn_input_buffer is None ? {}'.format(_self_attn_input_buffer is None))
+        sys.stdout.flush()
+
         if self.cross_self_attention and not (
             incremental_state is not None
             and _self_attn_input_buffer is not None
             and "prev_key" in _self_attn_input_buffer
         ):
+
+            print(' * [DEBUG] TransformerDecoderLayer, setting self attention keys and values...')
+            sys.stdout.flush()
+
             if self_attn_mask is not None:
                 assert encoder_out is not None
                 self_attn_mask = torch.cat(
@@ -281,6 +293,10 @@ class TransformerDecoderLayer(nn.Module):
             residual = x
             if self.normalize_before:
                 x = self.encoder_attn_layer_norm(x)
+
+            print(' * [DEBUG] TransformerDecoderLayer, prev_attn_state is None ? {}'.format(prev_attn_state is None))
+            sys.stdout.flush()
+
             if prev_attn_state is not None:
                 prev_key, prev_value = prev_attn_state[:2]
                 saved_state: Dict[str, Optional[Tensor]] = {
@@ -328,6 +344,10 @@ class TransformerDecoderLayer(nn.Module):
                 ]
             else:
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
+
+            print(' * [DEBUG] TransformerDecoderLayer, set self_attn_state')
+            sys.stdout.flush()
+
             return x, attn, self_attn_state
         return x, attn, None
 

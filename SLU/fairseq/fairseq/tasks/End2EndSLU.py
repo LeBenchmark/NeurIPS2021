@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 # Code for adding the End2End SLU task into fairseq
 
 import os
@@ -12,21 +14,10 @@ from fairseq.tasks import FairseqTask, register_task
 
 import examples.speech_recognition.criterions.SLU_CTC_loss as slu_ctc
 
-'''# Make these symbols global
-SOS_tag = 'SOS'
-blank_token = "__"
-pad_token = '_'
-pad_char = pad_token
-EOS_tag = 'EOS'
-unk_token = '<unk>'
-machine_semantic = 'MachineSemantic'
-slu_start_concept_mark = '_SOC_'
-slu_end_concept_mark = '_EOC_'
-user_ID = 'User'
-machine_ID = 'Machine'
+#from carbontracker.tracker import CarbonTracker
+from codecarbon import EmissionsTracker
 
-LOSS_INIT_VALUE=999999.9
-ER_INIT_VALUE=LOSS_INIT_VALUE'''
+_ADVANCED_SPK_MARK_ = True
 
 class SLUDictionary(Dictionary):
     """Dictionary wrapping to initialize a dictionary from a raw python dictionary"""
@@ -121,14 +112,163 @@ def create_batch_(data, curr_batch_ids):
 
     return dialog_batch
 
-def create_dialog_batches_(data, batch_size):
-    
+def get_bogus_turn(real_turn, dd, turn_id=None):
+    # EOS_tag, User_ID
+    T, C = real_turn[1].size()
+    sig = torch.zeros(1, C).to(real_turn[1])
+    tt = torch.LongTensor( [dd.eos()] )
+    bogus_id = turn_id if turn_id is not None else real_turn[0]
+    return (bogus_id, sig, tt, tt, tt, bogus_ID)
+
+def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
+
+    len_sorted = sorted(dlens.keys())
+    batches = []    # Batches of dialog id, not necessarily of the same length
+    batch = []
+    did2len = {}    # Given a dialog id (did) gets its length (in number of turns)
+    batch2len = []  # For a batch index, gets the length dialogues in that batch (must) have
+    for l in len_sorted:
+        num_batches = int(len(dlens[l])/bs) # dlens[l] is the list of dialogues (ID) having length l (in number of turns)
+        remainder = len(dlens[l]) % bs
+
+        for bi in range(num_batches):
+            for ti in range(bs):
+                batch.append( dlens[l][bi*bs+ti] )
+                did2len[dlens[l][bi*bs+ti]] = l
+                if len(batch) == bs:    # "finalize" this batch
+                    batches.append(batch)
+                    batch = []
+                    batch2len.append(l) # all dialogues in this batch will be padded to have this length
+
+        for ti in range(remainder):
+            batch.append( dlens[l][num_batches*bs+ti] )
+            did2len[dlens[l][num_batches*bs+ti]] = l
+            if len(batch) == bs:
+                batches.append(batch)
+                batch = []
+                batch2len.append(l) # this should be correct as we are scanning len_sorted with increasing lengths
+
+    if len(batch) > 0:
+        batches.append(batch) # TODO: last batch must be treated possibly in a different way...
+        max_len = 0
+        for did in batch:
+            did2len[did] = len(data[did])
+            if max_len < len(data[did]):
+                max_len = len(data[did])
+        batch = []
+        batch2len.append( max_len )
+
+    # TMP DEBUG CHECK
+    tot_len = 0
+    for bi, b in enumerate(batches):
+        if bi < len(batches)-1:
+            assert len(b) == bs
+        tot_len += len(b)
+    assert tot_len == len(data.keys())
+    for did in did2len.keys():
+        assert did2len[did] == len(data[did])
+    for bi, bb in enumerate(batches):
+        for did in bb:
+            assert len(data[did]) <= batch2len[bi]
+    # END TMP DEBUG CHECK
+
+    # Now add bogus turns to dialogues so that to have: 1. all dialogues in the same batch of the same length; 2. num of dialogues multiple of batch-size (this is accomplished by creating whole bogus dialogues! Hope this work...) 
+    for bi, bb in enumerate(batches):
+        max_len = batch2len[bi]
+
+        tmp = max([did2len[did] for did in bb])
+        assert tmp == max_len
+
+        for did in bb:
+            if did2len[did] < max_len:
+                dialog = data[did]
+                for ii in range(did2len[did]+1, max_len+1):
+                    dialog.append( get_bogus_turn(dialog[0], dd, ii) )
+                #data[did] = dialog # needed ???
+
+    # NOTE: last batch may contain less dialogues than bs, so possibly whole bogus dialogues must be added to have a batch of the same size as the others.
+    if len(batches[-1]) != bs:
+        did = 9900
+        max_len = batch2len[-1]
+
+        tmp = max( [did2len[did] for did in batches[-1]] )
+        assert tmp == max_len
+
+        for ii in range(bs-len(batches[-1])):
+            bogus_did = str(did+ii+1)
+            batches[-1].append(bogus_did) 
+            data[bogus_did] = []
+            did2len[bogus_did] = 0
+
+        assert len(batches[-1]) == bs
+
+        for did in batches[-1]:
+            if did2len[did] < max_len: # actually only the bogus dialogues should satisfy this condition !
+                assert did2len[did] == 0
+
+                dialog = data[did]
+                for ii in range(did2len[did]+1, max_len+1):
+                    dialog.append( get_bogus_turn(batches[-1][0], dd, ii) )
+                #data[did] = dialog # needed ???
+
+    # TMP DEBUG CHECK
+    assert len(data) % bs == 0
+
+    for ii, bb in enumerate(batches):
+        dlen = batch2len[ii]
+        plen = len(data[bb[0]])
+        found = False
+        for did in bb:
+            assert len(data[did]) == dlen
+            assert len(data[did]) == plen
+
+            if torch.sum(data[did][-1][1]).item() != 0.0:
+                found = True
+        if not found:
+            raise ValueError('Found a batch with all zero-turns as last')
+    # END TMP DEBUG CHECK
+
+    # TODO: add here an end of dialog marker in each and every dialog so that the model can detect when to re-initialize the dialog history cache
+    for did in data:
+        data[did].append( get_bogus_turn(data[did][0], dd, len(data[did])+1) )
+
     dialog_lengths = {}
     for dialog_id in data.keys():
         curr_len = len(data[dialog_id])
         if not curr_len in dialog_lengths:
             dialog_lengths[curr_len] = []
         dialog_lengths[curr_len].append( dialog_id )
+
+    # TMP DEBUG CHECK
+    for l in dialog_lengths.keys():
+        assert len(dialog_lengths[l]) % bs == 0
+    for bb in batches:
+        found = False
+        for did in bb:
+            if torch.sum(data[did][-1][1]) != 0.0:
+                found = True
+        if found:
+            raise ValueError('Found a batch without End-of-dialogue marker')
+    # END TMP DEBUG CHECK
+
+    return dialog_lengths
+
+def create_dialog_batches_(data, batch_size, infos):
+
+    dd = infos['dict']
+    dlevel_slu = infos['dialog_level_slu']
+
+    dialog_lengths = {}
+    for dialog_id in data.keys():
+        curr_len = len(data[dialog_id])
+        if not curr_len in dialog_lengths:
+            dialog_lengths[curr_len] = []
+        dialog_lengths[curr_len].append( dialog_id )
+
+    if dlevel_slu:
+        raise NotImplementedError()
+
+        dialog_lengths = rearrange_for_dialog_level_slu_(data, batch_size, dialog_lengths, dd)
 
     dialog_batches = []
     for dlen in dialog_lengths.keys():
@@ -137,6 +277,9 @@ def create_dialog_batches_(data, batch_size):
             
             num_batches = int(len(dialog_lengths[dlen]) / batch_size)
             remainder = len(dialog_lengths[dlen]) % batch_size
+
+            if dlevel_slu:
+                assert remainder == 0
             
             b_idx = 0
             while b_idx < num_batches:
@@ -148,6 +291,9 @@ def create_dialog_batches_(data, batch_size):
                 curr_batch_ids = dialog_lengths[dlen][num_batches*batch_size:]
                 dialog_batches.append( create_batch_(data, curr_batch_ids) )
         else:
+            if dlevel_slu:
+                raise ValueError()
+
             curr_batch_ids = dialog_lengths[dlen]
             dialog_batches.append( create_batch_(data, curr_batch_ids) )
 
@@ -171,7 +317,7 @@ def parse_media_semantic_annotation(filename):
     p = re.compile('^(\+|\-)?(\S+)\{([^\}]+)\}')
     
     Dialogs = {}
-    f = open(filename)
+    f = open(filename, encoding='utf-8')
     for line in f:
         line.rstrip("\r\n")
         tokens = line.split()
@@ -335,7 +481,7 @@ def read_dialog_data(TurnList, args):
 
             # 3. The reference transcription 
             turn_txt = read_txt(turn.strip() + '.txt')
-            turn_data.append( turn_txt ) 
+            turn_data.append( turn_txt )
 
             # 4. The transcription "enriched" with semantic annotation
             basename = turn.split('/')[-1]
@@ -374,8 +520,9 @@ def read_dialog_data(TurnList, args):
 
     return dialog_data
 
-def get_character_level_slu_turn(slu_turn_tsr, vocab, pad_flag=False):
+def get_character_level_slu_turn(args, slu_turn_tsr, vocab):
 
+    pad_flag = args.padded_reference
     slu_turn_str = vocab.string(slu_turn_tsr)
 
     #print('Original turn: {}'.format(slu_turn_str))
@@ -385,34 +532,45 @@ def get_character_level_slu_turn(slu_turn_tsr, vocab, pad_flag=False):
     char_slu_turn_str = ''
     if pad_flag:
         char_slu_turn_str = SOS_tag
-    chunk = {}
-    chunk['surface'] = []
-    for t in tokens:
-        if t == slu_start_concept_mark:
-            chunk['start'] = t
-        elif t == slu_end_concept_mark:
-            chunk['end'] = t
-            chunk['concept'] = chunk['surface'][-1]
-            chunk['surface'] = chunk['surface'][:-1]
 
-            if char_slu_turn_str != '':
-                char_slu_turn_str = char_slu_turn_str + ' '
-            char_slu_turn_str = char_slu_turn_str + chunk['start'] + ' '
-            for c in '|'.join(chunk['surface']).lower():
-                char_slu_turn_str = char_slu_turn_str + c + ' '
-            char_slu_turn_str = char_slu_turn_str + chunk['concept'] + ' ' + chunk['end'] + ' '
-            chunk = {}
-            chunk['surface'] = []
-        else:
-            chunk['surface'].append(t)
+    if args.corpus_name == 'fsc':
+        for c in '|'.joint(tokens[:-2]):
+            char_slu_turn_str = char_slu_turn_str + c + ' '
+    else:
+        chunk = {}
+        chunk['surface'] = []
+        for t in tokens:
+            if t == slu_start_concept_mark:
+                chunk['start'] = t
+            elif t == slu_end_concept_mark:
+                chunk['end'] = t
+                chunk['concept'] = chunk['surface'][-1]
+                chunk['surface'] = chunk['surface'][:-1]
+
+                if chunk['concept'] in ['', ' ', '|']:
+                    raise ValueError(' Found invalid concept {}'.format(chunk['concept']))
+
+                if char_slu_turn_str != '':
+                    char_slu_turn_str = char_slu_turn_str + ' '
+                char_slu_turn_str = char_slu_turn_str + chunk['start'] + ' | ' # TODO: with new format replace ' ' with ' | '
+                for c in '|'.join(chunk['surface']):
+                    char_slu_turn_str = char_slu_turn_str + c + ' '
+                char_slu_turn_str = char_slu_turn_str + ' | ' + chunk['concept'] + ' | ' + chunk['end'] + ' | '
+                #char_slu_turn_str = char_slu_turn_str + ' ' + chunk['concept'] + ' ' + chunk['end'] + ' ' # TODO: with new format comment this line and uncomment the previous
+                chunk = {}
+                chunk['surface'] = []
+            else:
+                chunk['surface'].append(t)
 
     if pad_flag:
         char_slu_turn_str = char_slu_turn_str + EOS_tag
     else:
         char_slu_turn_str = char_slu_turn_str[:-1] # Remove trailing space
 
-    #print('Character-level turn: {}'.format(char_slu_turn_str))
+    #print(' **** Original SLU turn: {}'.format(slu_turn_str))
+    #print(' * Character-level turn: {}'.format(char_slu_turn_str))
     #print(' -----')
+    #sys.stdout.flush()
 
     return char_slu_turn_str
 
@@ -478,11 +636,13 @@ class End2EndSLU(FairseqTask):
                             help='file containing the serialized corpus (with a previous torch.save)')
         parser.add_argument('--load-dictionary', type=str,
                             help='Load the dictionary for the task symbols from the specified file (e.g. to perform transfer learning)')
+        parser.add_argument('--source-dictionary', type=str,
+                            help='When performing transfer learning, uses this dictionary as source domain dictionary')
         parser.add_argument('--target-dictionary', type=str,
-                            help='When performing transfer learning, uses this dictionary as target domain dictionary to correctly initialize model embeddings and related parameters. If this argument is specified, the dictionary must be a sub-set of the dictionary specified with --load-dictionary')
+                            help='When performing transfer learning, uses this dictionary as target domain dictionary')
         parser.add_argument('--max-source-positions', default=10000, type=int,
                             help='max input length')
-        parser.add_argument('--max-target-positions', default=1024, type=int,
+        parser.add_argument('--max-target-positions', default=1600, type=int,
                             help='max input length')
         parser.add_argument('--slu-subtask', default='char', type=str,
                             help='which subtask has to be modeled (e.g. char, token, concept)')
@@ -513,6 +673,7 @@ class End2EndSLU(FairseqTask):
         parser.add_argument( '--load-fairseq-decoder', type=str, help='Load the decoder from a fairseq checkpoint' )
         parser.add_argument( '--slu-end2end', action='store_true', default=False, help='Add an auxiliary loss for an additional output expected in the model output structure' )
         parser.add_argument('--scheduled-sampling', action='store_true', default=False, help='Use scheduled sampling during training')
+        parser.add_argument('--start-scheduled-sampling', type=int, default=2, help='Epoch starting from which scheduled sampling will be performed')
         parser.add_argument('--encoder-state-window', type=int, default=2, help='Size w of the window of encoder states attended by the cross attention')
         parser.add_argument('--pyramid-hidden-layers', type=int, default=2, help='Number of layers in the hidden LSTM stages of the pyramidal encoder')
         parser.add_argument('--prev-prediction-query', type=int, default=-1, help='Index of the decoder hidden state used as query on the previous predictions')
@@ -522,6 +683,9 @@ class End2EndSLU(FairseqTask):
         parser.add_argument('--max-padding-len', type=int, default=60, help='Max length of input sequences that are padded in order to avoid input/output length missmatch')
         parser.add_argument('--max-padding-ratio', type=float, default=7.0, help='Factor by which input sequences shorter than max-padding-len are stretched to avoid input/output length missmatch')
         parser.add_argument('--padding-active', action='store_true', default=False, help='Determine if padding should be done or not')
+        parser.add_argument('--unfreeze-encoder-at-cer', type=float, default=110.00, help='Unfreeze encoder parameters for training when the dev CER goes below the specified value')
+        parser.add_argument('--dialog-level-slu', action='store_true', default=False, help='Re-arrange turns and dialogues to perform dialog-level SLU')
+        parser.add_argument('--speech-encoder', type=str, default='ziggurat', help='Structure of speech encoder: ziggurat (NeurIPS 2021 paper), deep-speech (ICASSP 2020 paper)')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -535,7 +699,7 @@ class End2EndSLU(FairseqTask):
             eos=EOS_tag,
             unk=unk_token,
             bos=SOS_tag,
-            extra_special_symbols=[blank_token, machine_semantic, slu_start_concept_mark, slu_end_concept_mark]
+            extra_special_symbols=[blank_token, machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, 'ã']
         )
         # NOTE: we are ogliged to initialize the Dictionary as it is requested in Fairseq,
         #       but then we reset it and re-add symbols so that to have index 0 for the blank token, as needed by the CTC loss.
@@ -550,14 +714,15 @@ class End2EndSLU(FairseqTask):
         label_vocab.add_symbol(machine_semantic)
         label_vocab.add_symbol(slu_start_concept_mark)
         label_vocab.add_symbol(slu_end_concept_mark)
+        label_vocab.add_symbol(tok_separator)
+        label_vocab.add_symbol('ã')
         label_vocab.set_nspecial_()  # We set the tokens added so far as being special tokens.
 
         if args.load_dictionary:
-            if os.path.exists(args.load_dictionary) and os.path.isfile(args.load_dictionary):
-                print(' - Loading serialized dictionary...')
-                sys.stdout.flush()
-
-                label_vocab = torch.load(args.load_dictionary)
+            print(' - Loading serialized dictionary...')
+            sys.stdout.flush()
+            
+            label_vocab = torch.load(args.load_dictionary)
 
         print('| [label] dictionary: {} types'.format(len(label_vocab)))
         
@@ -566,6 +731,19 @@ class End2EndSLU(FairseqTask):
     def __init__(self, args, label_vocab):
         
         super().__init__(args)
+
+        self.spk_abs_val = 1.0
+        self.num_speakers = 2
+        if args.dialog_level_slu:
+            self.num_speakers = 3
+        self.tracker_epoch = -1
+        self.epoch_no_improvement = 0
+        self.patience = args.patience if hasattr(args, 'patience') else 0
+        self.last_epoch = False
+        self.ended_tracking = False
+        self.max_epoch = args.max_epoch if hasattr(args, 'max_epoch') else 0
+        self.tracker = EmissionsTracker(output_dir=args.save_dir if hasattr(args, 'save_dir') else './') #CarbonTracker(epochs=args.max_epoch, monitor_epochs=-1)
+
         self.label_vocab = label_vocab
         self.num_features = 81
 
@@ -642,7 +820,7 @@ class End2EndSLU(FairseqTask):
                     gradient
                 - logging outputs to display while training
         """
-        
+
         loss, sample_size, logging_output = super().train_step(sample, model, criterion, optimizer, update_num, ignore_grad)
         self.curr_train_loss += loss.item()
         self.nsteps += 1
@@ -657,10 +835,27 @@ class End2EndSLU(FairseqTask):
             self.dev_errors += logging_output['errors']
             self.dev_tokens += logging_output['total']
 
+        if self.last_epoch and not self.ended_tracking:
+            self.tracker.stop()
+            self.ended_tracking = True
+
+            print('[DEBUG] CO2 emission tracker stopped.')
+            sys.stdout.flush()
+
         return loss, sample, logging_output
 
     def begin_epoch(self, epoch, model):
         """Hook function called before the start of each epoch."""
+
+        if self.tracker_epoch == -1:
+            print('[DEBUG] CO2 emission tracker epoch started')
+            sys.stdout.flush()
+
+            self.tracker.start()
+        else:
+            print('[DEBUG] CO2 emission tracker progress...')
+            sys.stdout.flush() 
+        self.tracker_epoch = epoch 
 
         n_ss_up = 0
         self.curr_epoch += 1
@@ -675,7 +870,7 @@ class End2EndSLU(FairseqTask):
 
         if epoch > 1:
             self.init_ss_threshold *= 0.98
-            if self.scheduled_sampling:
+            if self.scheduled_sampling and epoch >= self.args.start_scheduled_sampling:
                 n_ss_up = model.get_scheduled_sampling_updates()
                 model.set_scheduled_sampling(ss_val=True, epoch=epoch)
 
@@ -701,9 +896,25 @@ class End2EndSLU(FairseqTask):
                 self.best_dev_loss = self.curr_dev_loss
             if self.best_dev_er > self.curr_dev_er:
                 self.best_dev_er = self.curr_dev_er
+                self.epoch_no_improvement = 0
+            else:
+                self.epoch_no_improvement += 1
                 # Reset some ss state values
             #else:
                 # Set some ss values
+
+            if self.args.unfreeze_encoder_at_cer != 110.00 and self.curr_dev_er <= self.args.unfreeze_encoder_at_cer:
+                print(' * End2EndSLU, dev cer {} reached, unfreezing encoder'.format(self.curr_dev_er))
+                sys.stdout.flush()
+
+                model.unfreeze_encoder()
+
+        if self.epoch_no_improvement >= self.patience or self.tracker_epoch == self.max_epoch:
+            print('[DEBUG] stopping CO2 emission tracker')
+            sys.stdout.flush()
+
+            self.last_epoch = True
+            #self.tracker.stop()
 
         self.curr_train_loss = 0.0
         self.curr_dev_loss = 0.0
@@ -718,16 +929,31 @@ class End2EndSLU(FairseqTask):
             When using the MEDIA corpus it is important to distinguish between the Machine, which is much easier to recognize, and a User.
         """
 
-        spk_abs_val = 5.0
+        #num_speakers = 2
+        channel_per_speaker = 2
+        #spk_abs_val = 1.0
         (src_len, dim) = feats.size()
+        if _ADVANCED_SPK_MARK_:
+            speaker_mark = torch.zeros(src_len, channel_per_speaker*self.num_speakers).to(feats)
         spk_val = 0.0
         if spk == user_ID:
-            spk_val = +spk_abs_val
+            spk_val = +self.spk_abs_val
+            if _ADVANCED_SPK_MARK_:
+                speaker_mark[:,:channel_per_speaker] = spk_val
         elif spk == machine_ID:
-            spk_val = -spk_abs_val
+            spk_val = -self.spk_abs_val
+            if _ADVANCED_SPK_MARK_:
+                speaker_mark[:,channel_per_speaker:2*channel_per_speaker] = spk_val
+        elif spk == bogus_ID: 
+            spk_val = -2.0*self.spk_abs_val
+            if _ADVANCED_SPK_MARK_:
+                speaker_mark[:,2*channel_per_speaker:] = spk_val
         else:
             raise NotImplementedError
 
+        if _ADVANCED_SPK_MARK_:
+            feats = torch.cat([feats, speaker_mark], 1)
+            dim = dim + channel_per_speaker*self.num_speakers
         padder = torch.zeros(3, dim).fill_(spk_val).to(feats)
         return torch.cat( [padder, feats, padder], 0 )
 
@@ -747,7 +973,7 @@ class End2EndSLU(FairseqTask):
             comp_t_idx = 3
         elif self.args.slu_subtask == 'concept':
             comp_t_idx = 4 
-        in_red_factor = (self.args.num_lstm_layers-1)*2
+        in_red_factor = (self.args.num_lstm_layers-1)*2 if hasattr(self.args, 'num_lstm_layers') else 2
 
         # 1. First scan, detect sequences shorter than the expected output, once reduced by the LSTM pyramidal architecture
         for did in corpus[split]:
@@ -756,7 +982,7 @@ class End2EndSLU(FairseqTask):
                 t = corpus[split][did][t_idx]
 
                 if self.args.character_level_slu:
-                    char_slu_turn = get_character_level_slu_turn(t[4], self.label_vocab, self.args.padded_reference)
+                    char_slu_turn = get_character_level_slu_turn(self.args, t[4], self.label_vocab)
                     char_t = char_slu_turn.split()
 
                     if len(char_t) > max_turn_length:
@@ -799,7 +1025,7 @@ class End2EndSLU(FairseqTask):
 
         # 2. Second scan, pad short input sequences.
         padded_sequences = 0
-        if split == 'train':
+        if split == 'train' and not (self.args.decoder == 'ctclstm' and not self.args.load_fairseq_encoder): # NOTE: we pad only training examples and only if we are not performing end2end training.
             for did in corpus[split]: 
                 for t_idx in range(len(corpus[split][did])):
                     t = corpus[split][did][t_idx]
@@ -836,11 +1062,40 @@ class End2EndSLU(FairseqTask):
         if my_split == 'valid':
             my_split = 'dev'    # For compatibility with the old End2End SLU system (ICASSP 2020) 
 
-        if os.path.exists(self.args.serialized_data + '.' + my_split) and os.path.isfile(self.args.serialized_data + '.' + my_split):        
+        if os.path.exists(self.args.serialized_data + '.' + my_split) and os.path.isfile(self.args.serialized_data + '.' + my_split): 
+
             print(' - Loading serialized {} split...'.format(my_split))
             sys.stdout.flush()
 
             corpus[my_split] = torch.load(self.args.serialized_data + '.' + my_split)
+
+            '''if task.args.target_dictionary:
+                        tgt_dict = torch.load(task.args.target_dictionary)
+                        for sym in tgt_dict.symbols:
+                            tgt_idx = self.dict.index(sym)
+                            if sym != unk_token and tgt_idx == self.dict.unk():'''
+
+            '''if self.args.load_dictionary and my_split == 'dev':
+                tgt_dict = torch.load(self.args.target_dictionary)
+                new_symbols = 0
+                for sym in tgt_dict.symbols:
+                    tgt_idx = self.label_vocab.index(sym)
+                    if tgt_idx == self.label_vocab.unk() and sym != unk_token:
+                        print(' * End2EndSLU, adding token {} to the dictionary'.format(sym))
+                        sys.stdout.flush()
+
+                        new_symbols += 1
+                        self.label_vocab.add_symbol(sym)
+
+                if new_symbols > 0:
+                    torch.save(self.label_vocab, self.args.load_dictionary)
+                else:
+                    print(' * End2EndSLU, no new symbol added to the dictionary')
+                    sys.stdout.flush()
+                corpus['dictionary'] = self.label_vocab
+
+                print(' * End2EndSLU, new dictionary size: {}'.format(len(self.label_vocab)))
+                sys.stdout.flush()'''
         else:
             print(' - Reading dialog data')
             print('   - reading train data...')
@@ -907,126 +1162,36 @@ class End2EndSLU(FairseqTask):
         # data are organized as a dict of lists: the dict is indexed with dialog-id, the value is the list of turns for that dialog, each turn structure contains data described above.
 
         #debug_idx = 0
-        if hasattr(self.args, 'num_lstm_layers'):
-            print(' * End2EndSLU: checking for input-output sequence length incompatibility...')
-            sys.stdout.flush()
+        #if hasattr(self.args, 'num_lstm_layers'):
+        print(' * End2EndSLU: checking for input-output sequence length incompatibility...')
+        sys.stdout.flush()
 
-            '''length_missmatch = 0
-            missmatches = []
-            total = 0
-            max_turn_length = 0
-            comp_t_idx = 0
-            if self.args.slu_subtask == 'char':
-                comp_t_idx = 2
-            elif self.args.slu_subtask == 'token':
-                comp_t_idx = 3
-            elif self.args.slu_subtask == 'concept':
-                comp_t_idx = 4
-            
-            in_red_factor = (self.args.num_lstm_layers-1)*2
-            for did in corpus[my_split]:
-                total = total + len(corpus[my_split][did])
-                for t_idx in range(len(corpus[my_split][did])):
-                    t = corpus[my_split][did][t_idx] 
+        print('[DEBUG] dict size before: {}'.format(len(self.label_vocab)))
 
-                    if self.args.character_level_slu:
-                        char_slu_turn = get_character_level_slu_turn(t[4], self.label_vocab, self.args.padded_reference)
-                        char_t = char_slu_turn.split()
-                        if len(char_t) > max_turn_length:
-                            max_turn_length = len(char_t)
-                            if max_turn_length > 1024:
-                                print(' ### Got strangely long turn ({}): {}'.format(max_turn_length, char_slu_turn))
-                        slu_t = torch.LongTensor( [self.label_vocab.add_symbol(c) for c in char_t] )
-                        #turn_tuple = (t[0], t[1], t[2], t[3], slu_t, t[5])
-                        #corpus[my_split][did][t_idx] = turn_tuple
-                        input_tsr = t[1]
-                        if t[1].size(0)//in_red_factor < slu_t.size(0):
-                            #print('    - found missmatch: {} vs. {}'.format(t[1].size(0)//4, slu_t.size(0)))
-                            length_missmatch += 1
-                            missmatches.append( (t[1].size(0)//in_red_factor, slu_t.size(0)) )
+        cc, infos = self.pad_short_sequences(corpus, my_split)
+        corpus[my_split] = cc
+        length_missmatch, missmatches, max_turn_length, total = infos
 
-                            if my_split != 'test' and self.args.decoder != 'ctclstm':
-                                pad_len = slu_t.size(0) * in_red_factor #(slu_t.size(0) - t[1].size(0)//in_red_factor +1) * in_red_factor
-                                T, C = t[1].size()
-                                lratio = float(pad_len) / float(T)
-                                input_tsr = torch.zeros(pad_len,C).to(t[1])
-                                #input_tsr = torch.cat( [t[1], pad_tsr], 0 )
-                                for i in range(pad_len):
-                                    input_tsr[i,:] = t[1][int(i/lratio),:].clone()
+        print('[DEBUG] dict size after: {}'.format(len(self.label_vocab)))
+        sys.stdout.flush()
 
-                        assert my_split == 'test' or self.args.decoder == 'ctclstm' or input_tsr.size(0)//in_red_factor >= slu_t.size(0)
-                        turn_tuple = (t[0], input_tsr, t[2], t[3], slu_t, t[5])
-                        corpus[my_split][did][t_idx] = turn_tuple
-                    else: 
-                        if t[comp_t_idx].size(0) > max_turn_length:
-                            max_turn_length = t[comp_t_idx].size(0)
-                        input_tsr = t[1]
-                        if t[1].size(0)//in_red_factor < t[comp_t_idx].size(0):
-                            length_missmatch += 1
-                            missmatches.append( (t[1].size(0)//in_red_factor, t[comp_t_idx].size(0)) )
-
-                            if my_split != 'test' and self.args.decoder != 'ctclstm':
-                                #pad_len = (t[comp_t_idx].size(0) - t[1].size(0)//in_red_factor +1) * in_red_factor
-                                pad_len = t[comp_t_idx].size(0) * in_red_factor
-                                T, C = t[1].size()
-
-                                #print(' * Padding from length {} to {}'.format(T, pad_len))
-                                #sys.stdout.flush()
-
-                                lratio = float(pad_len) / float(T)
-                                input_tsr = torch.zeros(pad_len,C).to(t[1])
-                                #input_tsr = torch.cat( [t[1], pad_tsr], 0 )
-                                for i in range(pad_len):
-                                    input_tsr[i,:] = t[1][int(i/lratio),:].clone()
-
-                        assert my_split == 'test' or self.args.decoder == 'ctclstm' or input_tsr.size(0)//in_red_factor >= t[comp_t_idx].size(0), ' input-output sequence lengths missmatch after padding: {} vs. {}'.format(input_tsr.size(0)//in_red_factor, t[comp_t_idx].size(0))
-                        turn_tuple = (t[0], input_tsr, t[2], t[3], t[4], t[5])
-                        corpus[my_split][did][t_idx] = turn_tuple'''
-
-                    #if debug_idx >= 10:
-                    #    sys.exit(0)
-                    #debug_idx += 1
-
-            cc, infos = self.pad_short_sequences(corpus, my_split)
-            corpus[my_split] = cc
-            length_missmatch, missmatches, max_turn_length, total = infos
-
-            # DEBUG SANITY CHECK
-            '''for did in corpus[my_split]: 
-                for t_idx in range(len(corpus[my_split][did])):
-                    t = corpus[my_split][did][t_idx]
-
-                    assert t[1].size(0) >= t[3].size(0)
-                    assert t[1].size(0) >= t[4].size(0)
-            print(' SO FAR SO GOOD!')
-            sys.stdout.flush()'''
-
-            if length_missmatch > 0:
-                msg = ''
-                if my_split == 'train':
-                    msg = ' (and solved by padding)'
-                if self.args.character_level_slu:
-                    print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected{} converting to character-level SLU output'.format(length_missmatch, total, msg))
-                    print('     * Missmatches: {}'.format(missmatches))
-                    print('   *** End2EndSLU: max character-level turn length is {}'.format(max_turn_length))
-                    sys.stdout.flush()
-                else:
-                    print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected{}'.format(length_missmatch, total, msg))
-                    print('     * Missmatches: {}'.format(missmatches))
-                    print('   *** End2EndSLU: max turn length is {}'.format(max_turn_length))
-                    sys.stdout.flush()
+        if length_missmatch > 0:
+            msg = ''
+            if my_split == 'train':
+                msg = ' (and solved by padding)'
+            if self.args.character_level_slu:
+                print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected{} converting to character-level SLU output'.format(length_missmatch, total, msg))
+                print('     * Missmatches: {}'.format(missmatches))
+                print('   *** End2EndSLU: max character-level turn length is {}'.format(max_turn_length))
+                sys.stdout.flush()
             else:
-                print('   Done.')
-                sys.stdout.flush() 
-
-        '''print(' ***** End2End SLU task, {} split data loading...'.format(my_split))
-        print(' *** SLU task: blank-idx {}'.format(self.blank_idx))
-        print(' *** SLU task: sos_tag_idx {}'.format(self.sos_tag_idx))
-        print(' *** SLU task: eos_tag_idx {}'.format(self.eos_tag_idx))
-        print(' *** SLU task: slu_start_concept_idx {}'.format(self.slu_start_concept_idx))
-        print(' *** SLU task: slu_end_concept_idx {}'.format(self.slu_end_concept_idx))
-        print(' *** SLU task: pad index {}'.format(self.label_vocab.index(pad_token)))
-        sys.stdout.flush()''' 
+                print('   *** End2EndSLU: {} out of {} input-output length incompatibility detected{}'.format(length_missmatch, total, msg))
+                print('     * Missmatches: {}'.format(missmatches))
+                print('   *** End2EndSLU: max turn length is {}'.format(max_turn_length))
+                sys.stdout.flush()
+        else:
+            print('   Done.')
+            sys.stdout.flush() 
 
         print(' - Reorganizing {} dialog data...'.format(my_split))
         if self.args.user_only:
@@ -1034,17 +1199,20 @@ class End2EndSLU(FairseqTask):
 
         dialogs = corpus[my_split]
         bsz = 1
-        if my_split == 'train':
-            while( bsz < self.args.max_sentences ):
-                bsz = bsz * 2
-            if bsz > self.args.max_sentences:
-                bsz = int(bsz / 2)
-            if self.args.max_sentences == 5:
-                bsz = 5
+        #if my_split == 'train':
+        while( bsz < self.args.max_sentences ):
+            bsz = bsz * 2
+        if bsz > self.args.max_sentences:
+            bsz = int(bsz / 2)
+        if self.args.max_sentences == 5:
+            bsz = 5
 
         print(' - Approximating batch size to {} from {}'.format(bsz, self.args.max_sentences))
         sys.stdout.flush()
-        batch_info = create_dialog_batches_(dialogs, bsz)
+        slu_mode_info = {}
+        slu_mode_info['dict'] = self.label_vocab
+        slu_mode_info['dialog_level_slu'] = self.args.dialog_level_slu if hasattr(self.args, 'dialog_level_slu') else False
+        batch_info = create_dialog_batches_(dialogs, bsz, slu_mode_info)
         idx_batches = []
 
         ratios = []
@@ -1059,7 +1227,7 @@ class End2EndSLU(FairseqTask):
             batched_turns_idx = []
             for (did, idx) in batch:
                 turn = dialogs[did][idx]
-                if (my_split == 'train') or (turn[-1] == user_ID):
+                if (my_split == 'train') or (turn[-1] == user_ID) or slu_mode_info['dialog_level_slu']:
                     #if turn[-1] == user_ID:
                     # if (not self.args.user_only and (my_split == 'train' or turn[-1] == user_ID)) or (self.args.user_only and turn[-1] == user_ID)
                     feats = turn[1]
@@ -1099,15 +1267,7 @@ class End2EndSLU(FairseqTask):
 
                     else:
                         raise NotImplementedError
-                else:
-                    t = turn[1]
-                    del t
-                    t = turn[2]
-                    del t
-                    t = turn[3]
-                    del t
-                    t = turn[4]
-                    del t
+                else: 
                     dialogs[did][idx] = None
 
             if len(batched_turns_idx) > 0:

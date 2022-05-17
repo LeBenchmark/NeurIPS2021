@@ -453,6 +453,12 @@ class TransformerEncoder(FairseqEncoder):
 
         x, encoder_embedding = self.forward_embedding(src_tokens)
 
+        '''print(' - TransformerEncoder:')
+        print('   * x shape: {}'.format(x.size()))
+        print('   * x min, max, mean, sum: {}, {}, {}, {}'.format(torch.min(x), torch.max(x), torch.mean(x), torch.sum(x)))
+        sys.stdout.flush()
+        sys.exit(0)'''
+
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 

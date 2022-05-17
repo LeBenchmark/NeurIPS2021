@@ -12,7 +12,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from fairseq.globals import *
-from fairseq import utils
+from fairseq import utils, init_functions
 from fairseq import checkpoint_utils, options, utils
 from fairseq.models import (
     FairseqEncoder,
@@ -22,11 +22,11 @@ from fairseq.models import (
     register_model_architecture, 
 )
 
-from fairseq.models.slu_models import BasicEncoder, BasicSpeechEncoder, BasicSpeechSeqEncoder, BasicSpeechBiseqEncoder, MLSpeechEncoder, MLSpeechSeqEncoder, SLUSimpleDecoder, SLUBiDecoder
+#from fairseq.models.slu_models import BasicEncoder, BasicSpeechEncoder, BasicSpeechSeqEncoder, BasicSpeechBiseqEncoder, MLSpeechEncoder, MLSpeechSeqEncoder, SLUSimpleDecoder, SLUBiDecoder
 
 from fairseq.models.transformer import TransformerModel, base_architecture as trans_ba
 #from fairseq.models.ctc_transformer import CTCTransformerDecoder
-from fairseq.models.lstm import LSTMModel, AttentionLayer, LSTMDecoder, Embedding, Linear, base_architecture as lstm_ba
+from fairseq.models.lstm import LSTMModel, LSTMDecoder, base_architecture as lstm_ba
 
 # Importing for compatibilities with the Transformer model
 from fairseq.models.fairseq_encoder import EncoderOut
@@ -50,7 +50,7 @@ class Conv1dNormWrapper(nn.Module):
         super(Conv1dNormWrapper,self).__init__()
 
         #self.cNorm = nn.LayerNorm(input_size)
-        self.conv = nn.Conv1d(input_size, output_size, kernel, stride=stride_factor)
+        self.conv = init_functions.LSTMConv1d(input_size, output_size, kernel, stride=stride_factor)
         self.cNorm = nn.LayerNorm( output_size )
     
     def forward(self, input):
@@ -79,17 +79,17 @@ class LSTMWrapper(nn.Module):
         #print(' *** LSTMWrapper, adding LSTM of size: {} x {}'.format(input_size, output_size))
         #sys.stdout.flush()
 
-        self.lstm = nn.LSTM(input_size, output_size, bidirectional=bidirFlag)
+        self.lstm = init_functions.LSTM(input_size, output_size, bidirectional=bidirFlag)
         norm_size = output_size * 2 if bidirFlag else output_size
         self.lstm_norm = nn.LayerNorm(norm_size)
 
         self.fc1 = None
-        '''nn.Linear(input_size, 4*output_size) if input_size == output_size and bidirFlag else None
-        self.fc2 = nn.Linear(4*output_size, 2*output_size) if input_size == output_size and bidirFlag else None'''
+        '''init_functions.LSTMLinear(input_size, 4*output_size) if input_size == output_size and bidirFlag else None
+        self.fc2 = init_functions.LSTMLinear(4*output_size, 2*output_size) if input_size == output_size and bidirFlag else None'''
 
         self.fc3 = None
-        '''nn.Linear(2*output_size, 4*output_size) if input_size // 2 == output_size and bidirFlag else None
-        self.fc4 = nn.Linear(4*output_size, 2*output_size) if input_size // 2 == output_size and bidirFlag else None'''
+        '''init_functions.LSTMLinear(2*output_size, 4*output_size) if input_size // 2 == output_size and bidirFlag else None
+        self.fc4 = init_functions.LSTMLinear(4*output_size, 2*output_size) if input_size // 2 == output_size and bidirFlag else None'''
 
         class BogusClass :
             name = 'BogusClass'
@@ -147,8 +147,8 @@ class FFNN(nn.Module):
 
         self.dropout_ratio = dropout_ratio
         self.activation_fn = utils.get_activation_fn('relu')
-        self.fc1 = Linear(input_size, 2*output_size)
-        self.fc2 = Linear(2*output_size, output_size)
+        self.fc1 = init_functions.LSTMLinear(input_size, 2*output_size)
+        self.fc2 = init_functions.LSTMLinear(2*output_size, output_size)
 
     def forward(self, x):
 
@@ -157,6 +157,40 @@ class FFNN(nn.Module):
         x = F.dropout(x, p=self.dropout_ratio, training=self.training)
         x = self.fc2(x)
         return x
+
+class SLUAttentionLayer(nn.Module):
+    def __init__(self, input_embed_dim, source_embed_dim, output_embed_dim, bias=False):
+        super().__init__()
+
+        self.input_proj = init_functions.LSTMLinear(input_embed_dim, source_embed_dim, bias=bias)
+        self.output_proj = init_functions.LSTMLinear(input_embed_dim + source_embed_dim, output_embed_dim, bias=bias)
+
+    def forward(self, input, source_hids, encoder_padding_mask):
+        # input: bsz x input_embed_dim
+        # source_hids: srclen x bsz x source_embed_dim
+
+        # x: bsz x source_embed_dim
+        x = self.input_proj(input)
+
+        # compute attention
+        attn_scores = (source_hids * x.unsqueeze(0)).sum(dim=2) # srclen x bsz  
+
+        # don't attend over padding
+        if encoder_padding_mask is not None:
+            #print(' * SLUAttentionLayer, filling attn_scores with -1e8 (instead of float(\'-inf\')) at mask')
+            #sys.stdout.flush()
+            attn_scores = attn_scores.float().masked_fill_(
+                encoder_padding_mask,
+                -1e8
+            ).type_as(attn_scores)  # FP16 support: cast to float and back 
+        
+        attn_scores = F.softmax(attn_scores, dim=0)  # srclen x bsz 
+
+        # sum weighted sources
+        x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=0) # bsz x source_embed_dim
+        x = torch.tanh(self.output_proj(torch.cat((x, input), dim=1)))  # bsz x output_embed_dim 
+
+        return x, attn_scores
 
 class PyramidalRNNEncoder(nn.Module):
 
@@ -184,7 +218,7 @@ class PyramidalRNNEncoder(nn.Module):
             else:
                 nlayers = self.kheops_ptop_height
  
-            self.layers.append( nn.LSTM(input_size, self.params.speech_lstm_size, num_layers=nlayers, bidirectional=bidirectional) ) # TODO: Try adding in LSTM constructor dropout=self.params.drop_ratio
+            self.layers.append( init_functions.LSTM(input_size, self.params.speech_lstm_size, num_layers=nlayers, bidirectional=bidirectional) ) # TODO: Try adding in LSTM constructor dropout=self.params.drop_ratio
             self.norms.append( nn.LayerNorm( 2*self.params.speech_lstm_size ) )
 
         self.encoder_output_units = self.params.speech_lstm_size
@@ -226,11 +260,11 @@ class PyramidalRNNEncoder(nn.Module):
         return H
 
 
-class BasicEncoder(nn.Module):
+class DeepSpeechLikeEncoder(nn.Module):
     
     def __init__(self, params):
         
-        super(BasicEncoder,self).__init__()
+        super(DeepSpeechLikeEncoder,self).__init__()
         #self.window_size = params.window_size
         
         # Parameter initialization
@@ -241,7 +275,7 @@ class BasicEncoder(nn.Module):
         # 1. Convolutions
         conv_layers = []
         for i in range(self.params.speech_conv):
-            conv_stride = 1
+            conv_stride = 2
             if i == self.params.speech_conv-1:
                 conv_stride = 2
             input_size = self.params.speech_conv_size
@@ -252,7 +286,7 @@ class BasicEncoder(nn.Module):
         self.convolutions = nn.Sequential( OrderedDict(conv_layers) )
 
         lstm_size = 2*self.params.speech_lstm_size
-        #self.conv2lstm = nn.Linear(self.params.speech_conv_size, lstm_size, bias=False)
+        #self.conv2lstm = init_functions.LSTMLinear(self.params.speech_conv_size, lstm_size, bias=False)
 
         # 2. Recurrent layers
         recurrent_layers = [] 
@@ -266,7 +300,7 @@ class BasicEncoder(nn.Module):
         self.rnns = nn.Sequential( OrderedDict(recurrent_layers) )
             
         #Linear Layer
-        #self.linear_layer = nn.Linear(2*self.params.speech_lstm_size, self.params.output_size)
+        #self.linear_layer = init_functions.LSTMLinear(2*self.params.speech_lstm_size, self.params.output_size)
 
         self.encoder_output_units = self.params.speech_lstm_size
         if bidirectional:
@@ -303,14 +337,24 @@ class End2EndSLUEncoder(FairseqEncoder):
         self.padding_idx = dictionary.pad_index
         self.blank_idx = dictionary.set_blank() 
 
-        #self.encoder = BasicEncoder(args)
-        self.encoder = PyramidalRNNEncoder(args, dictionary)
+        if hasattr(args, 'speech_encoder') and args.speech_encoder == 'deep-speech':
+            self.encoder = DeepSpeechLikeEncoder(args)
+            self.se_type = 'ds'
+        elif hasattr(args, 'speech_encoder') and args.speech_encoder == 'ziggurat':
+            self.encoder = PyramidalRNNEncoder(args, dictionary)
+            self.se_type = 'zg'
+        elif not hasattr(args, 'speech_encoder'):
+            self.encoder = PyramidalRNNEncoder(args, dictionary)
+            self.se_type = 'zg'
+        else:
+            raise NotImplementedError('{} speech encoder not defined'.format(args.speech_encoder if hasattr(args, 'speech_encoder') else 'unknown'))
+
         self.encoder_output_units = self.encoder.encoder_output_units  # NEW ARCHITECTURE FOR COMBINED LOSS: the current output is the projection to the output dict, unless we are giving hidden states to the decoder instead of output projections
         self.return_all_hiddens = False
         self.speakers = None
 
         # NEW ARCHITECTURE FOR COMBINED LOSS
-        #self.output_projection = nn.Linear(args.encoder_hidden_dim*2, len(dictionary))
+        #self.output_projection = init_functions.LSTMLinear(args.encoder_hidden_dim*2, len(dictionary))
         #self.output_norm = nn.LayerNorm(len(dictionary))
 
     def set_turn_speaker(self, val):
@@ -357,10 +401,11 @@ class End2EndSLUEncoder(FairseqEncoder):
 
         x = src_tokens.transpose(0,1) 
 
-        #(conv_states, hidden_states) = self.encoder( x )
-        hidden_states = self.encoder( x ) 
-        (src_len, bsz, dim) = hidden_states.size() #conv_states.size()
-        #(h_src_len, h_bsz, h_dim) = hidden_states.size() 
+        if self.se_type == 'ds':
+            (conv_states, hidden_states) = self.encoder( x )
+        else:
+            hidden_states = self.encoder( x ) 
+        (src_len, bsz, dim) = hidden_states.size() #conv_states.size() 
 
         # T x B x C -> B x T x C
         # NEW ARCHITECTURE FOR COMBINED LOSS: these operations have been moved below (and correct!)
@@ -447,7 +492,7 @@ class End2EndSLUEncoder(FairseqEncoder):
                 encoder_embedding=new_encoder_out["encoder_embedding"],  # B x T x C
                 encoder_states=encoder_states,  # List[T x B x C]
             )
-        elif self.args.decoder in ['lstm', 'ctclstm', 'icassp_lstm']:
+        elif self.args.decoder in ['lstm', 'ctclstm', 'icassp_lstm', 'deliberation']:
             hidden_states = encoder_out['encoder_out'][0]
             new_hidden_states = hidden_states if hidden_states is None else hidden_states.index_select(1, new_order)
             new_final_h, new_final_c = create_lstm_final_states_(self.args.decoder_layers, new_hidden_states)
@@ -494,7 +539,7 @@ class BasicDecoder(FairseqIncrementalDecoder):
         #self.input_norm = nn.LayerNorm(hidden_dim)
 
         # NEW ARCHITECTURE FOR COMBINED LOSS: these components have been moved in the encoder
-        self.output_projection = Linear(hidden_dim, len(dictionary))
+        self.output_projection = init_functions.LSTMLinear(hidden_dim, len(dictionary))
         self.output_norm = nn.LayerNorm(len(dictionary))
 
     def set_turn_speaker(self, val):
@@ -567,7 +612,7 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
         if embeddings is not None:
             self.dec_embeddings = embeddings
         else:
-            self.dec_embeddings = Embedding(
+            self.dec_embeddings = init_functions.LSTMEmbedding(
                 num_embeddings=len(dictionary),
                 embedding_dim=args.decoder_embed_dim,
                 padding_idx=dictionary.pad(),
@@ -577,12 +622,12 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
 
         mapping_size = args.decoder_embed_dim + args.decoder_hidden_dim
         if mapping_size != args.decoder_hidden_dim:
-            self.input_map = Linear(mapping_size, args.decoder_hidden_dim, bias=False) 
+            self.input_map = init_functions.LSTMLinear(mapping_size, args.decoder_hidden_dim, bias=False) 
         else:
             self.input_map = None
         if self.encoder_output_size != args.decoder_hidden_dim:
-            self.input_map_h = Linear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
-            self.input_map_c = Linear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
+            self.input_map_h = init_functions.LSTMLinear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
+            self.input_map_c = init_functions.LSTMLinear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
         else:
             self.input_map_h = None
             self.input_map_c = None
@@ -592,7 +637,7 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
         self.dropout = nn.Dropout(p=args.dropout)
 
         self.layers = nn.ModuleList([
-            nn.LSTMCell(
+            init_functions.LSTMCell(
                 input_size=args.decoder_hidden_dim,
                 hidden_size=args.decoder_hidden_dim,
             )
@@ -606,17 +651,17 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
             for layer in range(args.decoder_layers)
         ])
 
-        self.attention = AttentionLayer(args.decoder_hidden_dim, self.encoder_output_size, args.decoder_hidden_dim, bias=False)
+        self.attention = SLUAttentionLayer(args.decoder_hidden_dim, self.encoder_output_size, args.decoder_hidden_dim, bias=False)
         self.outs_norm = nn.LayerNorm(args.decoder_hidden_dim)
 
         # Linear layers to gate attention vectors and hidden state (instead of just using attention vectors)
-        self.att_gate_x = Linear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
-        self.att_gate_y = Linear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
+        self.att_gate_x = init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
+        self.att_gate_y = init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
 
         if args.decoder_hidden_dim != args.decoder_embed_dim:
-            self.additional_fc = Linear(args.decoder_hidden_dim, args.decoder_embed_dim)
+            self.additional_fc = init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_embed_dim)
         if not self.share_input_output_embed:
-            self.fc_out = Linear(args.decoder_embed_dim, len(dictionary), dropout=args.dropout)
+            self.fc_out = init_functions.LSTMLinear(args.decoder_embed_dim, len(dictionary), dropout=args.dropout)
 
         self.speaker = None
 
@@ -827,6 +872,7 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         if args.scheduled_sampling:
             self.register_buffer('prev_output_tokens_h', torch.LongTensor(args.max_sentences, 4*max_target_positions).fill_(dictionary.pad()))
             self.prev_output_tokens_h.requires_grad = False
+        self.start_ss = args.start_scheduled_sampling
 
         self.bin_ray = args.encoder_state_window
         self.declen = args.constrained_output_length if hasattr(args, 'constrained_output_length') else -1
@@ -845,19 +891,19 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
         if pretrained_embed is None:
-            self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
+            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
         else:
             self.embed_tokens = pretrained_embed
 
         self.encoder_output_units = encoder_output_units
         if encoder_output_units != hidden_size and encoder_output_units != 0:
-            self.encoder_hidden_proj = Linear(encoder_output_units, hidden_size)
-            self.encoder_cell_proj = Linear(encoder_output_units, hidden_size)
+            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
         else:
             self.encoder_hidden_proj = self.encoder_cell_proj = None
 
-        self.pred_attention = AttentionLayer(hidden_size, embed_dim, hidden_size, bias=False) # TODO: use this as input to the LSTM instead of x
-        #self.pred_attention = AttentionLayer(encoder_output_units, embed_dim, hidden_size, bias=False)
+        self.pred_attention = SLUAttentionLayer(hidden_size, embed_dim, hidden_size, bias=False) # TODO: use this as input to the LSTM instead of x
+        #self.pred_attention = SLUAttentionLayer(encoder_output_units, embed_dim, hidden_size, bias=False)
 
         # disable input feeding if there is no encoder
         # input feeding is described in arxiv.org/abs/1508.04025
@@ -865,7 +911,7 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         self.lstm_flag = True
         if self.lstm_flag:
             self.layers = nn.ModuleList([
-                nn.LSTMCell(
+                init_functions.LSTMCell(
                     input_size=input_feed_size + embed_dim if layer == 0 else hidden_size,
                     hidden_size=hidden_size,
                 )
@@ -884,17 +930,17 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
 
         if attention:
             # TODO make bias configurable
-            self.attention = AttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
+            self.attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
         else:
             self.attention = None
         if hidden_size != out_embed_dim:
-            self.additional_fc = Linear(hidden_size, out_embed_dim)
+            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
             # setting adaptive_softmax dropout to dropout_out for now but can be redefined
             self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
                                                     dropout=dropout_out)
         elif not self.share_input_output_embed:
-            self.fc_out = Linear(out_embed_dim, num_embeddings)
+            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
 
         self.speaker = None
 
@@ -912,8 +958,8 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         self.scheduled_sampling = val
         if self.scheduled_sampling:
             self.scheduled_sampling_updates = epoch
-            if self.scheduled_sampling_updates > 1:
-                self.scheduled_sampling_p = self.scheduled_sampling_init * (0.98**(epoch-2))
+            if self.scheduled_sampling_updates >= self.start_ss:
+                self.scheduled_sampling_p = self.scheduled_sampling_init * (0.98**(epoch-self.start_ss))
 
         print(' - ICASSPDecoderEx: scheduled sampling set to {} (updates: {}; p: {})'.format(self.scheduled_sampling, self.scheduled_sampling_updates, self.scheduled_sampling_p))
         sys.stdout.flush()
@@ -1091,7 +1137,7 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         #print(' *** bin_ray and declen: {}, {}'.format(self.bin_ray, declen))
         #print(' *** prev_predictions: {}'.format(prev_predictions))
         #sys.stdout.flush()
-
+ 
         ss_backup_val = self.scheduled_sampling
         if self.scheduled_sampling:
             p = random.random()
@@ -1293,7 +1339,7 @@ class End2EndSLUDecoder(FairseqIncrementalDecoder):
     ):
         super().__init__(dictionary)
 
-        self.embed_tokens = Embedding(len(dictionary), embed_dim, padding_idx=dictionary.pad())
+        self.embed_tokens = init_functions.LSTMEmbedding(len(dictionary), embed_dim, padding_idx=dictionary.pad())
 
         self.decoder_layers = num_layers
         self.boundary_decoder = ICASSPDecoderEx(
@@ -1318,7 +1364,7 @@ class End2EndSLUDecoder(FairseqIncrementalDecoder):
         self.end_concept = dictionary.add_symbol( slu_end_concept_mark )
         self.hidden_size = 2*hidden_size
         self.output_dim = len(dictionary)
-        self.boundary_attention = AttentionLayer(embed_dim, self.output_dim, self.hidden_size, bias=False) 
+        self.boundary_attention = SLUAttentionLayer(embed_dim, self.output_dim, self.hidden_size, bias=False) 
 
         self.concept_decoder = ICASSPDecoderEx(
             args=args,
@@ -1543,37 +1589,45 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         self.dropout_in = dropout_in
         self.dropout_out = dropout_out
         self.hidden_size = hidden_size
+        self.out_embed_dim = out_embed_dim
         self.share_input_output_embed = share_input_output_embed
         self.need_attn = True
         self.max_target_positions = max_target_positions
         self.args = args
         self.blank_idx = dictionary.set_blank()
-        # TMP for DEBUGGING
-        print(' - LSTMDecoderEx, setting blank idx to {}'.format(self.blank_idx))
         self.num_masked_tokens = 0
+
+        #if args.scheduled_sampling:
+        #    self.register_buffer('prev_output_tokens_h', torch.LongTensor(args.max_sentences, 4*max_target_positions).fill_(dictionary.pad()))
+        #    self.prev_output_tokens_h.requires_grad = False
+        self.scheduled_sampling = False
+        self.scheduled_sampling_updates = 0
+        self.n_scheduled_sampling = 0
+        self.scheduled_sampling_init = 0.99
+        self.scheduled_sampling_p = 0.99
 
         self.adaptive_softmax = None
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
         if pretrained_embed is None:
-            self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
+            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
         else:
             self.embed_tokens = pretrained_embed
 
         self.encoder_output_units = encoder_output_units
         if encoder_output_units != hidden_size and encoder_output_units != 0:
-            self.encoder_hidden_proj = Linear(encoder_output_units, hidden_size)
-            self.encoder_cell_proj = Linear(encoder_output_units, hidden_size)
+            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
         else:
             self.encoder_hidden_proj = self.encoder_cell_proj = None
 
-        self.pred_attention = AttentionLayer(hidden_size, embed_dim, hidden_size, bias=False)  # TODO: use this as input to the LSTM instead of x
+        self.pred_attention = SLUAttentionLayer(hidden_size, embed_dim, hidden_size, bias=False)  # TODO: use this as input to the LSTM instead of x
 
         # disable input feeding if there is no encoder
         # input feeding is described in arxiv.org/abs/1508.04025
         input_feed_size = 0 if encoder_output_units == 0 else hidden_size
         self.layers = nn.ModuleList([
-            nn.LSTMCell(
+            init_functions.LSTMCell(
                 input_size=input_feed_size + embed_dim if layer == 0 else hidden_size,
                 hidden_size=hidden_size,
             )
@@ -1581,17 +1635,17 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         ])
         if attention:
             # TODO make bias configurable
-            self.attention = AttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
+            self.attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
         else:
             self.attention = None
         if hidden_size != out_embed_dim:
-            self.additional_fc = Linear(hidden_size, out_embed_dim)
+            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
             # setting adaptive_softmax dropout to dropout_out for now but can be redefined
             self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
                                                     dropout=dropout_out)
         elif not self.share_input_output_embed:
-            self.fc_out = Linear(out_embed_dim, num_embeddings)
+            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
 
         self.speaker = None
 
@@ -1604,6 +1658,37 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             prev_output_tokens, encoder_out, incremental_state
         )
         return self.output_layer(x), attn_scores
+
+    def set_scheduled_sampling(self, val=False, epoch=1):
+        self.scheduled_sampling = val
+        if self.scheduled_sampling:
+            self.scheduled_sampling_updates = epoch
+            if self.scheduled_sampling_updates >= self.args.start_scheduled_sampling:
+                self.scheduled_sampling_p = self.scheduled_sampling_init * (0.99**(epoch-self.args.start_scheduled_sampling))
+
+        print(' - LSTMDecoderEx: scheduled sampling set to {} (updates: {}; p: {})'.format(self.scheduled_sampling, self.scheduled_sampling_updates, self.scheduled_sampling_p))
+        sys.stdout.flush()
+
+    def n_scheduled_sampling_(self, val=0):
+        old_val = self.n_scheduled_sampling
+        self.n_scheduled_sampling = val
+        return old_val
+
+    def scheduled_sampling_output_(self, x):
+        if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
+            x = self.additional_fc(x)
+            x = F.dropout(x, p=self.dropout_out, training=self.training) 
+        return x
+
+    def scheduled_sampling_predict_(self, x):
+        x = self.output_layer(x)
+        scores = F.log_softmax(x, -1)
+
+        #print(' - scheduled_sampling processing, x: {}; scores: {}'.format(x.size(), scores.size()))
+        #sys.stdout.flush() 
+
+        max_sc, pred = torch.max(scores, -1)
+        return pred
 
     def extract_features(
         self, prev_output_tokens, encoder_out, incremental_state=None
@@ -1620,7 +1705,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
         if incremental_state is not None:
             prev_output_tokens = prev_output_tokens[:, -1:]
-        bsz, seqlen = prev_output_tokens.size()
+        bsz, seqlen = prev_output_tokens.size() 
 
         # get outputs from encoder
         if encoder_out is not None:
@@ -1628,6 +1713,19 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             srclen = encoder_outs.size(0)
         else:
             srclen = None
+        #if self.scheduled_sampling:
+        ss_backup_val = self.scheduled_sampling
+        if self.scheduled_sampling:
+            p = random.random()
+            if p < self.scheduled_sampling_p:
+                self.scheduled_sampling = False
+            else:
+                self.n_scheduled_sampling += 1
+                #old_val = seqlen
+                seqlen = int(srclen * self.args.max_len_a + self.args.max_len_b) + 1
+
+                #print(' [DEBUG] seqlen set to {} with scheduled sampling (instead of {})'.format(seqlen, old_val))
+                #sys.stdout.flush()
 
         self.num_masked_tokens += torch.sum(encoder_padding_mask == True).item() if encoder_padding_mask != None else 0
 
@@ -1696,15 +1794,51 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         attn_scores = x.new_zeros(srclen, seqlen, bsz) if self.attention is not None else None
         outs = []
 
-        '''print(' *** srclen, seqlen, io-ratio: {}, {}, {}'.format(srclen, seqlen, self.args.io_size_ratio))
-        sys.stdout.flush()'''
+        #ss_backup_val = self.scheduled_sampling
+        #if self.scheduled_sampling:
+        #    p = random.random()
+        #    if p < self.scheduled_sampling_p:
+        #        self.scheduled_sampling = False
+        #    else:
+        #        self.n_scheduled_sampling += 1
+        finalized_hypos = 0
+        train_flag = incremental_state is None and self.scheduled_sampling
+        if train_flag:
+            scheduled_sampling_out = torch.zeros(seqlen, bsz, self.out_embed_dim).to(x)
+            prev_output_tokens_h = torch.LongTensor(bsz, 4*self.max_target_positions).to(x.device)
+            prev_output_tokens_h.fill_(self.dictionary.pad())
+            prev_output_tokens_h[:,0] = self.dictionary.eos()
         for j in range(seqlen):
             curr_pred = x
             curr_pred_mask = prev_predictions_mask
             if incremental_state is None:
-                dec_idx = j
+                if self.scheduled_sampling:
+                    cacheB, cacheT = prev_output_tokens_h.size()
+                    if cacheB != bsz:
+                        print(' - LSTMDecoderEx, reducing scheduled sampling predicted tokens cache: {} vs. {} (length: {} vs. {})'.format(cacheB, bsz, cacheT, seqlen))
+                        sys.stdout.flush()
+
+                    prev_predictions = prev_output_tokens_h[:,:j+1].clone() #torch.cat( scheduled_sampling_prev_lst, 1 )
+                    prev_predictions_mask = prev_predictions.eq(self.padding_idx)
+                    prev_predictions_mask[prev_predictions == self.blank_idx] = True
+                    prev_predictions_mask = prev_predictions_mask.transpose(0, 1)
+                    x = self.embed_tokens(prev_predictions)
+                    x = F.dropout(x, p=self.dropout_in, training=self.training)
+                    x = x.transpose(0, 1)
+                    #tgt_idx = j+1
+                #else:
+                #    dec_idx = j
                 curr_pred = x[:j+1,:,:]   # We mask the future 
                 curr_pred_mask = prev_predictions_mask[:j+1,:]
+
+            if train_flag:
+                cacheB, cacheT = prev_output_tokens_h.size()
+                if cacheB != bsz:
+                    print(' - LSTMDecoderEx, attention input shapes:')
+                    print('   - prev_hiddens[0]: {}'.format(prev_hiddens[0].size()))
+                    print('   - curr_pred: {}'.format(curr_pred.size()))
+                    print('   - curr_pred_mask: {}'.format(curr_pred_mask.size()))
+                    sys.stdout.flush()
 
             pred_attn, _ = self.pred_attention(prev_hiddens[-1], curr_pred, curr_pred_mask)
             pred_attn = F.dropout(pred_attn, p=self.dropout_out, training=self.training)
@@ -1737,8 +1871,21 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             if input_feed is not None:
                 input_feed = out
 
-            # save final output
-            outs.append(out) 
+            if train_flag:
+                ss_x = self.scheduled_sampling_output_(out)
+                ss_pred = self.scheduled_sampling_predict_(ss_x)
+
+                scheduled_sampling_out[j,:,:] = ss_x              
+                prev_output_tokens_h[:,j+1] = ss_pred
+
+                finalized_hypos += torch.sum( ss_pred == self.dictionary.eos() ).item()
+                if finalized_hypos >= bsz:
+                    #print(' [DEBUG] found {} eos tokens, breaking decoding...'.format(finalized_hypos))
+                    #sys.stdout.flush()
+                    break
+            else:
+                # save final output
+                outs.append(out)
 
         # cache previous states (no-op except during incremental generation)
         utils.set_incremental_state(
@@ -1752,21 +1899,27 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         print(' -----')
         sys.stdout.flush()'''
 
-        # collect outputs across time steps
-        x = torch.cat(outs, dim=0).view(seqlen, bsz, self.hidden_size)
+        if train_flag:
+            x = scheduled_sampling_out
+        else:
+            # collect outputs across time steps
+            x = torch.cat(outs, dim=0).view(seqlen, bsz, self.hidden_size)
 
         # T x B x C -> B x T x C
         x = x.transpose(1, 0)
 
-        if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
-            x = self.additional_fc(x)
-            x = F.dropout(x, p=self.dropout_out, training=self.training)
+        if not train_flag:
+            if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
+                x = self.additional_fc(x)
+                x = F.dropout(x, p=self.dropout_out, training=self.training)
 
         # srclen x tgtlen x bsz -> bsz x tgtlen x srclen
         if not self.training and self.need_attn and self.attention is not None:
             attn_scores = attn_scores.transpose(0, 2)
         else:
             attn_scores = None
+
+        self.scheduled_sampling = ss_backup_val
         return x, attn_scores
 
     def output_layer(self, x):
@@ -1819,6 +1972,904 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
     def make_generation_fast_(self, need_attn=False, **kwargs):
         self.need_attn = need_attn
 
+class DraftLSTMDecoder(FairseqIncrementalDecoder):
+    """Like LSTM decoder, but it uses an attention on all previous predictions, instead of using only the previous prediction."""
+    def __init__(
+        self, dictionary, args, embed_dim=512, hidden_size=512, out_embed_dim=512,
+        num_layers=1, dropout_in=0.1, dropout_out=0.1, attention=True,
+        encoder_output_units=512, pretrained_embed=None,
+        share_input_output_embed=False, adaptive_softmax_cutoff=None,
+        max_target_positions=1024
+    ):
+        super().__init__(dictionary)
+        self.dropout_in = dropout_in
+        self.dropout_out = dropout_out
+        self.hidden_size = hidden_size
+        self.out_embed_dim = out_embed_dim
+        self.share_input_output_embed = share_input_output_embed
+        self.need_attn = True
+        self.max_target_positions = max_target_positions
+        self.args = args
+        self.blank_idx = dictionary.set_blank()
+        self.num_masked_tokens = 0
+
+        #if args.scheduled_sampling:
+        #    self.register_buffer('prev_output_tokens_h', torch.LongTensor(args.max_sentences, 4*max_target_positions).fill_(dictionary.pad()))
+        #    self.prev_output_tokens_h.requires_grad = False
+        self.scheduled_sampling = False
+        self.scheduled_sampling_updates = 0
+        self.n_scheduled_sampling = 0
+        self.scheduled_sampling_init = 0.99
+        self.scheduled_sampling_p = 0.99
+
+        self.adaptive_softmax = None
+        num_embeddings = len(dictionary)
+        self.padding_idx = dictionary.pad()
+        if pretrained_embed is None:
+            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+        else:
+            self.embed_tokens = pretrained_embed
+
+        self.encoder_output_units = encoder_output_units
+        if encoder_output_units != hidden_size and encoder_output_units != 0:
+            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+        else:
+            self.encoder_hidden_proj = self.encoder_cell_proj = None
+
+        self.pred_attention = SLUAttentionLayer(hidden_size, embed_dim, hidden_size, bias=False)  # TODO: use this as input to the LSTM instead of x
+
+        # disable input feeding if there is no encoder
+        # input feeding is described in arxiv.org/abs/1508.04025
+        input_feed_size = 0 if encoder_output_units == 0 else hidden_size
+        self.layers = nn.ModuleList([
+            init_functions.LSTMCell(
+                input_size=input_feed_size + embed_dim if layer == 0 else hidden_size,
+                hidden_size=hidden_size,
+            )
+            for layer in range(num_layers)
+        ])
+        if attention:
+            # TODO make bias configurable
+            self.attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
+        else:
+            self.attention = None
+        if hidden_size != out_embed_dim:
+            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
+        if adaptive_softmax_cutoff is not None:
+            # setting adaptive_softmax dropout to dropout_out for now but can be redefined
+            self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
+                                                    dropout=dropout_out)
+        elif not self.share_input_output_embed:
+            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
+
+        self.speaker = None
+
+    def set_turn_speaker(self, val):
+        self.speaker = val
+        return self.speaker
+
+    def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None, **kwargs):
+        x, attn_scores = self.extract_features(
+            prev_output_tokens, encoder_out, incremental_state
+        )
+        return self.output_layer(x), {'attn': attn_scores, 'feats': x}
+
+    def set_scheduled_sampling(self, val=False, epoch=1):
+        self.scheduled_sampling = val
+        if self.scheduled_sampling:
+            self.scheduled_sampling_updates = epoch
+            if self.scheduled_sampling_updates >= self.args.start_scheduled_sampling:
+                self.scheduled_sampling_p = self.scheduled_sampling_init * (0.99**(epoch-self.args.start_scheduled_sampling))
+
+        print(' - DraftLSTMDecoder: scheduled sampling set to {} (updates: {}; p: {})'.format(self.scheduled_sampling, self.scheduled_sampling_updates, self.scheduled_sampling_p))
+        sys.stdout.flush()
+
+    def n_scheduled_sampling_(self, val=0):
+        old_val = self.n_scheduled_sampling
+        self.n_scheduled_sampling = val
+        return old_val
+
+    def scheduled_sampling_output_(self, x):
+        if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
+            x = self.additional_fc(x)
+            x = F.dropout(x, p=self.dropout_out, training=self.training)
+        return x
+
+    def scheduled_sampling_predict_(self, x):
+        x = self.output_layer(x)
+        scores = F.log_softmax(x, -1)
+
+        #print(' - scheduled_sampling processing, x: {}; scores: {}'.format(x.size(), scores.size()))
+        #sys.stdout.flush()
+
+        max_sc, pred = torch.max(scores, -1)
+        return pred
+
+    def extract_features(
+        self, prev_output_tokens, encoder_out, incremental_state=None
+    ):
+        """
+        Similar to *forward* but only return features.
+        """
+        if encoder_out is not None:
+            encoder_padding_mask = encoder_out['encoder_padding_mask']
+            encoder_out = encoder_out['encoder_out']
+        else:
+            encoder_padding_mask = None
+            encoder_out = None
+
+        if incremental_state is not None:
+            prev_output_tokens = prev_output_tokens[:, -1:]
+        bsz, seqlen = prev_output_tokens.size()
+
+        # get outputs from encoder
+        if encoder_out is not None:
+            encoder_outs, encoder_hiddens, encoder_cells = encoder_out[:3]
+            encoder_outs = encoder_outs.clone().detach()    # We make encoder_outs a leaf in the draft decoder so that the encoder weights are not updated twice.
+            srclen = encoder_outs.size(0)
+        else:
+            srclen = None
+        #if self.scheduled_sampling:
+        ss_backup_val = self.scheduled_sampling
+        if self.scheduled_sampling:
+            p = random.random()
+            if p < self.scheduled_sampling_p:
+                self.scheduled_sampling = False
+            else:
+                self.n_scheduled_sampling += 1
+                #old_val = seqlen
+                seqlen = int(srclen * self.args.max_len_a + self.args.max_len_b) + 1
+
+                #print(' [DEBUG] seqlen set to {} with scheduled sampling (instead of {})'.format(seqlen, old_val))
+                #sys.stdout.flush()
+        if incremental_state is not None:
+            seqlen = int(srclen * self.args.max_len_a + self.args.max_len_b) + 1
+
+            #print('[DEBUG] DraftLSTMDecoder, seqlen set to {} (srclen: {})'.format(seqlen, srclen))
+            #sys.stdout.flush()
+
+        self.num_masked_tokens += torch.sum(encoder_padding_mask == True).item() if encoder_padding_mask != None else 0
+
+        '''cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is not None:
+            prev_hiddens, prev_cells, input_feed, prev_predictions = cached_state'''
+
+        '''att_cached_state = utils.get_incremental_state(self, incremental_state, 'for_att_cached_state')
+        if att_cached_state is not None: 
+            dec_idx = att_cached_state 
+            prev_predictions = torch.cat( [prev_predictions, prev_output_tokens], 1 )
+        elif incremental_state is not None:
+            dec_idx = 0
+            prev_predictions = prev_output_tokens
+        else:
+            dec_idx = -1
+            prev_predictions = prev_output_tokens'''
+
+        prev_predictions = prev_output_tokens
+        prev_predictions_mask = prev_predictions.eq(self.padding_idx)
+        prev_predictions_mask[prev_predictions == self.blank_idx] = True
+        prev_predictions_mask = prev_predictions_mask.transpose(0, 1)
+        #utils.set_incremental_state(self, incremental_state, 'for_att_cached_state', dec_idx+1)
+
+        # embed tokens
+        x = self.embed_tokens(prev_predictions)
+        x = F.dropout(x, p=self.dropout_in, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        # initialize previous states (or get from cache during incremental generation)
+        cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is not None:
+            prev_hiddens, prev_cells, input_feed, prev_predictions = cached_state
+            #prev_predictions = torch.cat( [prev_predictions, prev_output_tokens], 1 )
+        elif encoder_out is not None:
+            # setup recurrent cells
+            num_layers = len(self.layers)
+            prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
+            prev_cells = [encoder_cells[i] for i in range(num_layers)]
+            if self.encoder_hidden_proj is not None:
+                prev_hiddens = [self.encoder_hidden_proj(x) for x in prev_hiddens]
+                prev_cells = [self.encoder_cell_proj(x) for x in prev_cells]
+            input_feed = x.new_zeros(bsz, self.hidden_size)
+            #prev_predictions = prev_output_tokens
+        else:
+            # setup zero cells, since there is no encoder
+            num_layers = len(self.layers)
+            zero_state = x.new_zeros(bsz, self.hidden_size)
+            prev_hiddens = [zero_state for i in range(num_layers)]
+            prev_cells = [zero_state for i in range(num_layers)]
+            input_feed = None
+            #prev_predictions = prev_output_tokens
+
+        assert srclen is not None or self.attention is None, \
+            "attention is not supported if there are no encoder outputs"
+        attn_scores = x.new_zeros(srclen, seqlen, bsz) if self.attention is not None else None
+        outs = []
+
+        #ss_backup_val = self.scheduled_sampling
+        #if self.scheduled_sampling:
+        #    p = random.random()
+        #    if p < self.scheduled_sampling_p:
+        #        self.scheduled_sampling = False
+        #    else:
+        #        self.n_scheduled_sampling += 1
+        finalized_hypos = 0
+        train_flag = incremental_state is None and self.scheduled_sampling
+        if train_flag:
+            scheduled_sampling_out = torch.zeros(seqlen, bsz, self.out_embed_dim).to(x)
+            prev_output_tokens_h = torch.LongTensor(bsz, 4*self.max_target_positions).to(x.device)
+            prev_output_tokens_h.fill_(self.dictionary.pad())
+            prev_output_tokens_h[:,0] = self.dictionary.eos()
+
+        #print('[DEBUG] DraftLSTMDecoder, decoding a sequence of length {}'.format(seqlen))
+        #sys.stdout.flush()
+ 
+        inf_finalized_hypos_dim = [0] * bsz
+        inf_finalized_hypos_idx = [0] * bsz
+        for j in range(seqlen):
+            curr_pred = x
+            curr_pred_mask = prev_predictions_mask
+            if incremental_state is None:
+                if self.scheduled_sampling:
+                    cacheB, cacheT = prev_output_tokens_h.size()
+                    if cacheB != bsz:
+                        print(' - DraftLSTMDecoder, reducing scheduled sampling predicted tokens cache: {} vs. {} (length: {} vs. {})'.format(cacheB, bsz, cacheT, seqlen))
+                        sys.stdout.flush()
+
+                    prev_predictions = prev_output_tokens_h[:,:j+1].clone() #torch.cat( scheduled_sampling_prev_lst, 1 )
+                    prev_predictions_mask = prev_predictions.eq(self.padding_idx)
+                    prev_predictions_mask[prev_predictions == self.blank_idx] = True
+                    prev_predictions_mask = prev_predictions_mask.transpose(0, 1)
+                    x = self.embed_tokens(prev_predictions)
+                    x = F.dropout(x, p=self.dropout_in, training=self.training)
+                    x = x.transpose(0, 1)
+                    #tgt_idx = j+1
+                #else:
+                #    dec_idx = j
+                curr_pred = x[:j+1,:,:]   # We mask the future
+                curr_pred_mask = prev_predictions_mask[:j+1,:]
+
+            if train_flag:
+                cacheB, cacheT = prev_output_tokens_h.size()
+                if cacheB != bsz:
+                    print(' - DraftLSTMDecoder, attention input shapes:')
+                    print('   - prev_hiddens[0]: {}'.format(prev_hiddens[0].size()))
+                    print('   - curr_pred: {}'.format(curr_pred.size()))
+                    print('   - curr_pred_mask: {}'.format(curr_pred_mask.size()))
+                    sys.stdout.flush()
+
+            pred_attn, _ = self.pred_attention(prev_hiddens[-1], curr_pred, curr_pred_mask)
+            pred_attn = F.dropout(pred_attn, p=self.dropout_out, training=self.training)
+
+            # input feeding: concatenate context vector from previous time step
+            if input_feed is not None:
+                input = torch.cat((pred_attn, input_feed), dim=1)
+            else:
+                input = pred_attn
+
+            for i, rnn in enumerate(self.layers):
+                # recurrent cell
+                hidden, cell = rnn(input, (prev_hiddens[i], prev_cells[i]))
+
+                # hidden state becomes the input to the next layer
+                input = F.dropout(hidden, p=self.dropout_out, training=self.training)
+
+                # save state for next time step
+                prev_hiddens[i] = hidden
+                prev_cells[i] = cell
+
+            # apply attention using the last layer's hidden state
+            if self.attention is not None:
+                out, attn_scores[:, j, :] = self.attention(hidden, encoder_outs, encoder_padding_mask)
+            else:
+                out = hidden
+            out = F.dropout(out, p=self.dropout_out, training=self.training)
+
+            # input feeding
+            if input_feed is not None:
+                input_feed = out
+
+            if train_flag:
+                ss_x = self.scheduled_sampling_output_(out)
+                ss_pred = self.scheduled_sampling_predict_(ss_x)
+
+                scheduled_sampling_out[j,:,:] = ss_x
+                prev_output_tokens_h[:,j+1] = ss_pred
+
+                finalized_hypos += torch.sum( ss_pred == self.dictionary.eos() ).item()
+                if finalized_hypos >= bsz:
+                    #print(' [DEBUG] found {} eos tokens, breaking decoding...'.format(finalized_hypos))
+                    #sys.stdout.flush()
+                    break
+            else:
+                # save final output
+                outs.append(out)
+
+            if incremental_state is not None:
+                # NOTE: for generating predictions "all at once" in the DraftDecoder we use functions 'scheduled_sampling_output_' and 'scheduled_sampling_predict_' to compute predictions at inference phase as they do exactly what would be done in the last part of the 'extract_features' function.
+                draft_x = self.scheduled_sampling_output_(out)
+                draft_preds = self.scheduled_sampling_predict_(draft_x)
+                prev_predictions = torch.cat([prev_predictions, draft_preds], 1)
+                #prev_predictions = prev_output_tokens
+ 
+                prev_predictions_mask = prev_predictions.eq(self.padding_idx)
+                prev_predictions_mask[prev_predictions == self.blank_idx] = True
+                prev_predictions_mask = prev_predictions_mask.transpose(0, 1)
+
+                x = self.embed_tokens(prev_predictions)
+                x = F.dropout(x, p=self.dropout_in, training=self.training)
+
+                # B x T x C -> T x B x C
+                x = x.transpose(0, 1)
+
+                for o_idx in range(bsz):
+                    if draft_preds[o_idx] == self.dictionary.eos():
+                        inf_finalized_hypos_dim[o_idx] = 1
+                        inf_finalized_hypos_idx[o_idx] = j
+                if sum(inf_finalized_hypos_dim) >= bsz:
+                    break
+
+        # cache previous states (no-op except during incremental generation)
+        utils.set_incremental_state(
+            self, incremental_state, 'cached_state',
+            (prev_hiddens, prev_cells, input_feed, prev_predictions),
+        )
+        '''print(' - after extracting features:')
+        print('   * prev_hiddens shape: {}'.format(prev_hiddens[-1].size()))
+        print('   * prev_cells shape: {}'.format(prev_cells[-1].size()))
+        print('   * input_feed shape: {}'.format(input_feed.size()))
+        print(' -----')
+        sys.stdout.flush()'''
+
+        if train_flag:
+            x = scheduled_sampling_out
+        else:
+            # collect outputs across time steps
+            x = torch.cat(outs, dim=0).view(seqlen, bsz, self.hidden_size)
+
+        # T x B x C -> B x T x C
+        x = x.transpose(1, 0)
+
+        if not train_flag:
+            if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
+                x = self.additional_fc(x)
+                x = F.dropout(x, p=self.dropout_out, training=self.training)
+
+        # srclen x tgtlen x bsz -> bsz x tgtlen x srclen
+        if not self.training and self.need_attn and self.attention is not None:
+            attn_scores = attn_scores.transpose(0, 2)
+        else:
+            attn_scores = None
+
+        #print('[DEBUG] DraftLSTMDecoder, draft decoded: {}'.format(x.size()))
+        #sys.stdout.flush()
+
+        self.scheduled_sampling = ss_backup_val
+        return x, attn_scores
+
+    def output_layer(self, x):
+        """Project features to the vocabulary size."""
+        if self.adaptive_softmax is None:
+            if self.share_input_output_embed:
+                x = F.linear(x, self.embed_tokens.weight)
+            else:
+                x = self.fc_out(x)
+        return x
+
+    def reorder_incremental_state(self, incremental_state, new_order):
+        super().reorder_incremental_state(incremental_state, new_order)
+        cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is None:
+            return
+
+        '''print(' - reorder_incremental_state, shapes before reordering:')
+        for ii in cached_state:
+            if isinstance(ii, list):
+                print(ii[-1].size())
+            elif ii is not None:
+                print(ii.size())
+        print(' ---')'''
+
+        def reorder_state(state):
+            if isinstance(state, list):
+                return [reorder_state(state_i) for state_i in state]
+            elif state is not None:
+                return state.index_select(0, new_order)
+            else:
+                return None
+
+        new_state = tuple(map(reorder_state, cached_state))
+        utils.set_incremental_state(self, incremental_state, 'cached_state', new_state)
+
+        '''print(' - reorder_incremental_state, shapes AFTER reordering:')
+        for ii in cached_state:
+            if isinstance(ii, list):
+                print(ii[-1].size())
+            elif ii is not None:
+                print(ii.size())
+        print(' ---')
+        sys.stdout.flush()'''
+
+    def max_positions(self):
+        """Maximum output length supported by the decoder."""
+        return self.max_target_positions
+
+    def make_generation_fast_(self, need_attn=False, **kwargs):
+        self.need_attn = need_attn
+
+class DeliberationLSTMDecoder(FairseqIncrementalDecoder):
+    """Like LSTM decoder, but it uses an attention on all previous predictions, instead of using only the previous prediction."""
+    def __init__(
+        self, dictionary, args, embed_dim=512, hidden_size=512, out_embed_dim=512,
+        num_layers=1, dropout_in=0.1, dropout_out=0.1, attention=True,
+        encoder_output_units=512, pretrained_embed=None,
+        share_input_output_embed=False, adaptive_softmax_cutoff=None,
+        max_target_positions=1024
+    ):
+        super().__init__(dictionary)
+        self.dropout_in = dropout_in
+        self.dropout_out = dropout_out
+        self.hidden_size = hidden_size
+        self.out_embed_dim = out_embed_dim
+        self.share_input_output_embed = share_input_output_embed
+        self.need_attn = True
+        self.max_target_positions = max_target_positions
+        self.args = args
+        self.blank_idx = dictionary.set_blank()
+        self.num_masked_tokens = 0
+
+        #if args.scheduled_sampling:
+        #    self.register_buffer('prev_output_tokens_h', torch.LongTensor(args.max_sentences, 4*max_target_positions).fill_(dictionary.pad()))
+        #    self.prev_output_tokens_h.requires_grad = False
+        self.scheduled_sampling = False
+        self.scheduled_sampling_updates = 0
+        self.n_scheduled_sampling = 0
+        self.scheduled_sampling_init = 0.99
+        self.scheduled_sampling_p = 0.99
+
+        self.draft_decoder = DraftLSTMDecoder(dictionary, args,
+            embed_dim=embed_dim, hidden_size=hidden_size, out_embed_dim=out_embed_dim,
+            num_layers=num_layers,
+            dropout_in=dropout_in, dropout_out=dropout_out,
+            attention=attention,
+            encoder_output_units=encoder_output_units,
+            pretrained_embed=pretrained_embed,
+            share_input_output_embed=share_input_output_embed,
+            adaptive_softmax_cutoff=adaptive_softmax_cutoff,
+            max_target_positions=max_target_positions
+        )
+        self.draft_attention = SLUAttentionLayer(hidden_size, out_embed_dim, hidden_size, bias=False)
+
+        self.adaptive_softmax = None
+        num_embeddings = len(dictionary)
+        self.padding_idx = dictionary.pad()
+        if pretrained_embed is None:
+            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+        else:
+            self.embed_tokens = pretrained_embed
+
+        self.encoder_output_units = encoder_output_units
+        if encoder_output_units != hidden_size and encoder_output_units != 0:
+            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+        else:
+            self.encoder_hidden_proj = self.encoder_cell_proj = None
+
+        self.pred_attention = SLUAttentionLayer(hidden_size, embed_dim, hidden_size, bias=False)  # TODO: use this as input to the LSTM instead of x
+
+        # disable input feeding if there is no encoder
+        # input feeding is described in arxiv.org/abs/1508.04025
+        input_feed_size = 0 if encoder_output_units == 0 else hidden_size
+        self.layers = nn.ModuleList([
+            init_functions.LSTMCell(
+                input_size=input_feed_size + embed_dim + hidden_size if layer == 0 else hidden_size,
+                hidden_size=hidden_size,
+            )
+            for layer in range(num_layers)
+        ])
+        if attention:
+            # TODO make bias configurable
+            self.attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
+        else:
+            self.attention = None
+        if hidden_size != out_embed_dim:
+            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
+        if adaptive_softmax_cutoff is not None:
+            # setting adaptive_softmax dropout to dropout_out for now but can be redefined
+            self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
+                                                    dropout=dropout_out)
+        elif not self.share_input_output_embed:
+            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
+
+        self.speaker = None
+
+    def set_turn_speaker(self, val):
+        self.speaker = val
+        return self.speaker
+
+    def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None, **kwargs):
+        x, attn_scores = self.extract_features(
+            prev_output_tokens, encoder_out, incremental_state
+        )
+        return self.output_layer(x), attn_scores
+
+    def set_scheduled_sampling(self, val=False, epoch=1):
+        self.scheduled_sampling = val
+        if self.scheduled_sampling:
+            self.scheduled_sampling_updates = epoch
+            if self.scheduled_sampling_updates >= self.args.start_scheduled_sampling:
+                self.scheduled_sampling_p = self.scheduled_sampling_init * (0.99**(epoch-self.args.start_scheduled_sampling))
+
+        print(' - LSTMDecoderEx: scheduled sampling set to {} (updates: {}; p: {})'.format(self.scheduled_sampling, self.scheduled_sampling_updates, self.scheduled_sampling_p))
+        sys.stdout.flush()
+
+    def n_scheduled_sampling_(self, val=0):
+        old_val = self.n_scheduled_sampling
+        self.n_scheduled_sampling = val
+        return old_val
+
+    def scheduled_sampling_output_(self, x):
+        if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
+            x = self.additional_fc(x)
+            x = F.dropout(x, p=self.dropout_out, training=self.training) 
+        return x
+
+    def scheduled_sampling_predict_(self, x):
+        x = self.output_layer(x)
+        scores = F.log_softmax(x, -1)
+
+        #print(' - scheduled_sampling processing, x: {}; scores: {}'.format(x.size(), scores.size()))
+        #sys.stdout.flush() 
+
+        max_sc, pred = torch.max(scores, -1)
+        return pred
+
+    def extract_features(
+        self, prev_output_tokens, encoder_out, incremental_state=None
+    ):
+        """
+        Similar to *forward* but only return features.
+        """
+        draft_encoder_out = encoder_out
+        if encoder_out is not None:
+            encoder_padding_mask = encoder_out['encoder_padding_mask']
+            encoder_out = encoder_out['encoder_out']
+        else:
+            encoder_padding_mask = None
+            encoder_out = None
+
+        if incremental_state is not None:
+            prev_output_tokens = prev_output_tokens[:, -1:]
+        bsz, seqlen = prev_output_tokens.size() 
+
+        if incremental_state is not None:
+            draft_states = utils.get_incremental_state(self, incremental_state, 'draft_state')
+            if draft_states == None:
+                draft_out = self.draft_decoder(
+                    prev_output_tokens,
+                    encoder_out=draft_encoder_out,
+                    incremental_state=incremental_state,
+                    features_only=False,
+                    return_all_hiddens = False,
+                )
+                draft_state = draft_out[1]['feats'].transpose(0, 1)   # B x T x C -> T x B x C
+                draft_x = draft_out[0] 
+                utils.set_incremental_state(self, incremental_state, 'draft_state', (draft_state, draft_x))
+
+                #print('[DEBUG] DeliberationLSTMDecoder, draft decoded: {}'.format(draft_state.size()))
+                #sys.stdout.flush()
+            else:
+                draft_state, draft_x = draft_states
+                draft_out = (draft_x, {'attn': None, 'feats': draft_state})
+                #print('[DEBUG] DeliberationLSTMDecoder, draft retrieved from cache: {}'.format(draft_state.size()))
+                #sys.stdout.flush()
+        else:
+            draft_out = self.draft_decoder(
+                prev_output_tokens,
+                encoder_out=draft_encoder_out,
+                features_only=False, 
+                return_all_hiddens = False,
+            )
+            draft_state = draft_out[1]['feats'].transpose(0, 1)   # B x T x C -> T x B x C
+            draft_x = draft_out[0]
+
+        # Precomputes draft decoder predictions to create a mask to padding and blanks
+        T, B, C = draft_state.size() 
+
+        draft_lprobs = F.log_softmax(draft_x, dim=-1)
+        _, draft_preds = torch.max(draft_lprobs, -1)
+        draft_mask = draft_preds.eq(self.padding_idx)   # B x T
+        draft_mask[draft_mask == self.blank_idx] = True
+        draft_mask = draft_mask.transpose(0,1)  # T x B 
+
+        #print('[DEBUG] DeliberationLSTMDecoder, computed draft state: {}'.format(draft_state.size()))
+        #sys.stdout.flush()
+
+        # get outputs from encoder
+        if encoder_out is not None:
+            encoder_outs, encoder_hiddens, encoder_cells = encoder_out[:3]
+            srclen = encoder_outs.size(0)
+        else:
+            srclen = None
+        #if self.scheduled_sampling:
+        ss_backup_val = self.scheduled_sampling
+        if self.scheduled_sampling:
+            p = random.random()
+            if p < self.scheduled_sampling_p:
+                self.scheduled_sampling = False
+            else:
+                self.n_scheduled_sampling += 1
+                #old_val = seqlen
+                seqlen = int(srclen * self.args.max_len_a + self.args.max_len_b) + 1
+
+                #print(' [DEBUG] seqlen set to {} with scheduled sampling (instead of {})'.format(seqlen, old_val))
+                #sys.stdout.flush()
+
+        self.num_masked_tokens += torch.sum(encoder_padding_mask == True).item() if encoder_padding_mask != None else 0
+
+        cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is not None:
+            prev_hiddens, prev_cells, input_feed, prev_predictions = cached_state
+            '''print(' - prev_hiddens shape: {}'.format(prev_hiddens[-1].size()))
+            print(' - prev_cells shape: {}'.format(prev_cells[-1].size()))
+            print(' - input_feed shape: {}'.format(input_feed.size()))
+            sys.stdout.flush()'''
+
+        att_cached_state = utils.get_incremental_state(self, incremental_state, 'for_att_cached_state') 
+        if att_cached_state is not None:
+            #dec_idx, tmp_prev_predictions = att_cached_state
+            dec_idx = att_cached_state
+
+            #print('prev_predictions shape: {}; prev_output_tokens shape: {}'.format(prev_predictions.size(), prev_output_tokens.size()))
+            #sys.stdout.flush()
+
+            prev_predictions = torch.cat( [prev_predictions, prev_output_tokens], 1 ) 
+        elif incremental_state is not None:
+            dec_idx = 0 
+            prev_predictions = prev_output_tokens 
+        else: 
+            dec_idx = -1
+            prev_predictions = prev_output_tokens
+         
+        prev_predictions_mask = prev_predictions.eq(self.padding_idx)
+        prev_predictions_mask[prev_predictions == self.blank_idx] = True
+        prev_predictions_mask = prev_predictions_mask.transpose(0, 1) 
+        utils.set_incremental_state(self, incremental_state, 'for_att_cached_state', dec_idx+1)
+
+        # embed tokens
+        x = self.embed_tokens(prev_predictions)
+        x = F.dropout(x, p=self.dropout_in, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1) 
+
+        # initialize previous states (or get from cache during incremental generation)
+        cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is not None:
+            prev_hiddens, prev_cells, input_feed, prev_predictions = cached_state
+            prev_predictions = torch.cat( [prev_predictions, prev_output_tokens], 1 )
+        elif encoder_out is not None:
+            # setup recurrent cells
+            num_layers = len(self.layers)
+            prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
+            prev_cells = [encoder_cells[i] for i in range(num_layers)]
+            if self.encoder_hidden_proj is not None:
+                prev_hiddens = [self.encoder_hidden_proj(x) for x in prev_hiddens]
+                prev_cells = [self.encoder_cell_proj(x) for x in prev_cells]
+            input_feed = x.new_zeros(bsz, self.hidden_size)
+            prev_predictions = prev_output_tokens
+        else:
+            # setup zero cells, since there is no encoder
+            num_layers = len(self.layers)
+            zero_state = x.new_zeros(bsz, self.hidden_size)
+            prev_hiddens = [zero_state for i in range(num_layers)]
+            prev_cells = [zero_state for i in range(num_layers)]
+            input_feed = None
+            prev_predictions = prev_output_tokens
+
+        assert srclen is not None or self.attention is None, \
+            "attention is not supported if there are no encoder outputs"
+        attn_scores = x.new_zeros(srclen, seqlen, bsz) if self.attention is not None else None
+        outs = []
+
+        #ss_backup_val = self.scheduled_sampling
+        #if self.scheduled_sampling:
+        #    p = random.random()
+        #    if p < self.scheduled_sampling_p:
+        #        self.scheduled_sampling = False
+        #    else:
+        #        self.n_scheduled_sampling += 1
+        finalized_hypos = 0
+        train_flag = incremental_state is None and self.scheduled_sampling
+        if train_flag:
+            scheduled_sampling_out = torch.zeros(seqlen, bsz, self.out_embed_dim).to(x)
+            prev_output_tokens_h = torch.LongTensor(bsz, 4*self.max_target_positions).to(x.device)
+            prev_output_tokens_h.fill_(self.dictionary.pad())
+            prev_output_tokens_h[:,0] = self.dictionary.eos()
+        for j in range(seqlen):
+            curr_pred = x
+            curr_pred_mask = prev_predictions_mask
+            if incremental_state is None:
+                if self.scheduled_sampling:
+                    cacheB, cacheT = prev_output_tokens_h.size()
+                    if cacheB != bsz:
+                        print(' - LSTMDecoderEx, reducing scheduled sampling predicted tokens cache: {} vs. {} (length: {} vs. {})'.format(cacheB, bsz, cacheT, seqlen))
+                        sys.stdout.flush()
+
+                    prev_predictions = prev_output_tokens_h[:,:j+1].clone() #torch.cat( scheduled_sampling_prev_lst, 1 )
+                    prev_predictions_mask = prev_predictions.eq(self.padding_idx)
+                    prev_predictions_mask[prev_predictions == self.blank_idx] = True
+                    prev_predictions_mask = prev_predictions_mask.transpose(0, 1)
+                    x = self.embed_tokens(prev_predictions)
+                    x = F.dropout(x, p=self.dropout_in, training=self.training)
+                    x = x.transpose(0, 1)
+                    #tgt_idx = j+1
+                #else:
+                #    dec_idx = j
+                curr_pred = x[:j+1,:,:]   # We mask the future 
+                curr_pred_mask = prev_predictions_mask[:j+1,:]
+
+            if train_flag:
+                cacheB, cacheT = prev_output_tokens_h.size()
+                if cacheB != bsz:
+                    print(' - LSTMDecoderEx, attention input shapes:')
+                    print('   - prev_hiddens[0]: {}'.format(prev_hiddens[0].size()))
+                    print('   - curr_pred: {}'.format(curr_pred.size()))
+                    print('   - curr_pred_mask: {}'.format(curr_pred_mask.size()))
+                    sys.stdout.flush()
+
+            pred_attn, _ = self.pred_attention(prev_hiddens[-1], curr_pred, curr_pred_mask)
+            pred_attn = F.dropout(pred_attn, p=self.dropout_out, training=self.training)
+
+            draft_attn, _ = self.draft_attention(prev_hiddens[-1], draft_state, draft_mask)
+            draft_attn = F.dropout(draft_attn, p=self.dropout_out, training=self.training)
+
+            #print('[DEBUG] DeliberationLSTMDecoder, draft attention computed: {}'.format(draft_attn.size()))
+            #sys.stdout.flush() 
+
+            # input feeding: concatenate context vector from previous time step
+            if input_feed is not None:
+                input = torch.cat((pred_attn, draft_attn, input_feed), dim=1)
+            else:
+                input = torch.cat((pred_attn, draft_attn), dim=1)
+
+            for i, rnn in enumerate(self.layers):
+                # recurrent cell
+                hidden, cell = rnn(input, (prev_hiddens[i], prev_cells[i]))
+
+                # hidden state becomes the input to the next layer
+                input = F.dropout(hidden, p=self.dropout_out, training=self.training)
+
+                # save state for next time step
+                prev_hiddens[i] = hidden
+                prev_cells[i] = cell
+
+            #print('[DEBUG] DeliberationLSTMDecoder, LSTM output computed')
+            #sys.stdout.flush() 
+
+            # apply attention using the last layer's hidden state
+            if self.attention is not None:
+                out, attn_scores[:, j, :] = self.attention(hidden, encoder_outs, encoder_padding_mask)
+            else:
+                out = hidden
+            out = F.dropout(out, p=self.dropout_out, training=self.training)
+
+            # input feeding
+            if input_feed is not None:
+                input_feed = out
+
+            if train_flag:
+                ss_x = self.scheduled_sampling_output_(out)
+                ss_pred = self.scheduled_sampling_predict_(ss_x)
+
+                scheduled_sampling_out[j,:,:] = ss_x              
+                prev_output_tokens_h[:,j+1] = ss_pred
+
+                finalized_hypos += torch.sum( ss_pred == self.dictionary.eos() ).item()
+                if finalized_hypos >= bsz:
+                    #print(' [DEBUG] found {} eos tokens, breaking decoding...'.format(finalized_hypos))
+                    #sys.stdout.flush()
+                    break
+            else:
+                # save final output
+                outs.append(out)
+
+        # cache previous states (no-op except during incremental generation)
+        utils.set_incremental_state(
+            self, incremental_state, 'cached_state',
+            (prev_hiddens, prev_cells, input_feed, prev_predictions),
+        )
+        '''print(' - after extracting features:')
+        print('   * prev_hiddens shape: {}'.format(prev_hiddens[-1].size()))
+        print('   * prev_cells shape: {}'.format(prev_cells[-1].size()))
+        print('   * input_feed shape: {}'.format(input_feed.size()))
+        print(' -----')
+        sys.stdout.flush()'''
+
+        if train_flag:
+            x = scheduled_sampling_out
+        else:
+            # collect outputs across time steps
+            x = torch.cat(outs, dim=0).view(seqlen, bsz, self.hidden_size)
+
+        # T x B x C -> B x T x C
+        x = x.transpose(1, 0)
+
+        if not train_flag:
+            if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
+                x = self.additional_fc(x)
+                x = F.dropout(x, p=self.dropout_out, training=self.training)
+
+        # srclen x tgtlen x bsz -> bsz x tgtlen x srclen
+        if not self.training and self.need_attn and self.attention is not None:
+            attn_scores = attn_scores.transpose(0, 2)
+        else:
+            attn_scores = None 
+
+        #print('[DEBUG] DeliberationLSTMDecoder, output computed: {}'.format(x.size()))
+        #sys.stdout.flush()
+
+        self.scheduled_sampling = ss_backup_val
+        return x, {'attn': attn_scores, 'draft_out': draft_out}
+
+    def output_layer(self, x):
+        """Project features to the vocabulary size."""
+        if self.adaptive_softmax is None:
+            if self.share_input_output_embed:
+                x = F.linear(x, self.embed_tokens.weight)
+            else:
+                x = self.fc_out(x)
+        return x
+
+    def reorder_incremental_state(self, incremental_state, new_order):
+        super().reorder_incremental_state(incremental_state, new_order)
+        cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is None:
+            return
+
+        '''print(' - reorder_incremental_state, shapes before reordering:')
+        for ii in cached_state:
+            if isinstance(ii, list):
+                print(ii[-1].size())
+            elif ii is not None:
+                print(ii.size())
+        print(' ---')'''
+
+        def reorder_state(state):
+            if isinstance(state, list):
+                return [reorder_state(state_i) for state_i in state]
+            elif state is not None:
+                return state.index_select(0, new_order)
+            else:
+                return None
+
+        new_state = tuple(map(reorder_state, cached_state))
+        utils.set_incremental_state(self, incremental_state, 'cached_state', new_state)
+
+        draft_states = utils.get_incremental_state(self, incremental_state, 'draft_state')
+        if draft_states is not None:
+            draft_state, draft_x = draft_states
+            draft_state = draft_state.index_select(1, new_order)
+            draft_x = draft_x.index_select(0, new_order)
+            utils.set_incremental_state(self, incremental_state, 'draft_state', (draft_state, draft_x))
+
+        '''print(' - reorder_incremental_state, shapes AFTER reordering:')
+        for ii in cached_state:
+            if isinstance(ii, list):
+                print(ii[-1].size())
+            elif ii is not None:
+                print(ii.size())
+        print(' ---')
+        sys.stdout.flush()'''
+
+    def max_positions(self):
+        """Maximum output length supported by the decoder."""
+        return self.max_target_positions
+
+    def make_generation_fast_(self, need_attn=False, **kwargs):
+        self.need_attn = need_attn
 
 ### ENCODER-DECODER MODEL ###
 from fairseq.models import FairseqEncoderDecoderModel, register_model
@@ -1851,8 +2902,8 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         #parser.add_argument( '--load-encoder', type=str, default='None', help='Load a pre-trained (basic) encoder' )
         #parser.add_argument( '--load-fairseq-encoder', type=str, default='None', help='Load the encoder from a fairseq checkpoint' )
         parser.add_argument( '--match-source-len', action='store_true', default=False, help='For scheduled-sampling decoding, same behavior as for fairseq-generate' )
-        parser.add_argument( '--max-lan-a', type=float, default=0.4, help='For scheduled-sampling decoding, same behavior as for fairseq-generate' )
-        parser.add_argument( '--max-len-b', type=int, default=10, help='For scheduled-sampling decoding, same behavior as for fairseq-generate' )
+        parser.add_argument( '--max-len-a', type=float, default=1.0, help='For scheduled-sampling decoding, same behavior as for fairseq-generate' )
+        parser.add_argument( '--max-len-b', type=int, default=0, help='For scheduled-sampling decoding, same behavior as for fairseq-generate' )
         parser.add_argument( '--freeze-encoder', action='store_true', default=False, help='Freeze encoder parameters, only learns the decoder' )
         #parser.add_argument('--pyramid-hidden-layers', type=int, default=1, help='Number of layers in the hidden LSTM stages of the pyramidal encoder')
 
@@ -1892,6 +2943,26 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
             decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
         elif args.decoder == 'ctclstm': 
             decoder = LSTMDecoderEx(
+                dictionary=tgt_dict,
+                args=args,
+                embed_dim=args.decoder_embed_dim,
+                hidden_size=args.decoder_hidden_dim,
+                out_embed_dim=args.output_size,
+                num_layers=args.decoder_layers,
+                dropout_in=args.decoder_dropout,
+                dropout_out=args.decoder_dropout,
+                attention=True,
+                encoder_output_units=encoder.encoder_output_units,
+                pretrained_embed=None,
+                share_input_output_embed=False,
+                adaptive_softmax_cutoff=(
+                    options.eval_str_list(args.adaptive_softmax_cutoff, type=int)
+                    if args.criterion == 'adaptive_loss' else None
+                ),
+                max_target_positions=args.max_target_positions
+            )
+        elif args.decoder == 'deliberation':
+            decoder = DeliberationLSTMDecoder(
                 dictionary=tgt_dict,
                 args=args,
                 embed_dim=args.decoder_embed_dim,
@@ -1977,6 +3048,7 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
             raise NotImplementedError
  
         model = End2EndSLUModel(args, encoder, decoder, tgt_dict)
+        model.spk_abs_val = task.spk_abs_val
 
         # Print the model architecture.
         #print(model)
@@ -2003,7 +3075,7 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         num_embeddings = len(dictionary)
         padding_idx = dictionary.pad()
         
-        emb = Embedding(num_embeddings, embed_dim, padding_idx)
+        emb = init_functions.LSTMEmbedding(num_embeddings, embed_dim, padding_idx)
         # if provided, load from preloaded dictionaries
         if path:
             embed_dict = utils.parse_embedding(path)
@@ -2023,10 +3095,11 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
     def __init__(self, args, encoder, decoder, tgt_dict):
         super().__init__(encoder, decoder)
 
+        self.spk_abs_val = 1.0
         self.args = args
         self.dict = tgt_dict
         self.teacher_forcing = True
-        self.scheduled_sampling = False #args.scheduled_sampling
+        self.scheduled_sampling = args.scheduled_sampling
 
         #self.user_pad = src_tokens.new_zeros(3,args.num_features).fill_(5.0)
         #self.mach_pad = src_tokens.new_zeros(3,args.num_features).fill_(-5.0)
@@ -2038,11 +3111,11 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
 
     def set_scheduled_sampling(self, ss_val=False, epoch=1):
         self.scheduled_sampling = ss_val
-        if isinstance(self.decoder, ICASSPDecoderEx):
+        if isinstance(self.decoder, ICASSPDecoderEx) or isinstance(self.decoder, LSTMDecoderEx):
             self.decoder.set_scheduled_sampling(val=ss_val, epoch=epoch)
 
     def get_scheduled_sampling_updates(self):
-        if isinstance(self.decoder, ICASSPDecoderEx):
+        if isinstance(self.decoder, ICASSPDecoderEx) or isinstance(self.decoder, LSTMDecoderEx):
             return self.decoder.n_scheduled_sampling_()
         else:
             return 0
@@ -2150,8 +3223,8 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         """ 
 
         B, T, C = src_tokens.size()
-        user_pad = src_tokens.new_zeros(3,C).fill_(5.0)
-        mach_pad = src_tokens.new_zeros(3,C).fill_(-5.0)
+        user_pad = src_tokens.new_zeros(3,C).fill_(self.spk_abs_val)
+        mach_pad = src_tokens.new_zeros(3,C).fill_(-self.spk_abs_val)
  
         speakers = []
         for i in range(B):         
@@ -2230,7 +3303,7 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         self.encoder = checkpoint_utils.load_pretrained_component_from_model(self.encoder, fsencoder) 
 
         if task.args.decoder == state['args'].decoder:
-            if task.args.load_dictionary:
+            if task.args.load_dictionary or task.args.source_dictionary:
                 print(' * End2EndSLUModel: pre-initializing decoder weights from another model...')
                 sys.stdout.flush()
 
@@ -2238,14 +3311,14 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
                     state['model'][k].requires_grad = False
 
                 if isinstance(self.decoder, BasicDecoder):
-                    SubstateDict = {}
+                    '''SubstateDict = OrderedDict()
                     for key in state['model'].keys():
                         if 'decoder' in key and 'output_projection' not in key and 'output_norm' not in key:
                             SubstateDict[key[len('decoder')+1:]] = state['model'][key]
                         elif 'decoder' in key:
                             subkey = key[len('decoder')+1:]
                             SubstateDict[subkey] = self.decoder.state_dict()[subkey]
-                    self.decoder.load_state_dict(SubstateDict, strict=True)
+                    self.decoder.load_state_dict(SubstateDict, strict=True)'''
 
                     # Pre-initialize 'output_projection' matrix (self.decoder.output_projection.weight, second dimension is the size of the dictionary)
                     if task.args.target_dictionary:
@@ -2258,6 +3331,25 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
                             self.decoder.output_projection.bias.data[tgt_idx] = state['model']['decoder.output_projection.bias'].data[tgt_idx]
                             self.decoder.output_norm.weight.data[tgt_idx,:] = state['model']['decoder.output_norm.weight'].data[tgt_idx,:]
                             self.decoder.output_norm.bias.data[tgt_idx] = state['model']['decoder.output_norm.bias'].data[tgt_idx]
+                    elif task.args.source_dictionary:
+                        print(' * End2EndSLUModel, pre-initializing basic decoder with source dictionary')
+                        sys.stdout.flush()
+
+                        common = 0 
+                        src_dict = torch.load(task.args.source_dictionary)
+                        for sym in src_dict.symbols:
+                            if sym in self.dict.symbols:
+                                common += 1
+                                src_idx = src_dict.index(sym)
+                                tgt_idx = self.dict.index(sym) 
+
+                                self.decoder.output_projection.weight.data[tgt_idx,:] = state['model']['decoder.output_projection.weight'].data[src_idx,:]
+                                self.decoder.output_projection.bias.data[tgt_idx] = state['model']['decoder.output_projection.bias'].data[src_idx]
+                                self.decoder.output_norm.weight.data[tgt_idx] = state['model']['decoder.output_norm.weight'].data[src_idx]
+                                self.decoder.output_norm.bias.data[tgt_idx] = state['model']['decoder.output_norm.bias'].data[src_idx]
+
+                        print(' * End2EndSLUModel, {} common symbols have been initialized'.format(common))
+                        sys.stdout.flush()
                     else:
                         dd_size = state['model']['decoder.output_projection.weight'].size(0) 
                         self.decoder.output_projection.weight.data[:dd_size,:] = state['model']['decoder.output_projection.weight'].data
@@ -2267,35 +3359,68 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
 
                     print('   * BasicDecoder correctly pre-initialized.')
                     sys.stdout.flush()
-                elif isinstance(self.decoder, ICASSPDecoderEx):
-                    SubstateDict = {}
+                elif isinstance(self.decoder, ICASSPDecoderEx) or isinstance(self.decoder, LSTMDecoderEx):
+                    SubstateDict = OrderedDict()
                     for key in state['model'].keys():
+                        # NOTE: pre-initialize first all parameters except embeddings and output projection, which may have a different size with respect to the source domain
                         if 'decoder' in key and 'embed_tokens' not in key and 'fc_out' not in key:
                             SubstateDict[key[len('decoder')+1:]] = state['model'][key]
-                        elif 'decoder' in key:
+                        elif 'decoder' in key:  # NOTE: keep original initialization for embeddings and output projection
                             subkey = key[len('decoder')+1:]
                             SubstateDict[subkey] = self.decoder.state_dict()[subkey]
-                    self.decoder.load_state_dict(SubstateDict, strict=True)
 
-                    # TODO: pre-initialize 'embed_tokens' and 'fc_out' matrices (self.decoder.embed_tokens.weight, first dimention is the size of the dictionary; fc_out is like output_projection)
+                    print('[DEBUG] pre-initializing decoder with the following state:')
+                    print(SubstateDict.keys())
+                    print('[DEBUG] ==========')
+                    sys.stdout.flush()
+                    self.decoder.load_state_dict(SubstateDict, strict=True)
+ 
                     if task.args.target_dictionary:
+                        print(' * End2EndSLUModel, mapping embeddings and output projetction with target dictionary')
+                        sys.stdout.flush()
+
+                        #src_dict = torch.load(task.args.source_dictionary)
                         tgt_dict = torch.load(task.args.target_dictionary)
                         for sym in tgt_dict.symbols:
+                            #src_idx = src_dict.index(sym)
                             tgt_idx = self.dict.index(sym)
                             if sym != unk_token and tgt_idx == self.dict.unk():
                                 raise ValueError('Symbol {} is unknown in current dictionary'.format(sym))
                             self.decoder.embed_tokens.weight.data[tgt_idx,:] = state['model']['decoder.embed_tokens.weight'].data[tgt_idx,:]
                             if hasattr(self.decoder, 'fc_out'):
                                 self.decoder.fc_out.weight.data[tgt_idx,:] = state['model']['decoder.fc_out.weight'].data[tgt_idx,:]
-                                self.decoder.fc_out.bias.data[tgt_idx] = state['model']['decoder.fc_out.bias'].data[tgt_idx] 
+                                self.decoder.fc_out.bias.data[tgt_idx] = state['model']['decoder.fc_out.bias'].data[tgt_idx]
+                    elif task.args.source_dictionary:
+                        print(' * End2EndSLUModel, mapping embeddings and output projection with source dictionary')
+                        sys.stdout.flush()
+
+                        common = 0
+                        # NOTE: pre-initialize embeddings and output projection for tokens in common to source and target domains.
+                        src_dict = torch.load(task.args.source_dictionary)
+                        for sym in src_dict.symbols:
+                            if sym in self.dict.symbols:
+                                common += 1
+                                src_idx = src_dict.index(sym)
+                                tgt_idx = self.dict.index(sym)
+
+                                self.decoder.embed_tokens.weight.data[tgt_idx,:] = state['model']['decoder.embed_tokens.weight'].data[src_idx,:]
+                                if hasattr(self.decoder, 'fc_out'):
+                                    self.decoder.fc_out.weight.data[tgt_idx,:] = state['model']['decoder.fc_out.weight'].data[src_idx,:]
+                                    self.decoder.fc_out.bias.data[tgt_idx] = state['model']['decoder.fc_out.bias'].data[src_idx]
+
+                        print(' * End2EndSLUModel, {} common symbols have beed initialized'.format(common))
+                        sys.stdout.flush()
                     else:
+                        print(' * End2EndSLUModel, mapping embeddings and output projection as starting blocks')
+                        sys.stdout.flush()
+
                         dd_size = state['model']['decoder.embed_tokens.weight'].size(0)
                         self.decoder.embed_tokens.weight.data[:dd_size,:] = state['model']['decoder.embed_tokens.weight'].data
                         if hasattr(self.decoder, 'fc_out'):
                             self.decoder.fc_out.weight.data[:dd_size,:] = state['model']['decoder.fc_out.weight'].data
                             self.decoder.fc_out.bias.data[:dd_size] = state['model']['decoder.fc_out.bias'].data
 
-                    print('   * ICASSPDecoderEx correctly pre-initialized.')
+                    print('   * {} correctly pre-initialized.'.format(type(self.decoder)))
                     sys.stdout.flush()
             else:
                 print(' * End2EndSLUModel: pre-initializing also decoder...')
@@ -2357,7 +3482,7 @@ def end2end_slu_arch(args):
         trans_ba(args)
     elif args.decoder == 'lstm':
         lstm_ba(args)
-    elif not args.decoder in ['basic', 'ctclstm', 'icassp_lstm', 'end2end_slu']:
+    elif not args.decoder in ['basic', 'ctclstm', 'icassp_lstm', 'end2end_slu', 'deliberation']:
         raise NotImplementedError
 
 

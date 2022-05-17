@@ -11,6 +11,8 @@ import fairseq
 import torch.nn.functional as F
 from fairseq.models.wav2vec.wav2vec2_asr import Wav2VecCtc
 
+import resampy
+
 def split_wav_signal(infos, signal, chunk_duration):
 
     overlap = infos['split_overlap']
@@ -48,7 +50,10 @@ def extract_w2v2_features(model, samples):
 
         poker_face = torch.BoolTensor(1).fill_(False).to(samples.device)
         res = model.w2v_encoder.w2v_model.extract_features(source=samples.view(1,-1), padding_mask=poker_face, mask=False)
+        #res = model.w2v_encoder(samples.view(1, -1), poker_face, features_only=True) 
+ 
         y = res[0]
+        #y = res['encoder_out']
     else:
         #print(' - extracting features with w2v2 model...')
         #sys.stdout.flush()
@@ -81,21 +86,26 @@ def extract_features_from_splits(infos, threshold, model, samples):
     return tsr
 
 def main():
-    upsample = True
+    upsample = False
+    new_sample_rate = 16000
+    upsample_factor = 2
     cuda = False
-    extract_features=True
+    extract_features=False
     model_size = 'large'
     add_ext=True
-    file_ext = '.7kl-tslu'
-    duration_threshold = 30.0
+    input_ext = '.wav' #'.16kHz-resampy.wav'
+    file_ext = '.tmp-tokSLU'
+    duration_threshold = 28.0
     duration_margin = 1.0
-    chunk_overlap = 0.040
+    chunk_overlap = 0.020
     overwrite_arguments = {}
     device = 'cuda:1' if cuda else 'cpu'
+    #quantizer_location = 'encoder'
 
-    prefix_list='/home/getalp/dinarelm/work/data/MEDIA-Original/semantic_speech_aligned_corpus/media_all.lst'
-    #prefix_list='/home/getalp/dinarelm/work/data/FluentSpeechCommands/fluent_speech_commands_dataset/wavs/all_prefixes.lst'
     #prefix_list='/home/getalp/dinarelm/work/data/PortMEDIA/DialogTextAndWav/all_prefixes.lst'
+    #prefix_list='/home/getalp/dinarelm/work/data/MEDIA-Original/semantic_speech_aligned_corpus/media_all.lst'
+    #prefix_list='/home/getalp/dinarelm/work/data/FluentSpeechCommands/fluent_speech_commands_dataset/wavs/all_prefixes.lst'
+    prefix_list='/home/getalp/dinarelm/work/data/PortMEDIA/DialogTextAndWav/test_prefixes.lst'
 
     f = open(prefix_list, encoding='utf-8')
     lines = f.readlines()
@@ -103,14 +113,24 @@ def main():
     prefixes = [l.rstrip() for l in lines]
 
     sv_starting_point='/home/getalp/dinarelm/work/data/Exchance/wav2vec/models/FlowBERT-7K_large.pt'
-    flowbert_path='/home/getalp/dinarelm/work/data/models/wav2vec2.0/MEDIA-finetuned/MEDIA-fromFlowBERT-7klarge_SLU-token-tuned.pt'
+    #sv_starting_point='/home/getalp/dinarelm/work/data/Exchance/wav2vec/models/xlsr_53_56k.pt'
+    
+    flowbert_path='/home/getalp/dinarelm/work/data/models/wav2vec2.0/MEDIA-finetuned/MEDIA-fromFlowBERT-7klarge_SLU-token-tuned.pt' 
+    #flowbert_path='/home/getalp/dinarelm/work/data/models/wav2vec2.0/MEDIA-finetuned/MEDIA-fromFlowBERT-7klarge_SLU-char-tuned.pt'
+    #flowbert_path='/home/getalp/dinarelm/work/data/models/wav2vec2.0/FSC-finetuned/FSC-fromXLSR53-56klarge_SLU-token-tuned.pt'
 
     feat_norm = True if model_size == 'large' else False
     if feat_norm and extract_features:
         print(' - Normalizing {} model features...'.format(model_size))
         sys.stdout.flush()
     if upsample:
-        print(' - Upsampling input signals...')
+        pp = prefixes[0]
+        if add_ext:
+            pp = pp + input_ext
+        sample_rate, samples = wavfile.read(pp, mmap = True)
+        upsample_factor = int(new_sample_rate / sample_rate)
+
+        print(' - Upsampling input signals from {} to {} samples per second...'.format(sample_rate, new_sample_rate))
         sys.stdout.flush()
 
     if extract_features:
@@ -119,18 +139,22 @@ def main():
 
         if sv_starting_point is not None:
             overwrite_arguments['model'] = {'w2v_path': sv_starting_point}
-        model, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([flowbert_path], overwrite_arguments) #, arg_overrides=overwrite_arguments)
+        model, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([flowbert_path], overwrite_arguments)
         model = model[0]
+        #quantizer_location = getattr(cfg.model, "vq", "encoder")
+        #print('   * Quantizer location: {}'.format(quantizer_location))
+        #sys.stdout.flush()
         #state = torch.load(flowbert_path)
         #model.load_state_dict( state['model'] )
         model.eval()
-        model = model.to(device)
+        if cuda:
+            model = model.cuda() #model.to(device)
     else:
         model = None
 
     for prefix in prefixes:
         if add_ext:
-            wav_file = prefix + '.wav'
+            wav_file = prefix + input_ext
         else:
             wav_file = prefix
             prefix = prefix[:-4]
@@ -150,13 +174,20 @@ def main():
             else:
                 samples = samples[:,1]
 
+        assert len(samples.shape) == 1
         if upsample:
-            samples = signal.resample(samples, samples.shape[0]*2)  # Up-sampling to 16kHz
-            sample_rate = 2*sample_rate
+            resamples = signal.resample(samples, samples.shape[0]*upsample_factor)  # Up-sampling to 16kHz
+            #resamples = signal.resample_poly(samples, upsample_factor, 1, window=('kaiser', 5.0))
+            #resamples = resampy.core.resample(samples, sample_rate, new_sample_rate)
+            assert len(resamples.shape) == 1 and len(resamples) == upsample_factor*len(samples)
+            samples = resamples
+            sample_rate = upsample_factor*sample_rate
+            assert sample_rate == new_sample_rate
 
         if extract_features:
-            samples = torch.from_numpy(samples).float().squeeze() 
-            samples = samples.to(device)
+            samples = torch.from_numpy(samples).float().squeeze()
+            if cuda:
+                samples = samples.cuda() #samples.to(device)
             if feat_norm:
                 samples = F.layer_norm(samples, samples.shape) 
 
@@ -165,7 +196,20 @@ def main():
                 extract_params = {'sample_rate': sample_rate, 'split_overlap': chunk_overlap}
                 y = extract_features_from_splits(extract_params, duration_threshold, model, samples)
             else:
-                y = extract_w2v2_features(model, samples) 
+                y = extract_w2v2_features(model, samples)
+                
+            '''if quantizer_location == "encoder":
+                with torch.no_grad():
+                    _, idx = model.vector_quantizer.forward_idx(x)
+                    idx = idx.squeeze(0).cpu()
+            else:
+                with torch.no_grad():
+                    z = model.feature_aggregator(x)
+                    _, idx = model.vector_quantizer.forward_idx(z)
+                    idx = idx.squeeze(0).cpu()'''
+
+            print(' - Features extracted: {}'.format(y.size()))
+            sys.exit(0)
 
             torch.save(y.detach().to('cpu'), prefix + file_ext, _use_new_zipfile_serialization=False)
         elif upsample:

@@ -6,6 +6,7 @@
 import sys
 import math
 
+import torch
 import torch.nn.functional as F
 
 from fairseq import metrics, utils
@@ -55,6 +56,14 @@ class CrossEntropyCriterion(FairseqCriterion):
             ignore_index=self.padding_idx,
             reduction='sum' if reduce else 'none',
         )
+
+        '''print(' - CrossEntropy loss:')
+        print('   * lprobs min, max, mean: {}, {}, {}'.format(torch.min(lprobs), torch.max(lprobs), torch.mean(lprobs)))
+        print('   * loss value (reduce: {}): {}'.format(reduce, loss))
+        print(' ----------')
+        sys.stdout.flush()
+        sys.exit(0)'''
+
         return loss, loss
 
     @staticmethod

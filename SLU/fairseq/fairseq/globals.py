@@ -12,8 +12,10 @@ unk_token = '<unk>'
 machine_semantic = 'MachineSemantic'
 slu_start_concept_mark = '_SOC_'
 slu_end_concept_mark = '_EOC_'
+tok_separator = '|'
 user_ID = 'User'
 machine_ID = 'Machine'
+bogus_ID = '_Bogus_'
 
 LOSS_INIT_VALUE=999999.9
 ER_INIT_VALUE=LOSS_INIT_VALUE

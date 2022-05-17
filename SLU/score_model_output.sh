@@ -10,9 +10,12 @@ if [[ $# -ge 2 ]]; then
 	aux_opt=$2
 fi
 
-grep "^T\-" ${model_output} | cut -f 2- | perl -pe '{s/   / \# /g;}' > ${model_output}.ref # "s/   / \# \g;" is to keep into account spaces
-grep "^H\-" ${model_output} | cut -f 3- | perl -pe '{s/   / \# /g;}' > ${model_output}.hyp
-grep "^P\-" ${model_output} | cut -f 2- > ${model_output}.scores
+#grep "^T\-" ${model_output} | cut -f 2- | perl -pe '{s/   / \# /g;}' > ${model_output}.ref # "s/   / \# \g;" is to keep into account spaces
+#grep "^H\-" ${model_output} | cut -f 3- | perl -pe '{s/   / \# /g;}' > ${model_output}.hyp
+#grep "^P\-" ${model_output} | cut -f 2- > ${model_output}.scores
+grep "^T\-" ${model_output} | perl -pe '{s/   / \# /g;}' > ${model_output}.ref # "s/   / \# \g;" is to keep into account spaces
+grep "^H\-" ${model_output} | perl -pe '{s/   / \# /g;}' > ${model_output}.hyp
+grep "^P\-" ${model_output} > ${model_output}.scores
 
 # --clean-hyp removes blanks and duplicate tokens generated when training with CTC loss.
 # Remove this option if you trained the model with another loss (e.g. cross entropy)

@@ -79,6 +79,9 @@ class TarcMultiTaskCriterion(FairseqCriterion):
         if len(net_output[0]) > 1 and net_output[0][1] is not None:
             sample_ntokens = sample['ntokens'][1]
 
+        #print(' TarcMultiTaskCriterion, model forward passed, computing losses...')
+        #sys.stdout.flush() 
+
         o_idx = 0
         for o , attn, target in zip(net_output[0], net_output[1], mt_target):
 
@@ -94,8 +97,16 @@ class TarcMultiTaskCriterion(FairseqCriterion):
                 ignore_index = self.loss_function.padding_idx,
                 reduction = 'sum' if reduce else 'none'
             )
+
+            #print(' TarcMultiTaskCriterion, loss computed.')
+            #sys.stdout.flush()
+
             ch_loss = None
             if o[1] is not None:
+
+                #print(' ### computing char level loss')
+                #sys.stdout.flush()
+
                 ch_lprobs = model.get_normalized_probs( (o[1], attn), log_probs=True )
                 ch_lprobs = ch_lprobs.view(-1, ch_lprobs.size(-1))
                 char_tgt = char_mt_target[o_idx].view(-1)
@@ -129,12 +140,23 @@ class TarcMultiTaskCriterion(FairseqCriterion):
 
             t_idx += 1
 
+            '''print(' - CrossEntropy loss:')
+            print('   * lprobs min, max, mean: {}, {}, {}'.format(torch.min(lprobs), torch.max(lprobs), torch.mean(lprobs)))
+            print('   * loss value (reduce: {}): {}'.format(reduce, loss))
+            print(' ----------')
+            sys.stdout.flush()
+            sys.exit(0)'''
+
         logging_output = {
             'loss' : loss_data,
             'ntokens' : global_ntokens,
             'nsentences' : global_nsentences,
             'sample_size' : global_sample_size,
         }
+
+        '''print(' TarcMultiTaskCriterion, losses computed.')
+        print(' ********************************************************************************')
+        sys.stdout.flush()'''
 
         return global_loss, global_sample_size, logging_output
 

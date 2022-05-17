@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
-from fairseq import utils
+from fairseq import utils, init_functions
 from fairseq.tarc_utils import *
 from fairseq import checkpoint_utils, options, utils
 from fairseq.models import (
@@ -21,7 +21,7 @@ from fairseq.models import (
 )
 
 from fairseq.models.transformer import TransformerModel, TransformerEncoder, TransformerDecoder, base_architecture as trans_ba
-from fairseq.models.lstm import LSTMModel, AttentionLayer, LSTMEncoder, LSTMDecoder, base_architecture as lstm_ba
+from fairseq.models.lstm import LSTMModel, LSTMEncoder, LSTMDecoder, base_architecture as lstm_ba
 from fairseq.models.TarcLSTMModules import TarcLSTMEncoder, TarcLSTMDecoder
 from fairseq.models.TarcTransformerModules import TarcTransformerEncoder, TarcTransformerDecoder
 
@@ -37,6 +37,8 @@ from fairseq.modules import (
 )
 from torch import Tensor
 
+_DEBUG_ = False
+
 DEFAULT_MAX_SOURCE_POSITIONS=2048
 DEFAULT_MAX_TARGET_POSITIONS=2048
 
@@ -44,7 +46,7 @@ DEFAULT_MAX_TARGET_POSITIONS=2048
 class TarcMultiTaskEncoder(FairseqEncoder):
     
     def __init__(
-                 self, args, dictionary, encoders
+                 self, args, dictionary, encoders,
                  ):
         
         super().__init__(dictionary)
@@ -123,7 +125,9 @@ class TarcMultiTaskEncoder(FairseqEncoder):
             mt_x = []
             mt_final_hiddens = []
             mt_final_cells = []
-            encoder_padding_mask = outputs[0]['encoder_padding_mask'] 
+            encoder_padding_mask = outputs[0]['encoder_padding_mask']
+            sources = outputs[0]['sources'] if 'sources' in outputs[0] else None
+
 
             for o in outputs:
                 mt_x.append( o['encoder_out'][0] )
@@ -131,6 +135,7 @@ class TarcMultiTaskEncoder(FairseqEncoder):
                 mt_final_cells.append( o['encoder_out'][2] )
             return {
                 'encoder_out': (torch.cat(mt_x, -1), torch.cat(mt_final_hiddens, -1), torch.cat(mt_final_cells, -1)),
+                'sources': sources,
                 'encoder_padding_mask': encoder_padding_mask
             }
 
@@ -169,8 +174,11 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
         self.decoders = decoders
         self.first_decoder = 0
         self.last_decoder = len(decoders)
+        self.current_decoder = 0
         self.decoder_hidden_states = [[] for t_idx in range(len(decoders))]
+        self.working_decoder_hidden_states = [[] for t_idx in range(len(decoders))]
         self.granularity_merging_flags = ()
+        self.finalized_hypos = [[] for i in range(len(decoders))]
 
     def set_g_merging_flags_(self, g_flags: Tuple):
         assert len(g_flags) == len(self.decoders)
@@ -182,8 +190,18 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
         self.first_decoder = start
         self.last_decoder = end
 
+    def set_current_decoder(self, d_idx):
+        self.current_decoder = d_idx
+
+    def add_finalized_hypos(self, hypos, d_idx):
+        self.finalized_hypos[d_idx].append( hypos )
+
+    def reset_finalized_hypos(self):
+        self.finalized_hypos = [[] for i in range(len(self.decoders))]
+
     def reset_hidden_states(self):
         self.decoder_hidden_states = [[] for t_idx in range(len(self.decoders))]
+        self.working_decoder_hidden_states = [[] for t_idx in range(len(self.decoders))]
 
     def create_lstm_final_states_(self, hidden_state):
         if hidden_state is None:
@@ -213,29 +231,94 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
             toks_prev_output_tokens = [prev_output_tokens[0]]
             char_prev_output_tokens = [prev_output_tokens[1]]
 
+        if _DEBUG_:
+            print('[DEBUG] TarcMultiTaskDecoder, encoder_out type: {}'.format(type(encoder_out)))
+            if isinstance(encoder_out, list):
+                print('[DEBUG]    * TarcMultiTaskDecoder, detected list type:')
+                for le in encoder_out:
+                    print('[DEBUG]    * TarcMultiTaskDecoder: {}'.format(type(le)))
+            sys.stdout.flush()
+
         outputs = []
         decoder_input = [encoder_out]
+        B = toks_prev_output_tokens[0].size(0)
         if self.training:
             self.decoder_hidden_states = [[] for i in range(len(self.decoders))]
+            self.working_decoder_hidden_states = [[] for t_idx in range(len(self.decoders))]
         for i in range(self.first_decoder, self.last_decoder):
+
+            #print(' TarcMultiTaskDecoder, calling decoder {}'.format(i))
+            #sys.stdout.flush()
+
             incremental_state_i = utils.get_incremental_state(self, incremental_state, 'decoder-' + str(i+1))
             if not self.training and self.first_decoder > 0 and i == self.first_decoder:
                 assert len(decoder_input) == 1
-                for d_idx in range(0,i):
+                for d_idx in range(0,i): 
+                    hidden_state_i = self.working_decoder_hidden_states[d_idx]
+                    if isinstance(hidden_state_i, list) or hidden_state_i.size(1) != B:
+                        if _DEBUG_:
+                            print('[DEBUG] TarcMultiTaskDecoder, converting hidden state {} to tensor, length {}, shapes: {}'.format(d_idx, len(self.decoder_hidden_states[d_idx]), [t.size() for t in self.decoder_hidden_states[d_idx]]))
+                            print('[DEBUG] TArcMultiTaskDecoder, finalized hypos: {}'.format(self.finalized_hypos))
+                            sys.stdout.flush()
+
+                        L = len(self.decoder_hidden_states[d_idx]) 
+                        C = self.decoder_hidden_states[d_idx][0].size(-1)
+                        assert len(self.finalized_hypos[d_idx]) == L-1
+                        hidden_state_i = torch.zeros(L, B, C).to(self.decoder_hidden_states[d_idx][0])
+                        batch_mask = torch.LongTensor(B).fill_(1).to(self.decoder_hidden_states[d_idx][0].device)
+                        finalized = []
+                        for t_idx, t in enumerate(self.decoder_hidden_states[d_idx]): 
+                            if t_idx > 0 and t_idx-1 < len(self.finalized_hypos[d_idx]):
+                                #finalized.extend( self.finalized_hypos[d_idx][t_idx-1] )
+                                finalized = self.finalized_hypos[d_idx][t_idx-1]
+
+                            #batch_mask = cand_indices.new_ones(bsz[task_idx])   # NEW! before: bsz_val instead of bsz[task_idx]
+                            #batch_mask[cand_indices.new(finalized_sents)] = 0
+                            #batch_idxs = batch_mask.nonzero().squeeze(-1)
+                            #batch_mask = torch.LongTensor(B).fill_(1).to(self.decoder_hidden_states[d_idx][0].device)
+
+                            idxs = torch.LongTensor(finalized).to(batch_mask.device)
+                            batch_rel_idxs = batch_mask.nonzero().squeeze(-1)
+
+                            if _DEBUG_:
+                                print('[DEBUG] TarcMultiTaskDecoder, finalized: {}'.format(finalized))
+                                print('[DEBUG] TarcMultiTaskDecoder, idxs type: {}'.format(type(idxs)))
+                                print('[DEBUG] TarcMultiTaskDecoder, idxs: {}'.format(idxs))
+                                print('[DEBUG] TarcMultiTaskDecoder, batch_rel_idxs: {}'.format(batch_rel_idxs))
+                                print('[DEBUG] TarcMultiTaskDecoder, batch_mask: {}'.format(batch_mask))
+                                print('[DEBUG] TarcMultiTaskDecoder, -----')
+                                sys.stdout.flush()
+ 
+                            batch_mask[batch_rel_idxs[torch.LongTensor(finalized).to(batch_mask.device)]] = 0
+                            batch_idxs = batch_mask.nonzero().squeeze(-1)
+
+                            if _DEBUG_:
+                                print('[DEBUG] TarcMultiTaskDecoder, batch_mask: {}'.format(batch_mask)) 
+                                print('[DEBUG] TarcMultiTaskDecoder, batch_idxs: {}'.format(batch_idxs))
+                                print('[DEBUG] TarcMultiTaskDecoder, target vs. source sizes: {} vs. {}'.format(hidden_state_i[t_idx, batch_idxs, :].size(), self.decoder_hidden_states[d_idx][t_idx].size()))
+                                print('[DEBUG] TracMultiTaskDecoder, ************')
+                                sys.stdout.flush()
+
+                            hidden_state_i[t_idx, batch_idxs, :] = self.decoder_hidden_states[d_idx][t_idx]
+                        #hidden_state_i = torch.cat(self.decoder_hidden_states[d_idx], 0)
+                        self.working_decoder_hidden_states[d_idx] = hidden_state_i
                     if self.args.model_type == 'lstm':
                         new_decoder_input = {
-                            'encoder_out' : (torch.cat(self.decoder_hidden_states[d_idx], 0), None, None),
-                            'encoder_padding_mask' : None
+                            'encoder_out' : (hidden_state_i, None, None),
+                            'encoder_padding_mask' : toks_prev_output_tokens[d_idx].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[d_idx].eq(self.dictionary.pad())
                         }
                         decoder_input.append( new_decoder_input )
                     else:
                         new_decoder_input = EncoderOut(
-                            encoder_out=torch.cat(self.decoder_hidden_states[d_idx], 0),
-                            encoder_padding_mask=None,
+                                encoder_out=hidden_state_i, # NOTE: pay attention to this, Transformers may provide hidden states in one shot also at inference phase
+                            encoder_padding_mask=toks_prev_output_tokens[d_idx].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[d_idx].eq(self.dictionary.pad()),
                             encoder_embedding=None,
                             encoder_states=None
                         )
                         decoder_input.append( new_decoder_input )
+
+                        #print(' *** [DEBUG] Previous decoder {} hidden state shape: {}'.format(d_idx, new_decoder_input.encoder_out.size()))
+                        #sys.stdout.flush()
 
             feats_only = False
             prev_output_tokens_i = [toks_prev_output_tokens[i], char_prev_output_tokens[i]]
@@ -256,21 +339,28 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
             if not self.training:
                 self.decoder_hidden_states[i].append( hidden_state ) 
 
+            #print(' [DEBUG] TarcMultiTaskDecoder, decoder {} passed'.format(i))
+            #print(' [DEBUG]  * hidden state shape: {}'.format(hidden_state.size()))
+            #sys.stdout.flush() 
+
             if self.args.model_type == 'transformer': 
                 new_decoder_input = EncoderOut(
                     encoder_out = hidden_state, 
-                    encoder_padding_mask = None,
+                    encoder_padding_mask = toks_prev_output_tokens[i].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[i].eq(self.dictionary.pad()),
                     encoder_embedding = None,
                     encoder_states = None,
                 )
                 decoder_input.append( new_decoder_input )
-            else: 
+            else:
                 new_decoder_input = {
                     'encoder_out' : (hidden_state, None, None),
-                    'encoder_padding_mask' : None
+                    'encoder_padding_mask' : toks_prev_output_tokens[i].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[i].eq(self.dictionary.pad())
                 }
                 decoder_input.append( new_decoder_input ) 
- 
+
+            #print(' [DEBUG] --------------------------------------------------')
+            #sys.stdout.flush()
+
         if not self.training and len(outputs) != len(self.decoders):
             assert len(outputs) == self.last_decoder - self.first_decoder
             output_clone = outputs[-1]
@@ -281,14 +371,38 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
         attn_scores = []
         for o in outputs:
             x.append( o[0] )
-            attn_scores.append( o[1] ) 
+            attn_scores.append( o[1] )
 
-        return x, attn_scores
+        #print(' TarcMultiTaskDecoder, forward passed.')
+        #sys.stdout.flush() 
+
+        return x, attn_scores 
 
     def reorder_incremental_state(self, incremental_state, new_order):
 
-        for i in range( len( self.decoders) ):
-            self.decoders[i].reorder_incremental_state(utils.get_incremental_state(self, incremental_state, 'decoder-' + str(i+1)), new_order)
+        for i in range( len( self.working_decoder_hidden_states ) ):
+            if _DEBUG_:
+                print('[DEBUG] TarcMultiTaskDecoder, reordering incremental state @{}:...'.format(i))
+            if not isinstance(self.working_decoder_hidden_states[i], list):
+
+                if _DEBUG_:
+                    print('[DEBUG] TarcMultiTaskDecoder   * {}'.format(self.working_decoder_hidden_states[i].size()))
+                    sys.stdout.flush()
+
+                self.working_decoder_hidden_states[i] = self.working_decoder_hidden_states[i].index_select(1, new_order)
+
+                if _DEBUG_:
+                    print('[DEBUG] TarcMultiTaskDecoder,   * -> {}'.format(self.working_decoder_hidden_states[i].size()))
+                    sys.stdout.flush()
+            if _DEBUG_:
+                sys.stdout.flush()
+
+        #for i in range( len( self.decoders) ):
+        if _DEBUG_:
+            print('[DEBUG] TarcMultiTaskDecoder, reordering decoder {} incremental state'.format(self.current_decoder))
+            sys.stdout.flush()
+
+        self.decoders[self.current_decoder].reorder_incremental_state(utils.get_incremental_state(self, incremental_state, 'decoder-' + str(self.current_decoder+1)), new_order)
 
     def max_positions(self):
         """Maximum output length supported by the decoder."""
@@ -355,6 +469,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             )
         elif args.model_type == 'lstm':
             return TarcLSTMEncoder(
+                                args=args,
                                dictionary=src_dict,
                                embed_dim=args.encoder_embed_dim,
                                hidden_size=args.encoder_hidden_dim,
@@ -371,7 +486,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             raise NotImplementedError
 
     @classmethod
-    def build_decoder(cls, args, tgt_dict, embed_tokens, idx, token2components_map):
+    def build_decoder(cls, args, tgt_dict, embed_tokens, idx, token2components_map, dicts):
         if args.model_type == 'transformer':
             return TarcTransformerDecoder(
                                       args,
@@ -379,6 +494,10 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
                                       tgt_dict,
                                       embed_tokens,
                                       no_encoder_attn=getattr(args, "no_cross_attention", False),
+                                      token_map=token2components_map,
+                                      granularity_flags=(args.token_sequences, args.char_sequences),
+                                      double_learning=args.double_learning,
+                                      input_dict=dicts
             )
         elif args.model_type == 'lstm':
             encoder_output_units = args.num_of_inputs * args.encoder_hidden_dim * 2
@@ -386,6 +505,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             out_embed_dim = args.decoder_out_embed_dim
 
             return TarcLSTMDecoder(
+                    args=args,
                 dictionary=tgt_dict,
                 embed_dim=args.decoder_embed_dim,
                 hidden_size=hid_size,
@@ -404,7 +524,8 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
                 max_target_positions=args.max_target_positions,
                 token_map=token2components_map,
                 granularity_flags=(args.token_sequences, args.char_sequences),
-                double_learning=args.double_learning
+                double_learning=args.double_learning,
+                input_dict=dicts
             )
         else:
             raise NotImplementedError
@@ -430,12 +551,15 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             args.max_target_positions = DEFAULT_MAX_TARGET_POSITIONS
 
         args.num_of_inputs = task.num_of_inputs 
-        src_dict, tgt_dict = task.source_dictionary, task.target_dictionary 
+        src_dict, tgt_dict = task.source_dictionary, task.target_dictionary
         
-        def build_embedding(dictionary, embed_dim, path=None):
+        def build_embedding(args, dictionary, embed_dim, path=None):
             num_embeddings = len(dictionary)
             padding_idx = dictionary.pad()
-            emb = nn.Embedding(num_embeddings, embed_dim, padding_idx)
+            if args.model_type == 'lstm':
+                emb = init_functions.LSTMEmbedding(num_embeddings, embed_dim, padding_idx)
+            else:
+                emb = init_functions.TransformerEmbedding(num_embeddings, embed_dim, padding_idx)
             # if provided, load from preloaded dictionaries
             if path:
                 embed_dict = utils.parse_embedding(path)
@@ -460,17 +584,17 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             sys.stdout.flush()
  
             encoder_embed_tokens = build_embedding(
-                src_dict, args.encoder_embed_dim, args.encoder_embed_path
+                args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
             ) 
 
             decoder_embed_tokens = encoder_embed_tokens
             args.share_decoder_input_output_embed = True
         else:
             encoder_embed_tokens = build_embedding(
-                src_dict, args.encoder_embed_dim, args.encoder_embed_path
+                args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
             )
             decoder_embed_tokens = build_embedding(
-                tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
+                args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
             )
  
         if args.sub_task == 'tarc-full' and args.load_madar_data != 'None' and args.load_madar_model != 'None':
@@ -515,7 +639,12 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
 
         for i in range( min(num_encoders, num_decoders) ):
             encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens, task.token2components_tsr[enc_count])
-            decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens, dec_count, task.token2components_tsr[num_encoders+dec_count])
+            input_dict = task.input_dict if i == num_decoders-1 else None
+            output_dict = task.output_dict if i == num_decoders-1 else None
+            punct_dict = task.punct_dict if i == num_decoders-1 else None
+            inv_input_dict = task.inverse_input_dict if i == num_decoders-1 else None
+            inv_output_dict = task.inverse_output_dict if i == num_decoders-1 else None
+            decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens, dec_count, task.token2components_tsr[num_encoders+dec_count], [input_dict, output_dict, punct_dict, inv_input_dict, inv_output_dict])
             encoders.append( encoder )
             decoders.append( decoder )
             enc_count += 1
@@ -525,7 +654,12 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             encoders.append( encoder )
             enc_count += 1
         while dec_count < num_decoders:
-            decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens, dec_count, task.token2components_tsr[num_encoders+dec_count])
+            input_dict = task.input_dict if dec_count == num_decoders-1 else None
+            output_dict = task.output_dict if dec_count == num_decoders-1 else None
+            punct_dict = task.punct_dict if dec_count == num_decoders-1 else None
+            inv_input_dict = task.inverse_input_dict if dec_count == num_decoders-1 else None
+            inv_output_dict = task.inverse_output_dict if dec_count == num_decoders-1 else None
+            decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens, dec_count, task.token2components_tsr[num_encoders+dec_count], [input_dict, output_dict, punct_dict, inv_input_dict, inv_output_dict])
             decoders.append( decoder )
             dec_count += 1
  
@@ -565,9 +699,9 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
         encoder.set_g_merging_flags_( task.get_granularity_merging_flags()[:len(encoders)] )
         decoder.set_g_merging_flags_( task.get_granularity_merging_flags()[len(encoders):] )
 
-        return cls(args, encoder, decoder, tgt_dict)
+        return cls(args, encoder, decoder, tgt_dict, task.input_dict)
 
-    def __init__(self, args, encoder, decoder, tgt_dict):
+    def __init__(self, args, encoder, decoder, tgt_dict, input_dict=None):
         super().__init__(encoder, decoder)
 
         self.args = args
@@ -593,6 +727,9 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
 
         return None, None
 
+    def add_finalized_hypos(self, hypos, d_idx):
+        self.decoder.add_finalized_hypos(hypos, d_idx)
+
     # We could override the ``forward()`` if we wanted more control over how
     # the encoder and decoder interact, but it's not necessary for this
     # tutorial since we can inherit the default implementation provided by
@@ -606,6 +743,10 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
         """
 
         encoder_out = self.encoder(src_tokens, src_lengths, src_tok_bounds=src_tok_bounds, sort_order=sort_order, **kwargs)
+
+        #print(' *** TarcMultiTaskModel, encoder forward passed...')
+        #sys.stdout.flush()
+
         decoder_out = self.decoder(
             prev_output_tokens,
             shapes=shapes,
@@ -618,6 +759,10 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             incremental_state=incremental_state,
             **kwargs
         )
+
+        #print('[DEBUG] TarcMultiTaskModel forward passed.')
+        #sys.stdout.flush()
+        #sys.exit(0)
 
         return decoder_out
 

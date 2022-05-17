@@ -125,14 +125,14 @@ class SLUBaseCTCCriterion(FairseqCriterion):
         """
         net_output = model(**sample["net_input"])
         sem_output = None
-        if isinstance(net_output[1], dict) and 'c_outs' in net_output[1]:
-            sem_output = net_output[1]['c_outs'] 
+        #if isinstance(net_output[1], dict) and 'c_outs' in net_output[1]:
+        #    sem_output = net_output[1]['c_outs'] 
         bound_lprobs = model.get_normalized_probs(net_output, log_probs=log_probs) 
 
         # NOTE: I modified this since the original code was for training from the Encoder output, while I'm training with the Decoder output.
         #       Decoder output is (always ?) batch-first.
 
-        batch_first = True
+        #batch_first = True
         (N, T, C) = bound_lprobs.size()  
         bound_input_lengths = torch.full(size=(N,), fill_value=T, dtype=torch.long).to(bound_lprobs.device)
         #input_lengths = encoder_padding_mask_to_lengths(
@@ -141,9 +141,9 @@ class SLUBaseCTCCriterion(FairseqCriterion):
         bound_target_lengths = sample["target_lengths"]
         bound_targets = sample["target"]    # B x T 
 
-        if batch_first:
-            # N T D -> T N D (F.ctc_loss expects this) 
-            bound_lprobs = bound_lprobs.transpose(0, 1)
+        #if batch_first:
+        # N T D -> T N D (F.ctc_loss expects this) 
+        bound_lprobs = bound_lprobs.transpose(0, 1)
 
         pad_mask = sample["target"] != self.pad_idx
         bound_targets_flat = bound_targets.masked_select(pad_mask)
@@ -158,13 +158,29 @@ class SLUBaseCTCCriterion(FairseqCriterion):
             bound_target_lengths,
         )
 
+        if isinstance(net_output[1], dict) and 'draft_out' in net_output[1]:
+            draft_out = net_output[1]['draft_out']
+            draft_probs = model.get_normalized_probs(draft_out, log_probs=log_probs)
+            (dN, dT, dC) = draft_probs.size()
+            draft_input_lengths = torch.full(size=(dN,), fill_value=dT, dtype=torch.long).to(draft_probs.device)
+            draft_probs = draft_probs.transpose(0,1)
+
+            draft_loss = self.loss_function(
+                draft_probs,
+                bound_targets,
+                draft_input_lengths,
+                bound_target_lengths,
+            )
+
+            loss = loss + draft_loss 
+
         '''print(' *** CTC Loss, predicted and expected output shape:')
         print('   * Predicted: {}'.format(bound_lprobs.size()))
         print('   * Expected: {}'.format(bound_targets.size()))
         print(' *** CTC Loss.')
         sys.stdout.flush()'''
 
-        if self.aux_loss is not None and sem_output is not None:
+        if False: #self.aux_loss is not None and sem_output is not None:
             #print(' *** Computing auxiliary loss...')
             #sys.stdout.flush()
 
@@ -230,7 +246,7 @@ class SLUBaseCTCCriterion(FairseqCriterion):
             "nframes": torch.sum(sample["net_input"]["src_lengths"]).item(),
         }
 
-        #print(' - SLUCTCCriterion, loss computed, lprobs shape: {}'.format(lprobs.size()))
+        #print(' - SLUCTCCriterion, loss computed, lprobs shape: {}'.format(bound_lprobs.size()))
         #sys.stdout.flush() 
 
         return loss, sample_size, logging_output

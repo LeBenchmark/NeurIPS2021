@@ -292,13 +292,13 @@ class AttentionLayer(nn.Module):
 
     def forward(self, input, source_hids, encoder_padding_mask):
         # input: bsz x input_embed_dim
-        # source_hids: srclen x bsz x source_embed_dim 
+        # source_hids: srclen x bsz x source_embed_dim
 
         # x: bsz x source_embed_dim
-        x = self.input_proj(input) 
+        x = self.input_proj(input)
 
         # compute attention
-        attn_scores = (source_hids * x.unsqueeze(0)).sum(dim=2) # srclen x bsz 
+        attn_scores = (source_hids * x.unsqueeze(0)).sum(dim=2) # srclen x bsz  
 
         # don't attend over padding
         if encoder_padding_mask is not None:
@@ -314,6 +314,7 @@ class AttentionLayer(nn.Module):
         # sum weighted sources
         x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=0) # bsz x source_embed_dim
         x = torch.tanh(self.output_proj(torch.cat((x, input), dim=1)))  # bsz x output_embed_dim 
+
         return x, attn_scores
 
 

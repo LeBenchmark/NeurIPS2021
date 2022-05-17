@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import sys
 from collections import Counter
 from multiprocessing import Pool
 
@@ -98,6 +99,9 @@ class Dictionary(object):
             self.count[idx] = self.count[idx] + n
             return idx
         else:
+            #print(' * Dictionary, adding word {}'.format(word))
+            #sys.stdout.flush()
+
             idx = len(self.symbols)
             self.indices[word] = idx
             self.symbols.append(word)

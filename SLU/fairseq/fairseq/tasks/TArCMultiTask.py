@@ -11,23 +11,28 @@ from fairseq.tarc_utils import *
 from fairseq.data import Dictionary, TarcMultiTaskDataset
 from fairseq.tasks import FairseqTask, register_task
 
+from nltk.tree import Tree
 from typing import Dict, List
 
 LOSS_INIT_VALUE=999999.9
 ER_INIT_VALUE=LOSS_INIT_VALUE
+
+punct = [',', '.', ':', '\'\'', '$', '``', '-LRB-', '-RRB-']
 
 CLS_COL_IDX=1
 POS_COL_IDX=4
 def set_pos_col_idx(args):
     if args.sub_task == 'tarc-ext':
         return 3
-    elif args.sub_task == 'tarc-full':
+    elif args.sub_task in ['tarc-ext-npos', 'tarc-full', 'tarc-lemma']:
         return 4
     elif args.sub_task == 'madar-trs-ex':
         return 2
-    elif args.sub_task == 'madar-trs-full':
+    elif args.sub_task in ['madar-trs-full']:
         return 3
-    elif args.sub_task == 'tarc-full-npos':
+    elif args.sub_task == 'madar-trs-full-ex':
+        return 4
+    elif args.sub_task in ['tarc-full-npos', 'tarc-lemma-full']:
         return 5
     else:
         return 9999999
@@ -169,11 +174,11 @@ def process_pos_tag(tag, args, pad_flag=True, rep_flag=False):
         return res_tags
 
 def create_character_list(token, args, pad_flag=True, rep_flag=False):
-    if (not (token in fillers + latin_fillers)) and rep_flag and args.sub_task in ['tarc-ext', 'tarc-full', 'tarc-full-npos']:
+    if (not (token in fillers + latin_fillers)) and rep_flag and ((hasattr(args, 'apply_filling') and args.apply_filling) or args.sub_task in ['tarc-ext', 'tarc-ext-npos', 'tarc-full', 'tarc-full-npos', 'tarc-lemma', 'tarc-lemma-full']):
         token = replace_all_num(token)
         token = replace_all_pun(token)
         token = replace_all_sym(token)
-    elif (not (token in fillers + latin_fillers)) and args.sub_task in ['tarc-ext', 'tarc-full', 'tarc-full-npos']:
+    elif (not (token in fillers + latin_fillers)) and ((hasattr(args, 'apply_filling') and args.apply_filling) or args.sub_task in ['tarc-ext', 'tarc-ext-npos', 'tarc-full', 'tarc-full-npos', 'tarc-lemma', 'tarc-lemma-full']):
         token = replace_all_Lpun(token)
         token = replace_all_Lsym(token)
 
@@ -186,7 +191,7 @@ def create_character_list(token, args, pad_flag=True, rep_flag=False):
             tok_lst.append( c )
         tok_idx += 1
 
-    if args.sub_task in ['tarc-ext', 'tarc-full', 'tarc-full-npos']:
+    if (hasattr(args, 'apply_filling') and args.apply_filling) or args.sub_task in ['tarc-ext', 'tarc-ext-npos', 'tarc-full', 'tarc-full-npos', 'tarc-lemma', 'tarc-lemma-full']:
         seq_fillers = detect_fillers(tok_lst, fillers + latin_fillers)
         if len(seq_fillers) > 0:
             new_lst = []
@@ -243,19 +248,30 @@ def tiger_label_processing(label, args, pad_flag=True, rep_flag=False):
 def no_processing(token, args, pad_flag=True, rep_flag=False):
     return [token]
 
+opmap = {}
+opmap['nop'] = no_processing
+opmap['char'] = create_character_list
+opmap['tok'] = process_tokenization
+opmap['pos'] = process_pos_tag
+opmap['Tpos'] = tiger_label_processing
 madar_translation = (create_character_list, no_processing, create_character_list)
 madar_ex_translation = (create_character_list, no_processing, process_pos_tag, create_character_list)
-madar_full_translation = (create_character_list, no_processing, create_character_list, process_pos_tag, create_character_list)
+madar_full_translation = (create_character_list, no_processing, process_tokenization, process_pos_tag, create_character_list)
+madar_fullex_translation = (create_character_list, no_processing, create_character_list, process_tokenization, process_pos_tag)
 tarc_processing_base = (create_character_list, process_tokenization, process_pos_tag)   # Processing functions for raw tunisian, tokenized tunisian and POS
 tarc_processing_ext = (create_character_list, no_processing, process_tokenization, process_pos_tag)    # Processing functions for arabish, tunisian, tokenized tunisian and POS
+tarc_processing_ext_npos = ('char', 'nop', 'tok', 'nop', 'pos')
 tarc_processing_full = (create_character_list, no_processing, create_character_list, process_tokenization, process_pos_tag)
 tarc_processing_full_npos = (create_character_list, no_processing, no_processing, create_character_list, process_tokenization, process_pos_tag)
+tarc_lemmatization = ('char', 'nop', 'char', 'tok', 'pos', 'char')
+tarc_lemmatization_full = ('char', 'nop', 'char', 'char', 'tok', 'pos')
 tarc_substep_1 = (create_character_list, no_processing, create_character_list)
 tarc_substep_2 = (create_character_list, process_tokenization)
 tarc_substep_3 = (process_tokenization, process_pos_tag)
 tiger_mt_processing = (create_character_list, no_processing, no_processing)
 tiger_mtext_processing = (create_character_list, no_processing, tiger_label_processing)
 tiger4_mt_processing = (create_character_list, no_processing, no_processing, no_processing)
+wsj_processing = ('char', 'nop', 'nop')
 
 # NOTE: used to decide if tokens and chars representations must be computed and merged when their usage is specified from command line
 granularity_merging_flags = {}
@@ -265,6 +281,7 @@ granularity_merging_flags['tiger4-mt'] = (True, False, False, False)
 granularity_merging_flags['madar-trs'] = (True, False, True)
 granularity_merging_flags['madar-trs-ex'] = (True, False, True, True)
 granularity_merging_flags['madar-trs-full'] = (True, False, True, True, True)
+granularity_merging_flags['madar-trs-full-ex'] = (True, False, True, True, True)
 granularity_merging_flags['tarc-base'] = (True, False, True)
 granularity_merging_flags['tarc-ext'] = (True, False, True, True)
 granularity_merging_flags['tarc-full'] = (True, False, True, True, True)
@@ -274,9 +291,27 @@ granularity_merging_flags['tarc-substep2'] = (True, True)
 granularity_merging_flags['tarc-substep3'] = (True, True)
 
 def choose_column_processing(num_columns, args):
-    
+
+    gflags = None
     column_processing = None
-    if args.sub_task == 'tiger-mt':
+    if args.sub_task == 'base':
+        print(' - TArCMultiTask, processing mode set to base')
+        sys.stdout.flush()
+
+        gflags = {}
+        column_processing = []
+        gflags[args.sub_task] = []
+        for ti in range(num_columns):
+            if ti == 0 and (args.token_sequences and args.char_sequences):
+                column_processing.append( opmap['char'] )
+                gflags[args.sub_task].append(True)
+            elif args.char_sequences and not args.token_sequences:
+                column_processing.append( opmap['char'] )
+                gflags[args.sub_task].append(False)
+            else:
+                column_processing.append( opmap['nop'] )
+                gflags[args.sub_task].append(False)
+    elif args.sub_task == 'tiger-mt':
         print(' - TArCMultiTask, processing mode set to tiger-mt')
         sys.stdout.flush()
         column_processing = tiger_mt_processing
@@ -300,6 +335,10 @@ def choose_column_processing(num_columns, args):
         print(' - TArCMultiTask, processing mode set to madar-trs-full')
         sys.stdout.flush()
         column_processing = madar_full_translation
+    elif args.sub_task == 'madar-trs-full-ex':
+        print(' - TArCMultiTask, processing mode set to madar-trs-full-ex')
+        sys.stdout.flush()
+        column_processing = madar_fullex_translation
     elif args.sub_task == 'tarc-base':
         print(' - TArCMultiTask, processing mode set to tarc-base')
         sys.stdout.flush()
@@ -308,6 +347,55 @@ def choose_column_processing(num_columns, args):
         print(' - TArCMultiTask, processing mode set to tarc-ext')
         sys.stdout.flush()
         column_processing = tarc_processing_ext
+    elif args.sub_task == 'tarc-ext-npos':
+        print(' - TArCMultiTask, processing mode set to tarc-ext-npos')
+        sys.stdout.flush()
+        gflags = {}
+        column_processing = []
+        gflags[args.sub_task] = []
+        for s in tarc_processing_ext_npos:
+            column_processing.append( opmap[s] )
+            if s == 'nop':
+                gflags[args.sub_task].append( False )
+            else:
+                gflags[args.sub_task].append( True )
+    elif args.sub_task == 'tarc-lemma':
+        print(' - TArCMultiTask, processing mode set to tarc-lemma')
+        sys.stdout.flush()
+        gflags = {}
+        column_processing = []
+        gflags[args.sub_task] = []
+        for s in tarc_lemmatization:
+            column_processing.append( opmap[s] )
+            if s == 'nop':
+                gflags[args.sub_task].append( False )
+            else:
+                gflags[args.sub_task].append( True )
+    elif args.sub_task == 'tarc-lemma-full':
+        print(' - TArCMultiTask, processing mode set to tarc-lemma-full')
+        sys.stdout.flush()
+        gflags = {}
+        column_processing = []
+        gflags[args.sub_task] = []
+        for s in tarc_lemmatization_full:
+            column_processing.append( opmap[s] )
+            if s == 'nop':
+                gflags[args.sub_task].append( False )
+            else:
+                gflags[args.sub_task].append( True )
+    elif args.sub_task == 'wsj':
+        print(' - TArCMultiTask, processing mode set to wsj')
+        sys.stdout.flush()
+
+        gflags = {}
+        column_processing = []
+        gflags[args.sub_task] = []
+        for s in wsj_processing:
+            column_processing.append( opmap[s] )
+            if s == 'nop':
+                gflags[args.sub_task].append(False)
+            else:
+                gflags[args.sub_task].append(True) 
     elif args.sub_task == 'tarc-full':
         print(' - TArCMultiTask, processing mode set to tarc-full')
         sys.stdout.flush()
@@ -336,38 +424,44 @@ def choose_column_processing(num_columns, args):
         sys.stdout.flush()
         column_processing = [no_processing for i in range(num_columns)] 
 
-    return column_processing
+    return column_processing, gflags
 
 def check_column_processing(num_columns, args):
     
-    if num_columns == 3 and not args.sub_task in ['tiger-mt', 'tiger-mt-ext', 'tarc-base', 'base', 'madar-trs', 'tarc-substep1']:
+    if num_columns == 3 and not args.sub_task in ['wsj', 'tiger-mt', 'tiger-mt-ext', 'tarc-base', 'base', 'madar-trs', 'tarc-substep1']:
         raise ValueError(' wrong num. of columns in input data for processing mode {}'.format(args.sub_task))
     elif num_columns == 2 and not args.sub_task in ['tarc-substep2', 'tarc-substep3', 'base']:
         raise ValueError(' 2 columns are expected with sub-task tarc-substep2|3')
     elif num_columns == 4 and not args.sub_task in ['tiger4-mt', 'tarc-ext', 'base','madar-trs-ex']:
         raise ValueError(' wrong num. of columns in input data for processing mode {}'.format(args.sub_task))
-    elif num_columns == 5 and not args.sub_task in ['tarc-full','madar-trs-full', 'base']:
+    elif num_columns == 5 and not args.sub_task in ['tarc-full', 'tarc-ext-npos', 'madar-trs-full', 'madar-trs-full-ex', 'base']:
         raise ValueError(' wrong num. of columns in input data for processing mode {}'.format(args.sub_task))
-    elif num_columns == 6 and not args.sub_task in ['tarc-full-npos', 'base']:
+    elif num_columns == 6 and not args.sub_task in ['tarc-full-npos', 'base', 'tarc-lemma', 'tarc-lemma-full']:
         raise ValueError(' wrong num. of columns in input data for processing mode {}'.format(args.sub_task))
     elif (not num_columns in [2, 3, 4, 5, 6]) and (not args.sub_task in ['base']):
         raise ValueError(' Unexpected number of columns in input file, possible values: 2, 3, 4, 5 unless base is specified. Got {}'.format(num_columns))
 
 def apply_global_filling(args, curr_seq, cls_seq, Afillers, Lfillers, OFFcols, idx):
+    '''
+        Put fillers in place of tokens for columns corresponding to a class 'foreign' and 'emotag', except for the POS column.
+        For Arabizi a filler in latin character is used (Lfiller(FOR|EMO))
+    '''
 
     (fillerFOR, fillerEMO) = Afillers
     (LfillerFOR, LfillerEMO) = Lfillers
     (CLS_COL_IDX, POS_COL_IDX) = OFFcols
 
-    if args.sub_task in ['tarc-ext', 'tarc-full', 'madar-trs', 'madar-trs-ex', 'madar-trs-full', 'tarc-full-npos'] and idx != CLS_COL_IDX and idx != POS_COL_IDX:
+    if ((hasattr(args, 'apply_filling') and args.apply_filling) or args.sub_task in ['tarc-ext', 'tarc-ext-npos', 'tarc-full', 'madar-trs', 'madar-trs-ex', 'madar-trs-full', 'madar-trs-full-ex', 'tarc-full-npos', 'tarc-lemma', 'tarc-lemma-full']) and idx != CLS_COL_IDX and idx != POS_COL_IDX:
         for s_idx in range(len(curr_seq)):
-            if cls_seq[s_idx] == 'foreign':
-                if (args.sub_task == 'tarc-full' and idx == 0) or (args.sub_task == 'tarc-full-npos' and idx == 0) or (args.sub_task == 'madar-trs' and idx == 2) or (args.sub_task == 'madar-trs-ex' and idx == 3) or (args.sub_task == 'madar-trs-full' and idx == 4):
+            if cls_seq[s_idx] == 'foreign' and (not curr_seq[s_idx] in [bos_token, pad_token, eos_token, unk_token, start_token, end_token, space_token, separator_]):
+                # NOTE: (hasattr(args, 'apply_filling') and args.apply_filling works if input sequences are in Arabizi. TODO: modify to be generic
+                if (hasattr(args, 'apply_filling') and args.apply_filling) or (args.sub_task == 'tarc-full' and idx == 0) or (args.sub_task == 'tarc-full-npos' and idx == 0) or (args.sub_task == 'madar-trs' and idx == 2) or (args.sub_task == 'madar-trs-ex' and idx == 3) or (args.sub_task == 'madar-trs-full' and idx == 4) or (args.sub_task == 'madar-trs-full-ex' and idx == 2) or (args.sub_task in ['tarc-lemma', 'tarc-lemma-full'] and idx == 0):
                     curr_seq[s_idx] = LfillerFOR
                 else:
                     curr_seq[s_idx] = fillerFOR
-            elif cls_seq[s_idx] == 'emotag':
-                if (args.sub_task == 'tarc-full' and idx == 0) or (args.sub_task == 'tarc-full-npos' and idx == 0) or (args.sub_task == 'madar-trs' and idx == 2) or (args.sub_task == 'madar-trs-ex' and idx == 3) or (args.sub_task == 'madar-trs-full' and idx == 4):
+            elif cls_seq[s_idx] == 'emotag' and (not curr_seq[s_idx] in [bos_token, pad_token, eos_token, unk_token, start_token, end_token, space_token, separator_]):
+                # NOTE: same as above
+                if (hasattr(args, 'apply_filling') and args.apply_filling) or (args.sub_task == 'tarc-full' and idx == 0) or (args.sub_task == 'tarc-full-npos' and idx == 0) or (args.sub_task == 'madar-trs' and idx == 2) or (args.sub_task == 'madar-trs-ex' and idx == 3) or (args.sub_task == 'madar-trs-full' and idx == 4) or (args.sub_task == 'madar-trs-full-ex' and idx == 2) or (args.sub_task in ['tarc-lemma', 'tarc-lemma-full'] and idx == 0):
                     curr_seq[s_idx] = LfillerEMO
                 else:
                     curr_seq[s_idx] = fillerEMO
@@ -393,6 +487,63 @@ def _add_t2c_entry_safe(D: Dict[str, List[str]], key: str, val: List[str]) -> Di
                 sys.stdout.flush()
 
     return D
+
+def add_indices_to_dict(dd, tensors):
+    for t in tensors:
+        for el in list(t):
+            if el.item() not in dd:
+                dd[el.item()] = 1
+
+def add_entries_to_inverse_dict(inverse_dict, global_dict, tensors):
+
+    for t in tensors:
+        tmp_str = global_dict.string(t)
+        for tk in tmp_str.split():
+            if global_dict.index(tk) not in inverse_dict:
+                inverse_dict[global_dict.index(tk)] = tk
+
+def add_entries_to_inverse_dict_from_trees(inverse_dict, global_dict, tree_format, tensors):
+
+    if tree_format == 'wsj':
+        raise NotImplementedError
+    else:
+        for t in tensors:
+            tmp_str = global_dict.string(t)
+            for tk in tmp_str.split():
+                if '(' in tk or ')' in tk:
+                    if global_dict.index(tk) not in inverse_dict:
+                        inverse_dict[global_dict.index(tk)] = tk
+
+def add_tree_tokens_to_dict_no_leaves(output_dict, tree_token_mapping, tt):
+
+    if isinstance(tt, Tree):
+        t_idx = tree_token_mapping.index(tt.label())
+        if t_idx not in output_dict:
+            #print(' *** Adding {} to output dictionary (index {})'.format(tt.label(), t_idx))
+            #sys.stdout.flush()
+            output_dict[t_idx] = 1
+        for child in tt:
+            add_tree_tokens_to_dict_no_leaves(output_dict, tree_token_mapping, child)
+
+def create_output_dict_from_trees(output_dict, tree_token_mapping, tree_format, tree_tensors):
+
+    for t in tree_tensors:
+        tree_str = tree_token_mapping.string(t)
+        if tree_format == 'wsj':
+            ttree = Tree.fromstring(tree_str)
+            add_tree_tokens_to_dict_no_leaves(output_dict, tree_token_mapping, ttree)
+        elif tree_format == 'GAFL':
+            tokens = tree_str.split()
+            for t in tokens:
+                if '(' in t or ')' in t:
+                    t_idx = tree_token_mapping.index(t)
+                    if t_idx not in output_dict:
+                        #print(' * Adding {} to the output dict'.format(t))
+                        #sys.stdout.flush()
+
+                        output_dict[t_idx] = 1
+        else:
+            raise NotImplementedError(' tree format {} undefined ')
 
 def read_tarc_tabular_data(filename, args): 
 
@@ -440,6 +591,7 @@ def read_tarc_tabular_data(filename, args):
             for i in range(num_columns):
                 curr_seq = apply_global_filling(args, curr_sequences[i], curr_sequences[CLS_COL_IDX], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], i) 
                 all_sequences[i].append( curr_seq )
+                #all_sequences[i].append( curr_sequences[i] )
 
             curr_sequences = [[] for i in range(num_columns)] 
 
@@ -447,7 +599,9 @@ def read_tarc_tabular_data(filename, args):
     print(' *** TarcMultiTask, detected {} tasks in data'.format(num_columns-1))
     sys.stdout.flush()
 
-    column_processing = choose_column_processing( num_columns, args )
+    column_processing, gflags = choose_column_processing( num_columns, args )
+    if gflags is not None:
+        granularity_merging_flags[args.sub_task] = gflags[args.sub_task]
     check_column_processing( num_columns, args )
 
     total_tokens = 0
@@ -455,7 +609,7 @@ def read_tarc_tabular_data(filename, args):
     num_sequences = len(all_sequences[0])
     for i in range(num_columns):
         assert len(all_sequences[i]) == num_sequences
-    if args.sub_task in ['tarc-ext', 'tarc-full', 'tarc-full-npos']:
+    if args.sub_task in ['tarc-ext', 'tarc-ext-npos', 'tarc-full', 'tarc-full-npos']:
         for i in range(num_sequences):
             seq_len = len(all_sequences[0][i])
             for j in range(num_columns):
@@ -492,11 +646,12 @@ def read_tarc_tabular_data(filename, args):
             if len(tok_seqs) == 0:
                 tok_seqs = init_llist( num_columns )
             for idx in range(num_columns):
-                if idx > 0 and args.ignore_test_output and test_flag:
+                if (idx > 0 and args.ignore_test_output and test_flag) or tokens[idx] in [bos_token, pad_token, eos_token, unk_token, start_token, end_token, space_token, separator_]:
                     process_res = no_processing(tokens[idx], args)
                 else:
                     rep_flag = True
-                    if (idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos')) or (idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and idx == 3) or (args.sub_task == 'madar-trs-full' and idx == 4):
+                    # NOTE: see note above concerning apply_filling flag
+                    if (hasattr(args, 'apply_filling') and args.apply_filling) or (idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos' or args.sub_task == 'tarc-lemma' or args.sub_task == 'tarc-lemma-full')) or (idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and idx == 3) or (args.sub_task == 'madar-trs-full' and idx == 4) or (args.sub_task == 'madar-trs-full-ex' and idx == 2):
                         rep_flag = False
                     process_res = column_processing[idx]( tokens[idx], args, rep_flag=rep_flag )
 
@@ -538,6 +693,7 @@ def read_tarc_parallel_data( file_prefix, args ):
     if file_prefix[-4:] == 'test':
         test_flag = True
 
+    # 1. Read input sequences
     input_data = []
     f = open(input_file, encoding='utf-8')
     data = f.readlines()
@@ -550,6 +706,7 @@ def read_tarc_parallel_data( file_prefix, args ):
     print(' - TArCMultiTask, read {} sequences, {} tokens from input data'.format(len(input_data), total_tokens))
     sys.stdout.flush()
 
+    # 2. Read output sequences
     output_data = [[] for i in range(len(output_files))]
     for i in range( len(output_files) ):
         f = open(output_files[i], encoding='utf-8')
@@ -567,7 +724,7 @@ def read_tarc_parallel_data( file_prefix, args ):
                 tokens = apply_global_filling(args, tokens, output_data[CLS_COL_IDX-1][s_idx], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], i+1)
             output_data[i].append( tokens )
             s_idx += 1
-        print(' - TArCMultiTask, read {} sequences, {} tokens from output data {}'.format(len(output_data[i]), total_tokens, i))
+        print(' - TArCMultiTask, read {} sequences, {} tokens from output data {}'.format(len(output_data[i]), total_tokens, output_files[i]))
         sys.stdout.flush()
  
     for i in range( len(output_data) ):
@@ -576,7 +733,9 @@ def read_tarc_parallel_data( file_prefix, args ):
         #    assert len( input_data[s_idx] ) == len( output_data[i][s_idx] )
 
     num_columns = len(output_data)+1
-    column_processing = choose_column_processing(num_columns, args)
+    column_processing, gflags = choose_column_processing(num_columns, args)
+    if gflags is not None:
+        granularity_merging_flags[args.sub_task] = gflags[args.sub_task]
     check_column_processing(num_columns, args)
 
     total_tokens = 0
@@ -598,7 +757,8 @@ def read_tarc_parallel_data( file_prefix, args ):
         c_idx = 0
         for t in input_data[i]:
             rep_flag = True
-            if (c_idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos')) or (c_idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and c_idx == 3) or (args.sub_task == 'madar-trs-full' and c_idx == 4):
+            # NOTE: see note above concerning apply_filling flag
+            if (hasattr(args, 'apply_filling') and args.apply_filling) or (c_idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos' or args.sub_task == 'tarc-lemma' or args.sub_task == 'tarc-lemma-full')) or (c_idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and c_idx == 3) or (args.sub_task == 'madar-trs-full' and c_idx == 4) or (args.sub_task == 'madar-trs-full-ex' and c_idx == 2):
                 rep_flag = False
             #process_res = column_processing[idx]( tokens[idx], args, rep_flag=rep_flag )
             tok_res = column_processing[c_idx](t, args, rep_flag=rep_flag)
@@ -616,12 +776,13 @@ def read_tarc_parallel_data( file_prefix, args ):
         c_idx += 1
         for j in range(len(output_data)):
             for t in output_data[j][i]: 
-                if args.ignore_test_output and test_flag:
+                if args.ignore_test_output and test_flag or t in [bos_token, pad_token, eos_token, unk_token, start_token, end_token, space_token, separator_]:
                     process_res = no_processing(t)
                 else:
                     rep_flag = True
-                    if (c_idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos')) or (c_idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and c_idx == 3) or (args.sub_task == 'madar-trs-full' and c_idx == 4):
-                        rep_flag = False 
+                    # NOTE: see note above concerning apply_filling flag
+                    if (hasattr(args, 'apply_filling') and args.apply_filling) or (c_idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos' or args.sub_task == 'tarc-lemma' or args.sub_task == 'tarc-lemma-full')) or (c_idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and c_idx == 3) or (args.sub_task == 'madar-trs-full' and c_idx == 4) or (args.sub_task == 'madar-trs-full-ex' and c_idx == 2):
+                        rep_flag = False
                     process_res = column_processing[c_idx](t, args, rep_flag=rep_flag)
                 char_seqs[c_idx].extend( process_res )
                 char_seq_lens[c_idx].append( (token_offsets[c_idx], token_offsets[c_idx]+len(process_res)) )
@@ -656,6 +817,34 @@ def map_tokens(data, dict, pad_flag):
         tensors.append( torch.LongTensor( tok_lst ) )
 
     return tensors
+
+def check_input_definiteness(tt, d_dict, m_dict):
+
+    special_symbols = ['_FOREIGN_', '_SYM_', '_PUNC_', '_EMOTAG_']
+
+    mismatches = {}
+    for t in tt:
+        t_str = d_dict.string(t)
+        for tok in t_str.split():
+
+            if tok in special_symbols:
+                print('   * Found special symbol {} in sequence: {}'.format(tok, t_str))
+                sys.stdout.flush()
+
+            id1 = d_dict.index(tok)
+            assert id1 != d_dict.unk()
+            id2 = m_dict.index(tok)
+
+            if id1 != id2:
+                if tok not in mismatches:
+                    mismatches[tok] = [(id1, id2)]
+                else:
+                    for tpl in mismatches[tok]:
+                        if id1 != tpl[0] or id2 != tpl[1]:
+                            mismatches[tok].append( (id1, id2) )
+
+    return mismatches
+
 
 @register_task('tarc_multitask')
 class TarcMultiTask(FairseqTask):
@@ -692,9 +881,7 @@ class TarcMultiTask(FairseqTask):
         parser.add_argument('--ignore-test-output', action='store_true', default=False,
                             help='Don\'t apply pre-processing to test output(s)')
         parser.add_argument('--keep-data-order', action='store_true', default=False,
-                            help='Keep data in the original order, that is does not sort sequences by length.')
-        parser.add_argument('--reverse-sequences', action='store_true', default=False,
-                            help='Reverse sequences, that is they will be processed from right to left (e.g. for Arabic processing)')
+                            help='Keep data in the original order, that is does not sort sequences by length.') 
         parser.add_argument('--reverse-tokens', action='store_true', default=False,
                             help='Reverse tokens individually, that is they will be processed from last to first char (e.g. for Arabic processing)')
         parser.add_argument('--load-madar-model', type=str, default='None',
@@ -707,6 +894,18 @@ class TarcMultiTask(FairseqTask):
                             help='Use character-level information for modelling sequences')
         parser.add_argument('--double-learning', action='store_true', default=False,
                             help='Learn the model from both token and character representations')
+        parser.add_argument('--force-input-decoding', action='store_true', default=False,
+                            help='Force the model to decode the input sequence when tackling tasks where the input sequence must be predicted (e.g. constituent syntactic parsing)')
+        parser.add_argument('--reverse-input', action='store_true', default=False,
+                            help='Reverse input sequences (useful e.g. for seq-to-seq syntactic parsing)')
+        parser.add_argument('--tree-format', type=str, default='wsj', help='Specific to constituency syntactic parsing, specifies the format of the output trees (wsj, or GAFL)')
+        parser.add_argument('--input-lm', type=str, help='Load a language model for extracting representations of the input sequences')
+        parser.add_argument('--lm-data', type=str, help='Serialized data used to train the language model, used to keep the same dictionary')
+        parser.add_argument('--use-transformer-layers', action='store_true', default=False, help='Add Transformer layers in the LSTM encoder')
+        parser.add_argument('--transformer-layers', type=int, default=3, help='Number of Transformer layers in the LSTM encoder')
+        parser.add_argument('--load-transformer-layers', type=str, help='Load pre-trained transformer layers in the LSTM encoder')
+        parser.add_argument('--freeze-transformer-layers', action='store_true', default=False, help='Freeze pre-trained Transformer layers in LSTM encoder')
+        parser.add_argument('--apply-filling', action='store_true', default=False, help='Apply filler substitution whatever the subtask')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -723,6 +922,21 @@ class TarcMultiTask(FairseqTask):
                                  extra_special_symbols=[start_token, end_token]
         )
         output_vocab = input_vocab
+
+        if hasattr(args, 'input_lm') and args.input_lm:
+            if not args.lm_data:
+                raise ValueError('LM data are mandatory when using a language model to encode input sequences')
+
+            lm_data = torch.load(args.lm_data)
+            input_vocab = lm_data['vocab']
+            output_vocab = input_vocab
+
+            print('')
+            print(' ######################################################################################################################################################')
+            print(' ### TArCMultiTask CRITICAL WARNING: loading pre-defined dictionary, did you regenerate serialized data with this dictionary to have correct indexing ?')
+            print(' ######################################################################################################################################################')
+            print('')
+            sys.stdout.flush()
 
         print('| [token] dictionary: {} types'.format(len(input_vocab)))
         print('| [label] dictionary: {} types'.format(len(output_vocab)))
@@ -742,9 +956,23 @@ class TarcMultiTask(FairseqTask):
         
         super().__init__(args)
         self.args = args
+        self.input_dict = {} if args.force_input_decoding else None
+        self.output_dict = {} if args.force_input_decoding else None
+        self.punct_dict = {} if args.force_input_decoding else None
+        self.inverse_input_dict = {} if self.input_dict is not None else None
+        self.inverse_output_dict = {} if self.output_dict is not None else None
 
         self.input_vocab = input_vocab
         self.output_vocab = output_vocab
+        if hasattr(args, 'lm_data') and args.lm_data:
+            self.lm_vocab = Dictionary(
+                                 pad=pad_token,
+                                 eos=eos_token,
+                                 unk=unk_token,
+                                 bos=bos_token,
+                                 extra_special_symbols=[start_token, end_token]
+            )
+            self.lm_vocab.update( input_vocab )
  
         self.sequence_separator = self.input_vocab.add_symbol(args.sequence_separator)
         self.token2components_tsr = []
@@ -770,82 +998,116 @@ class TarcMultiTask(FairseqTask):
     
         """Load a given dataset split (e.g., train, valid, test)."""
 
-        if len(self.datasets) == 0:
-            if self.args.serialized_data is not None and os.path.exists(self.args.serialized_data) and os.path.isfile(self.args.serialized_data):
-                print(' - TArCMultiTask, reading serialized data from {}...'.format(self.args.serialized_data))
+        my_split = split
+        if my_split == 'valid':
+            my_split = 'dev'
+ 
+        if self.args.serialized_data is not None and os.path.exists(self.args.serialized_data + '.' + my_split) and os.path.isfile(self.args.serialized_data + '.' + my_split):
+            print(' - TArCMultiTask, reading serialized data from {} ...'.format(self.args.serialized_data + '.' + my_split))
+            sys.stdout.flush()
+            self.splits[my_split] = torch.load( self.args.serialized_data + '.' + my_split )
+            if 'vocab' not in self.splits:
+                print('   * reading dictionary ...')
                 sys.stdout.flush()
-                self.splits = torch.load( self.args.serialized_data )
-                self.input_vocab = self.splits['vocab']
+
+                self.input_vocab = torch.load( self.args.serialized_data + '.vocab' ) #self.splits['vocab']
                 self.output_vocab = self.input_vocab
-                self.token2components_tsr = self.splits['token2components'] 
-            else:
-                print(' - TArCMultiTask, creating dictionaries from whole corpus...')
+
+                print('   * reading token-to-components map ...')
                 sys.stdout.flush()
- 
-                token2components = []
-                for my_split in ['train', 'dev', 'test']:
-                    data_sequences = []
-                    if self.args.data_format == 'tabular':
-                        data_sequences = read_tarc_tabular_data( self.args.data + '.' + my_split, self.args) 
-                    elif self.args.data_format == 'parallel': 
-                        data_sequences = read_tarc_parallel_data( self.args.data + '.' + my_split, self.args )
-                    else:
-                        raise NotImplementedError(' unsupported data format {}'.format(self.args.data_format))
 
-                    if len(token2components) == 0:
-                        token2components = [{bos_token : [bos_token], eos_token : [eos_token]} for t_idx in range(len(data_sequences[3]))]
-                    for t_idx in range(len(data_sequences[3])):
-                        token2components[t_idx].update( data_sequences[3][t_idx] )
-
-                    if self.args.token_sequences and self.args.char_sequences:
-                        assert len(data_sequences[0]) == len(data_sequences[1])
-                        assert len(data_sequences[1]) == len(data_sequences[2])
-
-                    print(' - load_dataset, read {} data split'.format(my_split))
-                    print('   - got {} tasks'.format(len(data_sequences[0])-1))
-                    sys.stdout.flush()
-
-                    tensors = []
-                    lengths = []
-                    tok_tensors = []
-                    tok_lengths = []
-                    char_seq_lengths = [[] for i in range(len(data_sequences[2]))]
-                    for d_idx in range( len(data_sequences[0]) ):   
-                        tok_tt = map_tokens(data_sequences[0][d_idx], self.input_vocab, self.args.pad_reference)
-                        tok_tensors.append( tok_tt )
-                        tok_ll = torch.LongTensor( [t.size(0) for t in tok_tt] )
-                        tok_lengths.append( tok_ll )
-                       
-                        seq_tt = []
-                        for s in data_sequences[2][d_idx]:
-                            if self.args.pad_reference:
-                                s = [(p[0]+1, p[1]+1) for p in s]
-                            char_seq_lengths[d_idx].append( torch.LongTensor( s ) )    # As many pairs as tokens...
-                      
-                        tt = map_tokens(data_sequences[1][d_idx], self.input_vocab, self.args.pad_reference)
-                        tensors.append( tt )
-                        ll = torch.LongTensor([t.size(0) for t in tt])
-                        lengths.append(ll) 
-                    self.splits[my_split] = ([tok_tensors, tensors], [tok_lengths, lengths, char_seq_lengths])
- 
-                for t_idx in range(len(token2components)): 
-                    self.token2components_tsr.append( self._t2c_to_tsr(token2components[t_idx], self.input_vocab) ) 
-
+                self.token2components_tsr = torch.load(self.args.serialized_data + '.token2components' ) #self.splits['token2components']
                 self.splits['vocab'] = self.input_vocab
-                self.splits['token2components'] = self.token2components_tsr 
-                if self.args.serialized_data is not None: 
-                    print(' - TArCMultiTask, serializing data to file {}...'.format(self.args.serialized_data))
-                    sys.stdout.flush()
-                    torch.save(self.splits, self.args.serialized_data)
+                self.splits['token2components'] = self.token2components_tsr
+        else:
+            print(' - TArCMultiTask, creating dictionaries from whole corpus...')
+            sys.stdout.flush()
+ 
+            token2components = []
+            for my_split in ['train', 'dev', 'test']:
+                data_sequences = []
+                if self.args.data_format == 'tabular':
+                    data_sequences = read_tarc_tabular_data( self.args.data + '.' + my_split, self.args) 
+                elif self.args.data_format == 'parallel': 
+                    data_sequences = read_tarc_parallel_data( self.args.data + '.' + my_split, self.args )
+                else:
+                    raise NotImplementedError(' unsupported data format {}'.format(self.args.data_format))
 
-        assert len(self.splits) == 5 and 'train' in self.splits.keys() and 'dev' in self.splits.keys() and 'test' in self.splits.keys()
+                if len(token2components) == 0:
+                    token2components = [{bos_token : [bos_token], eos_token : [eos_token]} for t_idx in range(len(data_sequences[3]))]
+                for t_idx in range(len(data_sequences[3])):
+                    token2components[t_idx].update( data_sequences[3][t_idx] )
+
+                if self.args.token_sequences and self.args.char_sequences:
+                    assert len(data_sequences[0]) == len(data_sequences[1])
+                    assert len(data_sequences[1]) == len(data_sequences[2])
+
+                print(' - load_dataset, read {} data split'.format(my_split))
+                print('   - got {} tasks'.format(len(data_sequences[0])-1))
+                sys.stdout.flush()
+
+                tensors = []
+                lengths = []
+                tok_tensors = []
+                tok_lengths = []
+                char_seq_lengths = [[] for i in range(len(data_sequences[2]))]
+                for d_idx in range( len(data_sequences[0]) ):
+                    tk_idx = 0
+                    #if not self.args.token_sequences:
+                    #    tk_idx = 1
+                    tok_tt = map_tokens(data_sequences[tk_idx][d_idx], self.input_vocab, self.args.pad_reference)
+                    tok_tensors.append( tok_tt )
+                    tok_ll = torch.LongTensor( [t.size(0) for t in tok_tt] )
+                    tok_lengths.append( tok_ll )
+                       
+                    seq_tt = []
+                    for s in data_sequences[2][d_idx]:
+                        if self.args.pad_reference:
+                            s = [(p[0]+1, p[1]+1) for p in s]
+                        char_seq_lengths[d_idx].append( torch.LongTensor( s ) )    # As many pairs as tokens...
+
+                    ch_idx = 1
+                    #if not self.args.char_sequences:
+                    #    ch_idx = 0
+                    tt = map_tokens(data_sequences[ch_idx][d_idx], self.input_vocab, self.args.pad_reference)
+                    tensors.append( tt )
+                    ll = torch.LongTensor([t.size(0) for t in tt])
+                    lengths.append(ll) 
+                self.splits[my_split] = ([tok_tensors, tensors], [tok_lengths, lengths, char_seq_lengths])
+ 
+            for t_idx in range(len(token2components)): 
+                self.token2components_tsr.append( self._t2c_to_tsr(token2components[t_idx], self.input_vocab) ) 
+
+            self.splits['vocab'] = self.input_vocab
+            self.splits['token2components'] = self.token2components_tsr 
+            if self.args.serialized_data is not None: 
+                print(' - TArCMultiTask, serializing data...')
+                sys.stdout.flush()
+                for spt in self.splits.keys():
+                    print('   * Saving {}'.format( self.args.serialized_data + '.' + spt ))
+                    sys.stdout.flush()
+                    torch.save(self.splits[spt], self.args.serialized_data + '.' + spt)
+
+        assert my_split in self.splits.keys() and 'vocab' in self.splits.keys() and 'token2components' in self.splits.keys()
         print(' - TArCMultiTask, instantiating current split {}'.format(split))
         sys.stdout.flush() 
-        my_split = split
-        if split == 'valid':
-            my_split = 'dev' 
 
         tensors, lengths = self.splits[my_split]
+        if hasattr(self.args, 'lm_data') and self.args.lm_data:
+            print(' * TArCMultiTask, checking input symbols definiteness (model dict size {}, vs. LM dict size {})...'.format(len(self.input_vocab), len(self.lm_vocab)))
+            sys.stdout.flush()
+            if self.args.token_sequences:
+                print('   * checking token definiteness...')
+                sys.stdout.flush()
+                miss = check_input_definiteness(tensors[0][0], self.input_vocab, self.lm_vocab)
+                if len(miss) > 0:
+                    raise ValueError('There are {} undefined symbols in the language model dictionary: {}'.format(len(miss), miss))
+            if self.args.char_sequences:
+                print('   * checking character definiteness...')
+                sys.stdout.flush()
+                miss = check_input_definiteness(tensors[1][0], self.input_vocab, self.lm_vocab)
+                if len(miss) > 0:
+                    raise ValueError('There are {} undefined symbols in the language model dictionary: {}'.format(len(miss), miss))
 
         print(' - Split {} data lengths statistics:'.format(split))
         for idx, ll in enumerate(lengths[1]):
@@ -859,20 +1121,94 @@ class TarcMultiTask(FairseqTask):
         self.num_of_inputs = len(tensors[0]) - num_of_tasks
         self.args.num_of_tasks = num_of_tasks
         bound_idx = len(tensors[0])-num_of_tasks
- 
-        if 'base' not in granularity_merging_flags:
-            granularity_merging_flags['base'] = tuple([False for i in range(num_of_tasks+1)])
+  
         if self.args.sub_task not in granularity_merging_flags:
-            granularity_merging_flags[self.args.sub_task] = tuple([False for i in range(num_of_tasks+1)]) 
-        self.set_granularity_merging_flags(granularity_merging_flags[self.args.sub_task])
+            _, gflags = choose_column_processing(num_of_tasks+1, self.args)
+            if gflags is not None:
+                granularity_merging_flags[self.args.sub_task] = gflags[self.args.sub_task]
+            check_column_processing(num_of_tasks+1, self.args)
+        self.set_granularity_merging_flags(granularity_merging_flags[self.args.sub_task]) 
+ 
+        if self.input_dict is not None:
+            self.inverse_input_dict[self.input_vocab.bos()] = '<bos>'
+            self.inverse_input_dict[self.input_vocab.eos()] = '<eos>'
 
-        sources = [tensors[0][0:bound_idx], tensors[1][0:bound_idx]] 
+            for tok in punct:
+                t_idx = self.input_vocab.index(tok)
+                if t_idx == self.input_vocab.unk():
+                    print(' - TArCMultiTask WARNING: punctuation {} is not defined in the dictionary'.format(tok))
+                    sys.stdout.flush()
+                if t_idx not in self.punct_dict:
+                    self.punct_dict[t_idx] = 1
+            add_indices_to_dict(self.input_dict, tensors[0][0])
+            add_entries_to_inverse_dict(self.inverse_input_dict, self.input_vocab, tensors[0][0])
+            if my_split != 'train':
+                trn_tensors, trn_lenghts = self.splits['train']
+                add_indices_to_dict(self.input_dict, trn_tensors[0][0])
+                add_entries_to_inverse_dict(self.inverse_input_dict, self.input_vocab, trn_tensors[0][0])
+
+            '''for t in tensors[0][0]:
+                tmp_str = self.input_vocab.string(t)
+                for tk in tmp_str.split():
+                    if self.input_vocab.index(tk) not in self.inverse_input_dict:
+                        print(' *** Associating {} -> {}'.format(self.input_vocab.index(tk), tk))
+                        sys.stdout.flush()
+                        self.inverse_input_dict[self.input_vocab.index(tk)] = tk
+            if my_split != 'train':
+                trn_tensors, trn_lengths = self.splits['train']
+                for t in trn_tensors[0][0]:
+                    tmp_str = self.input_vocab.string(t)
+                    for tk in tmp_str.split():
+                        if self.input_vocab.index(tk) not in self.inverse_input_dict:
+                            print(' *** Associating {} -> {}'.format(self.input_vocab.index(tk), tk))
+                            sys.stdout.flush()
+                            self.inverse_input_dict[self.input_vocab.index(tk)] = tk'''
+
+        if self.output_dict is not None:
+            self.inverse_output_dict[self.input_vocab.bos()] = '<bos>'
+            self.inverse_output_dict[self.input_vocab.eos()] = '<eos>'
+
+            if self.args.tree_format == 'wsj':
+                for ii in range(bound_idx, len(tensors[0][bound_idx:])+1):
+                    if ii == len(tensors[0][bound_idx:]):
+                        create_output_dict_from_trees(self.output_dict, self.input_vocab, self.args.tree_format, tensors[0][ii])
+                        add_entries_to_inverse_dict_from_trees(self.inverse_output_dict, self.input_vocab, self.args.tree_format, tensors[0][ii])
+                    else:
+                        add_indices_to_dict(self.output_dict, tensors[0][ii])
+                        add_entries_to_inverse_dict(self.inverse_output_dict, self.input_vocab, tensors[0][ii])
+            else:
+                create_output_dict_from_trees(self.output_dict, self.input_vocab, self.args.tree_format, tensors[0][-1])
+                add_entries_to_inverse_dict_from_trees(self.inverse_output_dict, self.input_vocab, self.args.tree_format, tensors[0][-1])
+ 
+            print(' - TArCMultiTask, created input dictionary of size {}'.format(len(self.input_dict)))
+            print(' - TArCMultiTask, created output dictionary of size {}'.format(len(self.output_dict)))
+            print(' - TArCMultiTask, created inverse input dictionary of size {}'.format(len(self.inverse_input_dict)))
+            print(' - TArCMultiTask, created inverse output dictionary of size {}'.format(len(self.inverse_output_dict)))
+            sys.stdout.flush()
+
+        sources = [tensors[0][0:bound_idx], tensors[1][0:bound_idx]]
+        if self.args.reverse_input:
+            print(' - TArCMultiTask: reversing input sequences...')
+            sys.stdout.flush()
+
+            for ii in range(len(sources[0])):
+                for t_idx in range(len(sources[0][ii])):
+                    sources[0][ii][t_idx] = sources[0][ii][t_idx].flip(dims=[0])
+                    #sources[1][ii][t_idx] = sources[1][ii][t_idx].flip(dims=[0])
+                    
+
         src_lengths = [lengths[0][0:bound_idx], lengths[1][0:bound_idx], lengths[2][0:bound_idx]]
         targets = [tensors[0][bound_idx:], tensors[1][bound_idx:]] 
         tgt_lengths = [lengths[0][bound_idx:], lengths[1][bound_idx:], lengths[2][bound_idx:]]
 
         print(' - Tarc MultiTask, learning with {} input(s) (lengths: {}), {} different outputs (num. of tasks: {}, lengths: {})'.format(len(sources), len(src_lengths), len(targets), self.args.num_of_tasks, len(tgt_lengths)))
         sys.stdout.flush() 
+
+        #print(' -----')
+        #print(' * First token sequence: {}'.format(self.input_vocab.string(sources[0][0][0])))
+        #print(' -----')
+        #print(' * First char sequence: {}'.format(self.input_vocab.string(sources[1][0][0])))
+        #print(' -----') 
 
         input_feed = True 
         self.datasets[split] = TarcMultiTaskDataset.TarcMultiTaskDataset(

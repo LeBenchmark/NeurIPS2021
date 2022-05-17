@@ -18,6 +18,7 @@ class FixedSchedule(FairseqLRScheduler):
         # set defaults
         args.warmup_updates = getattr(args, 'warmup_updates', 0) or 0
 
+        self.start = True
         self.lr = args.lr[0]
         if args.warmup_updates > 0:
             self.warmup_factor = 1. / args.warmup_updates
@@ -38,12 +39,19 @@ class FixedSchedule(FairseqLRScheduler):
 
     def get_next_lr(self, epoch):
         lrs = self.args.lr
-        if self.args.force_anneal is None or epoch < self.args.force_anneal:
+        if self.args.force_anneal is None or epoch < self.args.force_anneal or self.start:
             # use fixed LR schedule
             next_lr = lrs[min(epoch, len(lrs) - 1)]
+            self.start = False
+
+            #print(' ********** FixedScheduler, using fixed LR {} (epoch: {}, force-anneal: {}) **********'.format(next_lr, epoch, self.args.force_anneal))
+            #sys.stdout.flush()
         else:
             # annneal based on lr_shrink
             next_lr = lrs[-1] * self.args.lr_shrink ** (epoch + 1 - self.args.force_anneal)
+
+            #print(' ********** FixedScheduler, using annealed LR {} (epoch: {}, force-anneal: {}) **********'.format(next_lr, epoch, self.args.force_anneal))
+            #sys.stdout.flush()
 
         #print(' *** FixedLRScheduler, next_lr: {}'.format(next_lr))
         #sys.stdout.flush()

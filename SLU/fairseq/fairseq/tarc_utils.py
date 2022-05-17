@@ -4,13 +4,16 @@ import torch
 import re
 import sys
 
+_DEBUG_ = False
+
 bos_token = '<bos>'
 pad_token = '<pad>'
 eos_token = '<eos>'
 unk_token = '<unk>'
 start_token = '<SOT>'
 end_token = '<EOT>'
-space_token = '-#-'
+space_token = '|'
+separator_ = '_SEQ_SEP_'
 
 fillerFOR = 'فلارفور'
 fillerEMO = 'فلاريمو'
@@ -27,7 +30,7 @@ latin_fillers = [LfillerFOR, LfillerEMO, LfillerPUN, LfillerSYM]
 
 NUM_list = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
 SYM_list = ['½', '%', '°', '/', '\\', '"', '*', '&', '$', '#', '+', '@', '^']
-PUNC_list = ['_', '-', '(', ')', '[', ']', '{', '}', '<', '>', ',', '.', ';', ':', '!', '?', '«', '»']
+PUNC_list = ['_', '-', '(', ')', '[', ']', '{', '}', '<', '>', ',', '.', ';', ':', '!', '?', '«', '»', '...', '…']
 
 Arabic_sym = ['\\', '/', '@', '#', '$', '%', '^', '&', '*']
 Arabic_punc =  ['.', ',', ':', '"', '،', 'ـ', '؟', '~', '!', ')', '(', '_', '+', '>', '<']
@@ -162,6 +165,11 @@ def concat_with_sep(tensors, sep, dim=-1, shapes=None):
     if dim > len(tensors[0].size())-1 or len(tensors[0].size()) > 2 or (not isinstance(tensors, list)): 
         raise ValueError
 
+    if _DEBUG_:
+        print('[DEBUG] tarc_utils, input tensor list length: {}'.format(len(tensors)))
+        print('[DEBUG] tarc_utils, input tensor sizes: {}'.format([t.size() for t in tensors]))
+        sys.stdout.flush()
+
     if len(tensors) > 1:
         if shapes is not None:
             max_shapes = [torch.max(shapes[:,j], 0)[0].item() for j in range(shapes.size(1))]
@@ -170,15 +178,44 @@ def concat_with_sep(tensors, sep, dim=-1, shapes=None):
  
         res_list = []
         for i in range(len(tensors)-1):
+
+            if _DEBUG_:
+                print('[DEBUG] tarc_utils, starting new loop')
+                sys.stdout.flush()
+
             if shapes is not None:
+
+                if _DEBUG_:
+                    print('[DEBUG] tarc_utils, if branch catched')
+                    sys.stdout.flush()
+
                 app_t = torch.LongTensor( torch.Size(max_shapes) ).to(tensors[i])
                 app_t[:tensors[i].size(0),:tensors[i].size(1)] = tensors[i]
             else:
+                if _DEBUG_:
+                    print('[DEBUG] tarc_utils, else branch catched')
+                    sys.stdout.flush()
+
                 app_t = tensors[i]
 
             res_list.append( app_t )
+
+            if _DEBUG_:
+                print('[DEBUG] tarc_utils, appending tensor of size (curr list length: {}): {}'.format(len(res_list), dims))
+                print('[DEBUG] tarc_utils, tensor like: type {}, content {}'.format(type(tensors[0]), tensors[0]))
+                sys.stdout.flush()
+
             res_list.append( torch.Tensor(torch.Size(dims)).to(tensors[0]).fill_(sep) )
+
+            if _DEBUG_:
+                print('[DEBUG] tarc_utils, tensor appended')
+                sys.stdout.flush()
+
         res_list.append( tensors[-1] )
+
+        if _DEBUG_:
+            print('[DEBUG] tarc_utils, final res_list length: {}'.format(len(res_list)))
+            sys.stdout.flush()
 
         return torch.cat( res_list, dim)
     else:

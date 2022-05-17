@@ -30,6 +30,7 @@ parser.add_argument('--slu-scores', type=str, help='Use system scores for taking
 parser.add_argument('--slu-out', action='store_true', default=False, help='Keep only SLU labels')
 parser.add_argument('--corpus', type=str, default='media', help='Specify the corpus name for task specific post-processing')
 parser.add_argument('--etape-slu-clean', action='store_true', default=False, help='Remove the bogus SLU annotation used in the ETAPE data')
+parser.add_argument('--character-level-slu', action='store_true', default=False, help='Assume character-level SLU output format (as specified in training and generation with option --character-level-slu)')
 args = parser.parse_args()
 
 def tsr_edit_distance(ref, hyp):
@@ -334,26 +335,33 @@ inv_dict[dict[slu_end_concept_mark]] = slu_end_concept_mark
 
 etape_clean_list = [void_concept, slu_start_concept_mark, slu_end_concept_mark]
 blank_idx = dict[blank_token]
-refs = []
+refs = {}
 ref_tokens = 0
 sem_dict = {}
+c_shift = 1
+if args.character_level_slu:
+    c_shift = 2
 prev_token = ''
 f = open(args.ref)
 for line in f:
     line = line.rstrip("\r\n")
     tokens = line.split()
+    rid = tokens[0][2:]
+    tokens = tokens[1:]
     ref_tokens += len(tokens)
-    for t in tokens:
+    for t_idx, t in enumerate(tokens):
         if not t in dict:
             dict[t] = len(dict)
             inv_dict[dict[t]] = t
-        if t == slu_end_concept_mark:
-            if prev_token != '' and prev_token not in sem_dict:
+        if t == slu_end_concept_mark and t_idx >= c_shift:
+            prev_token = tokens[t_idx-c_shift]
+            #if prev_token != '' and prev_token not in sem_dict and t_idx >= 2:
+            if prev_token not in sem_dict:
                 sem_dict[prev_token] = len(sem_dict)
                 print(' - Adding {} to concept dictionary'.format(prev_token))
                 sys.stdout.flush()
-        prev_token = t
-    refs.append( torch.LongTensor( [dict[t] for t in tokens if not t in etape_clean_list] ) ) if args.etape_slu_clean else refs.append( torch.LongTensor( [dict[t] for t in tokens] ) )
+        #prev_token = t
+    refs[rid] = torch.LongTensor( [dict[t] for t in tokens if not t in etape_clean_list] ) if args.etape_slu_clean else torch.LongTensor( [dict[t] for t in tokens] )
 f.close()
 
 print(' * Read {} lines, {} tokens, from file {}'.format(len(refs), ref_tokens, args.ref))
@@ -373,29 +381,38 @@ def preprocess_hyp(hyp):
         prev_t = t
     return res
 
-hyps = []
+hyps = {}
 hyp_tokens = 0
 f = open(args.hyp)
 for line in f:
     line = line.rstrip("\r\n")
-    tokens = line.split() 
+    tokens = line.split()
+    hid = tokens[0][2:]
+    tokens = tokens[2:]
     #tokens = preprocess_hyp(tokens)
     hyp_tokens += len(tokens)
     for t in tokens:
         if not t in dict:
             dict[t] = len(dict)
             inv_dict[dict[t]] = t 
-    hyps.append( torch.LongTensor( [dict[t] for t in tokens if not t in etape_clean_list] ) ) if args.etape_slu_clean else hyps.append( torch.LongTensor( [dict[t] for t in tokens] ) )
+    hyps[hid] = torch.LongTensor( [dict[t] for t in tokens if not t in etape_clean_list] ) if args.etape_slu_clean else torch.LongTensor( [dict[t] for t in tokens] )
+    assert hid in refs
 f.close()
 
-scores = []
+scores = {}
 nscores = 0
 start_idx=1
 if args.slu_scores:
     f = open(args.slu_scores)
     lines = f.readlines()
-    scores = [l.rstrip().split()[start_idx:-1] for l in lines]
-    nscores = sum( [len(s) for s in scores] )
+    for l in lines:
+        tokens = l.strip().split()
+        sid = tokens[0][2:]
+        tokens = tokens[2:-1]
+        assert sid in hyps and len(hyps[sid]) == len(tokens)
+        scores[sid] = tokens
+        #scores = [l.rstrip().split()[start_idx:-1] for l in lines]
+    nscores = sum( [len(scores[k]) for k in scores.keys()] )
     f.close()
 
 print(' * Read {} lines, {} tokens, from file {}'.format(len(hyps), hyp_tokens, args.hyp))
@@ -404,8 +421,10 @@ if args.slu_scores:
 sys.stdout.flush()
 
 if args.slu_scores:
-    for idx in range(len(hyps)):
-        if len(hyps[idx]) != len(scores[idx]):
+    for k in hyps.keys():
+        if k not in scores:
+            raise ValueError('sequence id {} is not defined in score data structure'.format(k))
+        if len(hyps[k]) != len(scores[k]):
             print(' - WARNING: length missmatch at sequence {}'.format(idx))
             sys.stdout.flush()
 
@@ -432,13 +451,13 @@ indeces = (blank_idx, soc_idx, eoc_idx, null_idx, clean_flag, slu_flag, args.cor
 processed_hyps = 0
 total_hyps = len(refs)
 progress_format_str = '{:' + str(len(str(total_hyps))+1) + '} of {}\n'
-for idx in range(len(refs)):
+for kk in refs.keys():
 
     sc = None
     if args.slu_scores:
-        sc = scores[idx]
+        sc = scores[kk]
 
-    (res, seq, nonzeros) = compute_wer(hyps[idx], sc, refs[idx], indeces, sem_dict, inv_dict)
+    (res, seq, nonzeros) = compute_wer(hyps[kk], sc, refs[kk], indeces, sem_dict, inv_dict)
     I, D, S, toks = res
     bootstrap_stats.append( (I+D+S, toks) )
     total_er[0] += I
@@ -449,7 +468,7 @@ for idx in range(len(refs)):
     (output_hyp, clean_hyp, ref) = seq
     hyp_txt = ' '.join( [inv_dict[idx.item()] for idx in clean_hyp] )
     ref_txt = ' '.join( [inv_dict[idx.item()] for idx in ref] )
-    scored_seqs.append( (ref_txt, hyp_txt, sum(res[:3])) )
+    scored_seqs.append( (kk, ref_txt, hyp_txt, sum(res[:3])) )
 
     processed_hyps += 1
     sys.stdout.write('.')
@@ -463,9 +482,9 @@ print('')
 output_file = args.hyp + '.scored'
 f = open(output_file, 'w')
 for t in scored_seqs:
-    f.write('REF: ' + t[0] + '\n')
-    f.write('HYP: ' + t[1] + '\n')
-    f.write(' - WER' + str(t[2]) + '\n\n')
+    f.write('REF-' + t[0] + ': ' + t[1] + '\n')
+    f.write('HYP-' + t[0] + ': ' + t[2] + '\n')
+    f.write(' - WER' + str(t[3]) + '\n\n')
 f.close()
 
 output_file = args.hyp + '.bs-samples'

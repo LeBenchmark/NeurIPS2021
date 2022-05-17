@@ -12,7 +12,7 @@ from fairseq.incremental_decoding_utils import with_incremental_state
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fairseq import options, utils, tarc_utils
+from fairseq import options, utils, tarc_utils, init_functions
 from torch import Tensor
 
 import sys
@@ -26,6 +26,7 @@ from fairseq.models import (
     register_model,
     register_model_architecture,
 )
+
 from fairseq.models.fairseq_encoder import EncoderOut
 from fairseq.modules import (
     AdaptiveSoftmax,
@@ -36,455 +37,7 @@ from fairseq.modules import (
     TransformerEncoderLayer,
 )
 
-
-@with_incremental_state
-class AyeyeBrazzoTarcMultiheadAttention(nn.Module):
-    """Multi-headed attention.
-
-    See "Attention Is All You Need" for more details.
-    """
-
-    def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        kdim=None,
-        vdim=None,
-        dropout=0.0,
-        bias=True,
-        add_bias_kv=False,
-        add_zero_attn=False,
-        self_attention=False,
-        encoder_decoder_attention=False,
-    ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.kdim = kdim if kdim is not None else embed_dim
-        self.vdim = vdim if vdim is not None else embed_dim
-        self.qkv_same_dim = self.kdim == embed_dim and self.vdim == embed_dim
-
-        self.num_heads = num_heads
-        self.dropout = dropout
-        self.head_dim = embed_dim // num_heads
-        assert (
-            self.head_dim * num_heads == self.embed_dim
-        ), "embed_dim must be divisible by num_heads"
-        self.scaling = self.head_dim ** -0.5
-
-        self.self_attention = self_attention
-        self.encoder_decoder_attention = encoder_decoder_attention
-
-        assert not self.self_attention or self.qkv_same_dim, (
-            "Self-attention requires query, key and " "value to be of the same size"
-        )
-
-        self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-        if add_bias_kv:
-            self.bias_k = Parameter(torch.Tensor(1, 1, embed_dim))
-            self.bias_v = Parameter(torch.Tensor(1, 1, embed_dim))
-        else:
-            self.bias_k = self.bias_v = None
-
-        self.add_zero_attn = add_zero_attn
-
-        self.reset_parameters()
-
-        self.onnx_trace = False
-
-        self.enable_torch_version = False
-        if hasattr(F, "multi_head_attention_forward"):
-            self.enable_torch_version = True
-        else:
-            self.enable_torch_version = False
-
-    def prepare_for_onnx_export_(self):
-        self.onnx_trace = True
-
-    def reset_parameters(self):
-        if self.qkv_same_dim:
-            # Empirically observed the convergence to be much better with
-            # the scaled initialization
-            nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
-            nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
-            nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
-        else:
-            nn.init.xavier_uniform_(self.k_proj.weight)
-            nn.init.xavier_uniform_(self.v_proj.weight)
-            nn.init.xavier_uniform_(self.q_proj.weight)
-
-        nn.init.xavier_uniform_(self.out_proj.weight)
-        if self.out_proj.bias is not None:
-            nn.init.constant_(self.out_proj.bias, 0.)
-        if self.bias_k is not None:
-            nn.init.xavier_normal_(self.bias_k)
-        if self.bias_v is not None:
-            nn.init.xavier_normal_(self.bias_v)
-
-    def forward(
-        self,
-        query,
-        key: Optional[Tensor],
-        value: Optional[Tensor],
-        key_padding_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        need_weights: bool = True,
-        static_kv: bool = False,
-        attn_mask: Optional[Tensor] = None,
-        before_softmax: bool = False,
-        need_head_weights: bool = False,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-        """Input shape: Time x Batch x Channel
-
-        Args:
-            key_padding_mask (ByteTensor, optional): mask to exclude
-                keys that are pads, of shape `(batch, src_len)`, where
-                padding elements are indicated by 1s.
-            need_weights (bool, optional): return the attention weights,
-                averaged over heads (default: False).
-            attn_mask (ByteTensor, optional): typically used to
-                implement causal attention, where the mask prevents the
-                attention from looking forward in time (default: None).
-            before_softmax (bool, optional): return the raw attention
-                weights and values before the attention softmax.
-            need_head_weights (bool, optional): return the attention
-                weights for each head. Implies *need_weights*. Default:
-                return the average attention weights over all heads.
-        """
-        if need_head_weights:
-            need_weights = True
-
-        tgt_len, bsz, embed_dim = query.size()
-        assert embed_dim == self.embed_dim
-        assert list(query.size()) == [tgt_len, bsz, embed_dim]
-
-        if (
-            self.enable_torch_version
-            and not self.onnx_trace
-            and incremental_state is None
-            and not static_kv
-        ):
-            assert key is not None and value is not None
-            return F.multi_head_attention_forward(
-                query,
-                key,
-                value,
-                self.embed_dim,
-                self.num_heads,
-                torch.empty([0]),
-                torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias)),
-                self.bias_k,
-                self.bias_v,
-                self.add_zero_attn,
-                self.dropout,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                self.training,
-                key_padding_mask,
-                need_weights,
-                attn_mask,
-                use_separate_proj_weight=True,
-                q_proj_weight=self.q_proj.weight,
-                k_proj_weight=self.k_proj.weight,
-                v_proj_weight=self.v_proj.weight,
-            )
-
-        if incremental_state is not None:
-            saved_state = self._get_input_buffer(incremental_state)
-            if saved_state is not None and "prev_key" in saved_state:
-                # previous time steps are cached - no need to recompute
-                # key and value if they are static
-                if static_kv:
-                    assert self.encoder_decoder_attention and not self.self_attention
-                    key = value = None
-        else:
-            saved_state = None
-
-        if self.self_attention:
-            q = self.q_proj(query)
-            k = self.k_proj(query)
-            v = self.v_proj(query)
-        elif self.encoder_decoder_attention:
-            # encoder-decoder attention
-            q = self.q_proj(query)
-            if key is None:
-                assert value is None
-                k = v = None
-            else:
-                k = self.k_proj(key)
-                v = self.v_proj(key)
-
-        else:
-            assert key is not None and value is not None
-            q = self.q_proj(query)
-            k = self.k_proj(key)
-            v = self.v_proj(value)
-        q *= self.scaling
-
-        if self.bias_k is not None:
-            assert self.bias_v is not None
-            k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])
-            v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)])
-            if attn_mask is not None:
-                attn_mask = torch.cat(
-                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
-                )
-            if key_padding_mask is not None:
-                key_padding_mask = torch.cat(
-                    [
-                        key_padding_mask,
-                        key_padding_mask.new_zeros(key_padding_mask.size(0), 1),
-                    ],
-                    dim=1,
-                )
-
-        q = (
-            q.contiguous()
-            .view(tgt_len, bsz * self.num_heads, self.head_dim)
-            .transpose(0, 1)
-        )
-        if k is not None:
-            k = (
-                k.contiguous()
-                .view(-1, bsz * self.num_heads, self.head_dim)
-                .transpose(0, 1)
-            )
-        if v is not None:
-            v = (
-                v.contiguous()
-                .view(-1, bsz * self.num_heads, self.head_dim)
-                .transpose(0, 1)
-            )
-
-        if saved_state is not None:
-            # saved states are stored with shape (bsz, num_heads, seq_len, head_dim)
-            if "prev_key" in saved_state:
-                _prev_key = saved_state["prev_key"]
-                assert _prev_key is not None
-                prev_key = _prev_key.view(bsz * self.num_heads, -1, self.head_dim)
-                if static_kv:
-                    k = prev_key
-                else:
-                    assert k is not None
-                    k = torch.cat([prev_key, k], dim=1)
-            if "prev_value" in saved_state:
-                _prev_value = saved_state["prev_value"]
-                assert _prev_value is not None
-                prev_value = _prev_value.view(bsz * self.num_heads, -1, self.head_dim)
-                if static_kv:
-                    v = prev_value
-                else:
-                    assert v is not None
-                    v = torch.cat([prev_value, v], dim=1)
-            prev_key_padding_mask: Optional[Tensor] = None
-            if "prev_key_padding_mask" in saved_state:
-                prev_key_padding_mask = saved_state["prev_key_padding_mask"]
-            assert k is not None and v is not None
-            key_padding_mask = MultiheadAttention._append_prev_key_padding_mask(
-                key_padding_mask=key_padding_mask,
-                prev_key_padding_mask=prev_key_padding_mask,
-                batch_size=bsz,
-                src_len=k.size(1),
-                static_kv=static_kv,
-            )
-
-            saved_state["prev_key"] = k.view(bsz, self.num_heads, -1, self.head_dim)
-            saved_state["prev_value"] = v.view(bsz, self.num_heads, -1, self.head_dim)
-            saved_state["prev_key_padding_mask"] = key_padding_mask
-            # In this branch incremental_state is never None
-            assert incremental_state is not None
-            incremental_state = self._set_input_buffer(incremental_state, saved_state)
-        assert k is not None
-        src_len = k.size(1)
-
-        # This is part of a workaround to get around fork/join parallelism
-        # not supporting Optional types.
-        if key_padding_mask is not None and key_padding_mask.dim() == 0:
-            key_padding_mask = None
-
-        if key_padding_mask is not None:
-            assert key_padding_mask.size(0) == bsz
-            assert key_padding_mask.size(1) == src_len
-
-        if self.add_zero_attn:
-            assert v is not None
-            src_len += 1
-            k = torch.cat([k, k.new_zeros((k.size(0), 1) + k.size()[2:])], dim=1)
-            v = torch.cat([v, v.new_zeros((v.size(0), 1) + v.size()[2:])], dim=1)
-            if attn_mask is not None:
-                attn_mask = torch.cat(
-                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
-                )
-            if key_padding_mask is not None:
-                key_padding_mask = torch.cat(
-                    [
-                        key_padding_mask,
-                        torch.zeros(key_padding_mask.size(0), 1).type_as(
-                            key_padding_mask
-                        ),
-                    ],
-                    dim=1,
-                )
-
-        attn_weights = torch.bmm(q, k.transpose(1, 2))
-        attn_weights = MultiheadAttention.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
-
-        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
-
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(0)
-            if self.onnx_trace:
-                attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
-            attn_weights += attn_mask
-
-        if key_padding_mask is not None:
-            # don't attend to padding symbols
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf")
-            )
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-
-        if before_softmax:
-            return attn_weights, v
-
-        attn_weights_float = utils.softmax(
-            attn_weights, dim=-1, onnx_trace=self.onnx_trace
-        )
-        attn_weights = attn_weights_float.type_as(attn_weights)
-        attn_probs = F.dropout(
-            attn_weights_float.type_as(attn_weights),
-            p=self.dropout,
-            training=self.training,
-        )
-        assert v is not None
-        attn = torch.bmm(attn_probs, v)
-        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
-        if self.onnx_trace and attn.size(1) == 1:
-            # when ONNX tracing a single decoder step (sequence length == 1)
-            # the transpose is a no-op copy before view, thus unnecessary
-            attn = attn.contiguous().view(tgt_len, bsz, embed_dim)
-        else:
-            attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
-        attn = self.out_proj(attn)
-        attn_weights: Optional[Tensor] = None
-        if need_weights:
-            attn_weights = attn_weights_float.view(
-                bsz, self.num_heads, tgt_len, src_len
-            ).transpose(1, 0)
-            if not need_head_weights:
-                # average attention weights over heads
-                attn_weights = attn_weights.mean(dim=0)
-
-        return attn, attn_weights
-
-    @staticmethod
-    def _append_prev_key_padding_mask(
-        key_padding_mask: Optional[Tensor],
-        prev_key_padding_mask: Optional[Tensor],
-        batch_size: int,
-        src_len: int,
-        static_kv: bool,
-    ) -> Optional[Tensor]:
-        # saved key padding masks have shape (bsz, seq_len)
-        if prev_key_padding_mask is not None and static_kv:
-            new_key_padding_mask = prev_key_padding_mask
-        elif prev_key_padding_mask is not None and key_padding_mask is not None:
-            new_key_padding_mask = torch.cat(
-                [prev_key_padding_mask.float(), key_padding_mask.float()], dim=1
-            )
-        # During incremental decoding, as the padding token enters and
-        # leaves the frame, there will be a time when prev or current
-        # is None
-        elif prev_key_padding_mask is not None:
-
-            filler = torch.zeros(batch_size, src_len - prev_key_padding_mask.size(1))
-            if prev_key_padding_mask.is_cuda:
-                filler = filler.cuda()
-            new_key_padding_mask = torch.cat(
-                [prev_key_padding_mask.float(), filler.float()], dim=1
-            )
-        elif key_padding_mask is not None:
-            filler = torch.zeros(batch_size, src_len - key_padding_mask.size(1))
-            if key_padding_mask.is_cuda:
-                filler = filler.cuda()
-            new_key_padding_mask = torch.cat(
-                [filler.float(), key_padding_mask.float()], dim=1
-            )
-        else:
-            new_key_padding_mask = prev_key_padding_mask
-        return new_key_padding_mask
-
-    @torch.jit.export
-    def reorder_incremental_state(
-        self, incremental_state: Dict[str, Dict[str, Optional[Tensor]]], new_order: Tensor
-    ):
-        """Reorder buffered internal state (for incremental generation)."""
-        input_buffer = self._get_input_buffer(incremental_state)
-        if input_buffer is not None:
-            for k in input_buffer.keys():
-                input_buffer_k = input_buffer[k]
-                if input_buffer_k is not None:
-                    input_buffer[k] = input_buffer_k.index_select(0, new_order)
-            incremental_state = self._set_input_buffer(incremental_state, input_buffer)
-        return incremental_state
-
-    def _get_input_buffer(
-            self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]], attn_key: str ='attn_state'
-    ) -> Dict[str, Optional[Tensor]]:
-        result = self.get_incremental_state(incremental_state, attn_key)
-        if result is not None:
-            return result
-        else:
-            empty_result: Dict[str, Optional[Tensor]] = {}
-            return empty_result
-
-    def _set_input_buffer(
-        self,
-        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
-        buffer: Dict[str, Optional[Tensor]],
-        attn_key: str = 'attn_state',
-    ):
-        return self.set_incremental_state(incremental_state, attn_key, buffer)
-
-    def apply_sparse_mask(attn_weights, tgt_len: int, src_len: int, bsz: int):
-        return attn_weights
-
-    def upgrade_state_dict_named(self, state_dict, name):
-        prefix = name + "." if name != "" else ""
-        items_to_add = {}
-        keys_to_remove = []
-        for k in state_dict.keys():
-            if k.endswith(prefix + "in_proj_weight"):
-                # in_proj_weight used to be q + k + v with same dimensions
-                dim = int(state_dict[k].shape[0] / 3)
-                items_to_add[prefix + "q_proj.weight"] = state_dict[k][:dim]
-                items_to_add[prefix + "k_proj.weight"] = state_dict[k][dim : 2 * dim]
-                items_to_add[prefix + "v_proj.weight"] = state_dict[k][2 * dim :]
-
-                keys_to_remove.append(k)
-
-                k_bias = prefix + "in_proj_bias"
-                if k_bias in state_dict.keys():
-                    dim = int(state_dict[k].shape[0] / 3)
-                    items_to_add[prefix + "q_proj.bias"] = state_dict[k_bias][:dim]
-                    items_to_add[prefix + "k_proj.bias"] = state_dict[k_bias][
-                        dim : 2 * dim
-                    ]
-                    items_to_add[prefix + "v_proj.bias"] = state_dict[k_bias][2 * dim :]
-
-                    keys_to_remove.append(prefix + "in_proj_bias")
-
-        for k in keys_to_remove:
-            del state_dict[k]
-
-        for key, value in items_to_add.items():
-            state_dict[key] = value
-
+_DEBUG_ = False
 
 class TarcTransformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -520,8 +73,8 @@ class TarcTransformerEncoderLayer(nn.Module):
             # for backwards compatibility with models that use args.relu_dropout
             self.activation_dropout = getattr(args, "relu_dropout", 0)
         self.normalize_before = args.encoder_normalize_before
-        self.fc1 = Linear(self.embed_dim, args.encoder_ffn_embed_dim)
-        self.fc2 = Linear(args.encoder_ffn_embed_dim, self.embed_dim)
+        self.fc1 = init_functions.TransformerLinear(self.embed_dim, args.encoder_ffn_embed_dim)
+        self.fc2 = init_functions.TransformerLinear(args.encoder_ffn_embed_dim, self.embed_dim)
         self.final_layer_norm = LayerNorm(self.embed_dim)
 
     def upgrade_state_dict_named(self, state_dict, name):
@@ -588,6 +141,10 @@ class TarcTransformerEncoderLayer(nn.Module):
         x = residual + x
         if not self.normalize_before:
             x = self.final_layer_norm(x)
+
+        #print(' TarcTransformerLayer, returning x: {}'.format(x.size()))
+        #sys.stdout.flush()
+
         return x
 
 
@@ -708,6 +265,12 @@ class TarcTransformerEncoder(FairseqEncoder):
 
         x, encoder_embedding = self.forward_embedding(toks_src_tokens)
 
+        '''print(' - TarcTransformerEncoder:')
+        print('   * x shape: {}'.format(x.size()))
+        print('   * x min, max, mean, sum: {}, {}, {}, {}'.format(torch.min(x), torch.max(x), torch.mean(x), torch.sum(x)))
+        sys.stdout.flush()
+        sys.exit(0)'''
+
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
         (T, B, C) = x.size()
@@ -785,26 +348,25 @@ class TarcTransformerEncoder(FairseqEncoder):
         elif self.char_sequences:
             enc_out = self._forward_transformer([char_src_tokens, char_src_tokens], [char_src_lengths, char_src_lengths], src_tok_bounds, sort_order)
 
-        #return enc_out
-        inv_idx = range(enc_out.encoder_out.size(0)-1, -1, -1)
+        '''print(' TarcTransformerEncoder, returning EncoderOut structure:')
+        print('  * encoder_out shape: {}'.format(enc_out.encoder_out.size()))
+        print('  * encoder_padding_mask shape: {}'.format(enc_out.encoder_padding_mask.size()))
+        print('  * encoder_embedding shape: {}'.format(enc_out.encoder_embedding.size()))
+        if enc_out.encoder_states is not None:
+            print('  * encoder_states length: {}'.format(len(enc_out.encoder_states)))
+        print(' -----')
+        sys.stdout.flush()'''
+
+        return enc_out
+        '''inv_idx = range(enc_out.encoder_out.size(0)-1, -1, -1)
         encoder_out = torch.cat( [enc_out.encoder_out, enc_out.encoder_out[inv_idx, :, :]], -1 )
         final_hiddens = torch.stack( [encoder_out[-1,:,:] for i in range(self.num_layers)], 0 )
         final_cells = torch.stack( [encoder_out[-1,:,:] for i in range(self.num_layers)], 0 )
 
-        '''print(' - TarcTransformerEncoder output shapes:')
-        print(inv_idx)
-        print('   * x: {}'.format(encoder_out.size()))
-        print('   * final_hiddens: {}'.format(final_hiddens.size()))
-        print('   * final_cells: {}'.format(final_cells.size()))
-        print('   * encoder_padding_mask: {}'.format(enc_out.encoder_padding_mask.transpose(0, 1).size()))
-        print(' -----')
-        sys.stdout.flush()
-        sys.exit(0)'''
-
         return {
             'encoder_out': (encoder_out, final_hiddens, final_cells),
             'encoder_padding_mask': enc_out.encoder_padding_mask.transpose(0, 1) if enc_out.encoder_padding_mask.any() else None
-        }
+        }'''
 
 
     @torch.jit.export
@@ -957,9 +519,14 @@ class TarcTransformerDecoderLayer(nn.Module):
             )
             self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
 
-        # This is my main modification: cross-attentions to attend the other decoder outputs
+        # This is my main modification: cross-attentions to attend the other decoder outputs, queries are the same as the encoder MHA 
         self.cross_attentions = nn.ModuleList()
         self.cross_attentions_norm = nn.ModuleList()
+        if num_cross_attentions > 0:    # TODO: for new architecture (xattn concatenation), validation in progress...
+            if self.normalize_before:
+                self.xattn_norm = LayerNorm(self.embed_dim * (num_cross_attentions+1), export=export)
+            self.xattn_fc1 = init_functions.TransformerLinear(self.embed_dim * (num_cross_attentions+1), args.decoder_ffn_embed_dim)
+            self.xattn_fc2 = init_functions.TransformerLinear(args.decoder_ffn_embed_dim, self.embed_dim)
         for i in range( num_cross_attentions ):
             self.cross_attentions.append(
                 MultiheadAttention(
@@ -975,10 +542,12 @@ class TarcTransformerDecoderLayer(nn.Module):
                 LayerNorm(self.embed_dim, export=export)
             )
 
-        self.fc1 = Linear(self.embed_dim, args.decoder_ffn_embed_dim)
-        self.fc2 = Linear(args.decoder_ffn_embed_dim, self.embed_dim)
+        if num_cross_attentions == 0:   # TODO: for new architecture (xattn concatenation) ...
+            self.fc1 = init_functions.TransformerLinear(self.embed_dim, args.decoder_ffn_embed_dim)
+            self.fc2 = init_functions.TransformerLinear(args.decoder_ffn_embed_dim, self.embed_dim)
 
-        self.final_layer_norm = LayerNorm(self.embed_dim, export=export)
+        if self.num_cross_attentions == 0 or not self.normalize_before: # TODO: for new architecture (xattn concatenation) ...
+            self.final_layer_norm = LayerNorm(self.embed_dim, export=export)
         self.need_attn = True
 
         self.onnx_trace = False
@@ -990,7 +559,7 @@ class TarcTransformerDecoderLayer(nn.Module):
         self,
         x,
         encoder_out: Optional[List[torch.Tensor]] = None,
-        encoder_padding_mask: Optional[torch.Tensor] = None,
+        encoder_padding_mask: Optional[List[torch.Tensor]] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         prev_self_attn_state: Optional[List[torch.Tensor]] = None,
         prev_attn_state: Optional[List[torch.Tensor]] = None,
@@ -1018,9 +587,17 @@ class TarcTransformerDecoderLayer(nn.Module):
 
         assert len(self.cross_attentions)+1 == len(encoder_out)
 
+        '''print(' TarcTransformerDecoderLayer, input x shape: {}'.format(x.size()))
+        print('    * num. of value sets: {}'.format(len(encoder_out)))
+        sys.stdout.flush()'''
+
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
+
+        #print(' *** [DEBUG] TarcTransformerDecoderLayer, prev_self_attn_state is None ? {}'.format(prev_self_attn_state is None))
+        #sys.stdout.flush()
+
         if prev_self_attn_state is not None:
             prev_key, prev_value = prev_self_attn_state[:2]
             saved_state: Dict[str, Optional[Tensor]] = {
@@ -1032,24 +609,33 @@ class TarcTransformerDecoderLayer(nn.Module):
             assert incremental_state is not None
             self.self_attn._set_input_buffer(incremental_state, saved_state)
         _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
+
+        #print(' *** [DEBUG] TarcTransformerDecoderLayer, _self_attn_input_buffer is None ? {}'.format(_self_attn_input_buffer is None))
+        #sys.stdout.flush()
+
         if self.cross_self_attention and not (
             incremental_state is not None
             and _self_attn_input_buffer is not None
             and "prev_key" in _self_attn_input_buffer
         ):
+
+            #print(' ***** [DEBUG] ***** TarcTransformerDecoderLayer, setting query for self-attention')
+            #sys.stdout.flush()
+
             if self_attn_mask is not None:
                 assert encoder_out[0] is not None
                 self_attn_mask = torch.cat(
                     (x.new_zeros(x.size(0), encoder_out[0].size(0)), self_attn_mask), dim=1
                 )
             if self_attn_padding_mask is not None:
-                if encoder_padding_mask is None:
+                encoder_zero_padding_mask = encoder_padding_mask[0]
+                if encoder_padding_mask[0] is None:
                     assert encoder_out[0] is not None
-                    encoder_padding_mask = self_attn_padding_mask.new_zeros(
+                    encoder_zero_padding_mask = self_attn_padding_mask.new_zeros(
                         encoder_out[0].size(1), encoder_out[0].size(0)
                     )
                 self_attn_padding_mask = torch.cat(
-                    (encoder_padding_mask, self_attn_padding_mask), dim=1
+                    (encoder_zero_padding_mask, self_attn_padding_mask), dim=1
                 )
             assert encoder_out[0] is not None
             y = torch.cat((encoder_out[0], x), dim=0)
@@ -1070,11 +656,18 @@ class TarcTransformerDecoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.self_attn_layer_norm(x)
 
+        #print(' TarcTransformerDecoderLayer, self attention computed...')
+        #sys.stdout.flush()
+
         cross_attn_x = x
         if self.encoder_attn is not None:
             residual = x
             if self.normalize_before:
                 x = self.encoder_attn_layer_norm(x)
+
+            #print(' *** [DEBUG] TarcTransformerDecoderLayer, prev_attn_state is None ? {}'.format(prev_attn_state is None))
+            #sys.stdout.flush()
+
             if prev_attn_state is not None:
                 prev_key, prev_value = prev_attn_state[:2]
                 saved_state: Dict[str, Optional[Tensor]] = {
@@ -1090,7 +683,7 @@ class TarcTransformerDecoderLayer(nn.Module):
                 query=x,
                 key=encoder_out[0],
                 value=encoder_out[0],
-                key_padding_mask=encoder_padding_mask,
+                key_padding_mask=encoder_padding_mask[0],
                 incremental_state=incremental_state,
                 static_kv=True,
                 need_weights=need_attn or (not self.training and self.need_attn),
@@ -1101,12 +694,19 @@ class TarcTransformerDecoderLayer(nn.Module):
             if not self.normalize_before:
                 x = self.encoder_attn_layer_norm(x)
 
+            #print(' TarcTransformerDecoderLayer, cross attention (encoder) computed...')
+            #sys.stdout.flush()
+
         if self.num_cross_attentions > 0:
-            residual = cross_attn_x
-            all_att_output = torch.zeros_like(cross_attn_x)
+            #residual = cross_attn_x
+            all_att_output = [] #torch.zeros_like(cross_attn_x) # TODO: [] is for new architecture (xattn concatenation)...
             if self.normalize_before:
                 cross_attn_x = self.cross_attentions_norm[0](cross_attn_x)
             for i in range( len(self.cross_attentions) ):
+
+                #print(' *** [DEBUG] TarcTransformerDecoderLayer, prev_cross_attn_state is None ? {}'.format(prev_cross_attn_state is None))
+                #sys.stdout.flush()
+
                 if prev_cross_attn_state is not None:
                     prev_key, prev_value = prev_cross_attn_state[i][:2]
                     cross_saved_state: Dict[str, Optional[Tensor]] = {
@@ -1122,31 +722,49 @@ class TarcTransformerDecoderLayer(nn.Module):
                     query=cross_attn_x,
                     key=encoder_out[i+1],
                     value=encoder_out[i+1],
-                    key_padding_mask=None,
+                    key_padding_mask=encoder_padding_mask[i+1],
                     incremental_state=incremental_state,
                     static_kv=True,
                     need_weights=need_attn or (not self.training and self.need_attn),
                     need_head_weights=need_head_weights,
                 )
-                att_output = F.dropout(att_output, p=self.dropout, training=self.training) 
-                all_att_output = att_output + all_att_output
-            if self.encoder_attn is not None:
-                x = x + all_att_output  # encoder_attn and cross_attentions use the same residual, so no need to add it twice
-            else:
-                x = residual + x + all_att_output
-            if not self.normalize_before:
-                x = self.cross_attentions_norm[0](x)
+                att_output = F.dropout(att_output, p=self.dropout, training=self.training)
+                #att_output = cross_attn_x + att_output # Residual add also here ???
+                if not self.normalize_before:
+                    att_output = self.cross_attentions_norm[i](att_output)
+                all_att_output.append(att_output) #= att_output + all_att_output    # TODO: .append(att_output) is for new architecture (xattn concatenation) ...
 
-        residual = x
-        if self.normalize_before:
-            x = self.final_layer_norm(x)
-        x = self.activation_fn(self.fc1(x))
-        x = F.dropout(x, p=float(self.activation_dropout), training=self.training)
-        x = self.fc2(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = residual + x
-        if not self.normalize_before:
-            x = self.final_layer_norm(x)
+                #print(' TarcTransformerDecoderLayer, cross attention (decoder {}) computed'.format(i))
+                #sys.stdout.flush()
+
+            # TODO: for new architecture (xattn concatenation) ...
+            all_att_output.append(x)
+            all_att_output = torch.cat(all_att_output, -1)
+            if self.normalize_before:
+                all_att_output = self.xattn_norm(all_att_output)
+            all_att_output = self.activation_fn( self.xattn_fc1(all_att_output) )
+            all_att_output = F.dropout(all_att_output, p=float(self.activation_dropout), training=self.training)
+            all_att_output = self.xattn_fc2( all_att_output )
+            all_att_output = F.dropout(all_att_output, p=float(self.activation_dropout), training=self.training)
+            # END TODO: for new architecture
+
+            x = x + all_att_output
+            if not self.normalize_before:
+                x = self.final_layer_norm(x)
+            #if not self.normalize_before:
+            #    x = self.cross_attentions_norm[0](x)
+
+        if self.num_cross_attentions == 0:  # TODO: for new architecture (xattn concatenation) ...
+            residual = x
+            if self.normalize_before:
+                x = self.final_layer_norm(x)
+            x = self.activation_fn(self.fc1(x))
+            x = F.dropout(x, p=float(self.activation_dropout), training=self.training)
+            x = self.fc2(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = residual + x
+            if not self.normalize_before:
+                x = self.final_layer_norm(x)
         if self.onnx_trace and incremental_state is not None:
             saved_state = self.self_attn._get_input_buffer(incremental_state)
             assert saved_state is not None
@@ -1159,6 +777,10 @@ class TarcTransformerDecoderLayer(nn.Module):
             else:
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
             return x, attn, self_attn_state
+
+        #print(' TarcTransformerDecoderLayer passed, output shape: {}'.format(x.size()))
+        #sys.stdout.flush()
+
         return x, attn, None
 
     def make_generation_fast_(self, need_attn: bool = False, **kwargs):
@@ -1206,7 +828,12 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
             (default: False).
     """
 
-    def __init__(self, args, num_cross_attentions, dictionary, embed_tokens, no_encoder_attn=False):
+    def __init__(self, args, num_cross_attentions, dictionary, embed_tokens, no_encoder_attn=False,
+        token_map=None,
+        granularity_flags=None,
+        double_learning=False,
+        input_dict=None
+    ):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
@@ -1224,12 +851,18 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
         self.padding_idx = embed_tokens.padding_idx
         self.max_target_positions = args.max_target_positions
 
-        self.embed_tokens = embed_tokens
+        self.token2components_map = token_map
+        self.token_sequences = granularity_flags[0] if granularity_flags is not None else False
+        self.char_sequences = granularity_flags[1] if granularity_flags is not None else False
+        self.g_id = 'char' if ((not self.token_sequences) and self.char_sequences) else 'token'
+        self.merge_flag = False
+        self.double_learning = double_learning
 
+        self.embed_tokens = embed_tokens
         self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
 
         self.project_in_dim = (
-            Linear(input_embed_dim, embed_dim, bias=False)
+            init_functions.TransformerLinear(input_embed_dim, embed_dim, bias=False)
             if embed_dim != input_embed_dim
             else None
         )
@@ -1260,10 +893,13 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
         self.adaptive_softmax = None
 
         self.project_out_dim = (
-            Linear(embed_dim, self.output_embed_dim, bias=False)
+            init_functions.TransformerLinear(embed_dim, self.output_embed_dim, bias=False)
             if embed_dim != self.output_embed_dim and not args.tie_adaptive_weights
             else None
         )
+
+        if double_learning:
+            raise NotImplementedError
 
         if args.adaptive_softmax_cutoff is not None:
             self.adaptive_softmax = AdaptiveSoftmax(
@@ -1292,9 +928,15 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
         else:
             self.layernorm_embedding = None
 
+    def set_merge_flag(self, val):
+        self.merge_flag = val
+
+    def get_token_from_chars_(self, token, embed):
+        raise NotImplementedError
+
     def forward(
         self,
-        prev_output_tokens,
+        prev_output_tokens, tgt_tok_bounds, sort_order,
         encoder_out: Optional[EncoderOut] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         features_only: bool = False,
@@ -1320,19 +962,32 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
                 - a dictionary with any model-specific outputs
         """
         x, extra = self.extract_features(
-            prev_output_tokens,
+            prev_output_tokens, tgt_tok_bounds, sort_order,
             encoder_out=encoder_out,
             incremental_state=incremental_state,
             alignment_layer=alignment_layer,
             alignment_heads=alignment_heads,
         )
-        if not features_only:
-            x = self.output_layer(x)
-        return x, extra
 
-    def extract_features(
+        hidden_states = x[0]
+        x_tk = x[0]
+        x_ch = x[1] if x[1] is not None else None
+
+        if not features_only:
+            x_tk = self.output_layer(x[0])
+            if x[1] is not None:
+                x_ch = self.output_layer(x[1])
+
+        '''print(' TarcTransformerDecoder, forward passed:')
+        print('   * output shape: {}'.format(x_tk.size()))
+        print('   * hidden states shape: {}'.format(hidden_states.size()))
+        sys.stdout.flush()'''
+
+        return (x_tk, x_ch), {'extra': extra, 'hidden': hidden_states}
+
+    def extract_features_layers(
         self,
-        prev_output_tokens,
+        prev_output_tokens, tgt_tok_bounds, sort_order,
         encoder_out: Optional[EncoderOut] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         full_context_alignment: bool = False,
@@ -1359,31 +1014,61 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
                 - a dictionary with any model-specific outputs
         """ 
 
+        #print(' TarcTransformerDecoder, extracting features from layers...')
+        #sys.stdout.flush() 
+
+        toks_prev_output, char_prev_output = prev_output_tokens
+        toks_sort_order, char_sort_order = sort_order
+        padding_flag = toks_prev_output[0,0].item() == self.dictionary.eos()
+
         if alignment_layer is None:
             alignment_layer = self.num_layers - 1
 
         # embed positions
-        positions = (
+        toks_positions = (
             self.embed_positions(
-                prev_output_tokens, incremental_state=incremental_state
+                toks_prev_output, incremental_state=incremental_state
             )
             if self.embed_positions is not None
             else None
         )
+        char_positions = (
+            self.embed_positions(
+                char_prev_output, incremental_state=incremental_state
+            )
+            if self.embed_positions is not None and self.token_sequences and self.char_sequences
+            else None
+        )
 
         if incremental_state is not None:
-            prev_output_tokens = prev_output_tokens[:, -1:]
-            if positions is not None:
-                positions = positions[:, -1:]
+            #prev_output_tokens = prev_output_tokens[:, -1:]
+            toks_prev_output = toks_prev_output[:, -1:]
+            if toks_positions is not None:
+                toks_positions = toks_positions[:, -1:]
+            char_prev_output = get_chars_from_tokens_(toks_prev_output, self.token2components_map, self.dictionary) if (self.token_sequences and self.char_sequences) else char_prev_output[:,-1:]
+            if char_positions is not None:
+                char_positions = char_positions[:, -1:]
 
+        double_signal_flag = self.double_learning and self.merge_flag and self.token_sequences and self.char_sequences
+        #tk_bsz, tk_seqlen = toks_prev_output.size()
+        #ch_bsz, ch_seqlen = char_prev_output.size()
+
+        #bsz = tk_bsz
+        #seqlen = tk_seqlen
+ 
         # embed tokens and positions
-        x = self.embed_scale * self.embed_tokens(prev_output_tokens)
+        x = self.embed_scale * self.embed_tokens(toks_prev_output)
+
+        '''print(' TarcTransformerDecoder, input embedded:')
+        print('   * input shape: {}'.format(toks_prev_output.size()))
+        print('   * embedding shape: {}'.format(x.size()))
+        sys.stdout.flush()'''
 
         if self.project_in_dim is not None:
             x = self.project_in_dim(x)
 
-        if positions is not None:
-            x += positions
+        if toks_positions is not None:
+            x += toks_positions
 
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
@@ -1391,11 +1076,58 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         # B x T x C -> T x B x C
-        x = x.transpose(0, 1) 
+        x = x.transpose(0, 1)
+        T, B, C = x.size()
+
+        if self.merge_flag and self.token_sequences and self.char_sequences: 
+            offset = 0
+            if padding_flag and incremental_state is None:
+                offset = 2
+                assert toks_prev_output[0,0].item() == self.dictionary.eos()
+                assert toks_prev_output[0,1].item() == self.dictionary.bos()
+                assert char_prev_output[0,0].item() == self.dictionary.eos()
+                assert char_prev_output[0,1].item() == self.dictionary.bos()
+
+            if incremental_state is None:
+                y = self.embed_tokens(char_prev_output)
+                y = F.dropout(y, p=self.dropout_in, training=self.training)
+                y = y.transpose(0, 1) 
+                toks_from_chars = char2token_features_(y, [T, B, C], tgt_tok_bounds, toks_sort_order, offset)
+            else:
+                toks_from_chars = self.get_token_from_chars_(toks_prev_output, self.embed_tokens)
+            xx = torch.zeros_like(x).copy_(x)
+            xx[offset:T,:,:] = toks_from_chars # NOTE: anything else than toks_from_chars should be padding, or bos or eos
+
+            x = torch.cat( [x, xx], -1 )
+        elif self.token_sequences and self.char_sequences:
+            x = torch.cat( [x, torch.zeros_like(x)], -1)
 
         self_attn_padding_mask: Optional[Tensor] = None
-        if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
-            self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
+        if self.cross_self_attention or toks_prev_output.eq(self.padding_idx).any():
+            self_attn_padding_mask = toks_prev_output.eq(self.padding_idx)
+
+        #print(' TarcTransformerDecoder, final input x computed: {}'.format(x.size()))
+        #sys.stdout.flush() 
+
+        outs = []
+        ch_outs = []
+        for i in range(self.num_cross_attentions):
+            outs.append([])
+            ch_outs.append([])
+        tc_hiddens = []
+
+        if _DEBUG_:
+            print('[DEBUG] TarcTransformerDecoder, encoder_out length: {}'.format(len(encoder_out)))
+            for e in encoder_out:
+                print('[DEBUG]    * TarcTransformerDecoder, encoder_out element type: {}'.format(type(e)))
+                if isinstance(e, list):
+                    print('[DEBUG]    * TarcTransformerDecoder, detected list type:')
+                    for ee in e:
+                        if ee is not None:
+                            print('[DEBUG]    * TracTransformerDecoder: {}'.format(ee.size()))
+                        else:
+                            print('[DEBUG]    * TarcTransformerDecoder: {}'.format(ee))
+            sys.stdout.flush()
 
         # decoder layers
         attn: Optional[Tensor] = None
@@ -1415,18 +1147,29 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
             else:
                 self_attn_mask = None 
 
+            '''print(' TarcTransformerDecoder, values computed: {}'.format(encoder_state.size()))
+            if self_attn_mask is not None:
+                print('    self attention future mask computed')
+            sys.stdout.flush()'''
+
             trans_layer_input = [encoder_state]
+            trans_layer_mask = [encoder_out[0].encoder_padding_mask]
             for i_idx in range(1,len(encoder_out)):
                 trans_layer_input.append( encoder_out[i_idx].encoder_out )  # TODO: add modifications in order to be able to give encoder_states also here
+                trans_layer_mask.append( encoder_out[i_idx].encoder_padding_mask )
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = torch.empty(1).uniform_()
+
+            '''print(' TarcTransformerDecoder, all values computed: {} value sets'.format(len(trans_layer_input)))
+            if dropout_probability > self.decoder_layerdrop:
+                print('   possibly dropping decoder layer ({}, {})'.format(dropout_probability, self.decoder_layerdrop))
+            sys.stdout.flush()'''
+
             if not self.training or (dropout_probability > self.decoder_layerdrop):
                 x, layer_attn, _ = layer(
                     x,
                     trans_layer_input,
-                    encoder_out[0].encoder_padding_mask
-                    if encoder_out[0] is not None
-                    else None,
+                    trans_layer_mask, #encoder_out[0].encoder_padding_mask if encoder_out[0] is not None else None,  # TODO: this may possibly be wrong, we are masking all previous decoder outputs with the encoder padding mask.
                     incremental_state,
                     self_attn_mask=self_attn_mask,
                     self_attn_padding_mask=self_attn_padding_mask,
@@ -1436,6 +1179,9 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
                 inner_states.append(x)
                 if layer_attn is not None and idx == alignment_layer:
                     attn = layer_attn.float().to(x)
+
+        #print(' TarcTransformerDecoder, layers computation passed')
+        #sys.stdout.flush() 
 
         if attn is not None:
             if alignment_heads is not None:
@@ -1447,13 +1193,70 @@ class TarcTransformerDecoder(FairseqIncrementalDecoder):
         if self.layer_norm is not None:
             x = self.layer_norm(x)
 
+        # TODO: RESTART WORKING FROM HERE!
+        xx = None
+        if double_signal_flag:
+            raise NotImplementedError
+
         # T x B x C -> B x T x C
-        x = x.transpose(0, 1) 
+        x = x.transpose(0, 1)
+        if xx is not None:
+            xx = xx.transpose(0, 1)
 
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
+            if xx is not None:
+                xx = self.project_out_dim(xx)
 
-        return x, {"attn": [attn], "inner_states": inner_states, 'hidden' : x}
+        #print(' TarcTransformerDecoder, extrated features from layers, output shape: {}'.format(x.size()))
+        #sys.stdout.flush() 
+
+        return (x, xx), {"attn": [attn], "inner_states": inner_states}
+
+    def extract_features(
+        self,
+        prev_output_tokens, tgt_tok_bounds, sort_order,
+        encoder_out: Optional[EncoderOut] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        full_context_alignment: bool = False,
+        alignment_layer: Optional[int] = None,
+        alignment_heads: Optional[int] = None,
+    ): 
+        """
+        Similar to *forward* but only return features.
+        """ 
+
+        #print(' TarcTransformerDecoder, extracting features...')
+        #sys.stdout.flush()
+
+        toks_prev_output_tokens, char_prev_output_tokens = prev_output_tokens
+        toks_sort_order, char_sort_order = sort_order
+
+        if self.token_sequences and self.char_sequences:
+            #print(' TarcTransformerDecoder, extracting features from tokens and characters...')
+            #sys.stdout.flush()
+
+            x, attn_scores = self.extract_features_layers([toks_prev_output_tokens, char_prev_output_tokens], tgt_tok_bounds, sort_order,
+                    encoder_out=encoder_out, incremental_state=incremental_state, full_context_alignment=full_context_alignment, alignment_layer=alignment_layer, alignment_heads=alignment_heads)
+        elif self.token_sequences:
+            #print(' TarcTransformerDecoder, extracting features from tokens...')
+            #sys.stdout.flush()
+
+            x, attn_scores = self.extract_features_layers([toks_prev_output_tokens, toks_prev_output_tokens], tgt_tok_bounds, sort_order,
+                    encoder_out=encoder_out, incremental_state=incremental_state, full_context_alignment=full_context_alignment, alignment_layer=alignment_layer, alignment_heads=alignment_heads)
+        elif self.char_sequences:
+            #print(' TarcTransformerDecoder, extracting features from characters...')
+            #sys.stdout.flush()
+
+            x, attn_scores = self.extract_features_layers([char_prev_output_tokens, char_prev_output_tokens], tgt_tok_bounds, sort_order,
+                    encoder_out=encoder_out, incremental_state=incremental_state, full_context_alignment=full_context_alignment, alignment_layer=alignment_layer, alignment_heads=alignment_heads)
+        else:
+            raise ValueError('At least one between character and token sequences must be processed ({}, {})'.format(self.token_sequences, self.char_sequences))
+
+        #print(' TarcTransformerDecoder, features extracted, shape: {}'.format(x[0].size()))
+        #sys.stdout.flush()
+
+        return x, attn_scores
 
     def output_layer(self, features):
         """Project features to the vocabulary size."""

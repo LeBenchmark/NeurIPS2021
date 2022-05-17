@@ -490,7 +490,6 @@ def load_pretrained_component_from_model(
     component.load_state_dict(component_state_dict, strict=True)
     return component
 
-
 def verify_checkpoint_directory(save_dir: str) -> None:
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
