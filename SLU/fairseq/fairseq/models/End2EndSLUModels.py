@@ -12,7 +12,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from fairseq.globals import *
-from fairseq import utils, init_functions
+from fairseq import utils, slu_init_functions
 from fairseq import checkpoint_utils, options, utils
 from fairseq.models import (
     FairseqEncoder,
@@ -22,10 +22,7 @@ from fairseq.models import (
     register_model_architecture, 
 )
 
-#from fairseq.models.slu_models import BasicEncoder, BasicSpeechEncoder, BasicSpeechSeqEncoder, BasicSpeechBiseqEncoder, MLSpeechEncoder, MLSpeechSeqEncoder, SLUSimpleDecoder, SLUBiDecoder
-
 from fairseq.models.transformer import TransformerModel, base_architecture as trans_ba
-#from fairseq.models.ctc_transformer import CTCTransformerDecoder
 from fairseq.models.lstm import LSTMModel, LSTMDecoder, base_architecture as lstm_ba
 
 # Importing for compatibilities with the Transformer model
@@ -50,7 +47,7 @@ class Conv1dNormWrapper(nn.Module):
         super(Conv1dNormWrapper,self).__init__()
 
         #self.cNorm = nn.LayerNorm(input_size)
-        self.conv = init_functions.LSTMConv1d(input_size, output_size, kernel, stride=stride_factor)
+        self.conv = slu_init_functions.LSTMConv1d(input_size, output_size, kernel, stride=stride_factor)
         self.cNorm = nn.LayerNorm( output_size )
     
     def forward(self, input):
@@ -79,17 +76,17 @@ class LSTMWrapper(nn.Module):
         #print(' *** LSTMWrapper, adding LSTM of size: {} x {}'.format(input_size, output_size))
         #sys.stdout.flush()
 
-        self.lstm = init_functions.LSTM(input_size, output_size, bidirectional=bidirFlag)
+        self.lstm = slu_init_functions.LSTM(input_size, output_size, bidirectional=bidirFlag)
         norm_size = output_size * 2 if bidirFlag else output_size
         self.lstm_norm = nn.LayerNorm(norm_size)
 
         self.fc1 = None
-        '''init_functions.LSTMLinear(input_size, 4*output_size) if input_size == output_size and bidirFlag else None
-        self.fc2 = init_functions.LSTMLinear(4*output_size, 2*output_size) if input_size == output_size and bidirFlag else None'''
+        '''slu_init_functions.LSTMLinear(input_size, 4*output_size) if input_size == output_size and bidirFlag else None
+        self.fc2 = slu_init_functions.LSTMLinear(4*output_size, 2*output_size) if input_size == output_size and bidirFlag else None'''
 
         self.fc3 = None
-        '''init_functions.LSTMLinear(2*output_size, 4*output_size) if input_size // 2 == output_size and bidirFlag else None
-        self.fc4 = init_functions.LSTMLinear(4*output_size, 2*output_size) if input_size // 2 == output_size and bidirFlag else None'''
+        '''slu_init_functions.LSTMLinear(2*output_size, 4*output_size) if input_size // 2 == output_size and bidirFlag else None
+        self.fc4 = slu_init_functions.LSTMLinear(4*output_size, 2*output_size) if input_size // 2 == output_size and bidirFlag else None'''
 
         class BogusClass :
             name = 'BogusClass'
@@ -147,8 +144,8 @@ class FFNN(nn.Module):
 
         self.dropout_ratio = dropout_ratio
         self.activation_fn = utils.get_activation_fn('relu')
-        self.fc1 = init_functions.LSTMLinear(input_size, 2*output_size)
-        self.fc2 = init_functions.LSTMLinear(2*output_size, output_size)
+        self.fc1 = slu_init_functions.LSTMLinear(input_size, 2*output_size)
+        self.fc2 = slu_init_functions.LSTMLinear(2*output_size, output_size)
 
     def forward(self, x):
 
@@ -162,8 +159,8 @@ class SLUAttentionLayer(nn.Module):
     def __init__(self, input_embed_dim, source_embed_dim, output_embed_dim, bias=False):
         super().__init__()
 
-        self.input_proj = init_functions.LSTMLinear(input_embed_dim, source_embed_dim, bias=bias)
-        self.output_proj = init_functions.LSTMLinear(input_embed_dim + source_embed_dim, output_embed_dim, bias=bias)
+        self.input_proj = slu_init_functions.LSTMLinear(input_embed_dim, source_embed_dim, bias=bias)
+        self.output_proj = slu_init_functions.LSTMLinear(input_embed_dim + source_embed_dim, output_embed_dim, bias=bias)
 
     def forward(self, input, source_hids, encoder_padding_mask):
         # input: bsz x input_embed_dim
@@ -218,7 +215,7 @@ class PyramidalRNNEncoder(nn.Module):
             else:
                 nlayers = self.kheops_ptop_height
  
-            self.layers.append( init_functions.LSTM(input_size, self.params.speech_lstm_size, num_layers=nlayers, bidirectional=bidirectional) ) # TODO: Try adding in LSTM constructor dropout=self.params.drop_ratio
+            self.layers.append( slu_init_functions.LSTM(input_size, self.params.speech_lstm_size, num_layers=nlayers, bidirectional=bidirectional) ) # TODO: Try adding in LSTM constructor dropout=self.params.drop_ratio
             self.norms.append( nn.LayerNorm( 2*self.params.speech_lstm_size ) )
 
         self.encoder_output_units = self.params.speech_lstm_size
@@ -286,7 +283,7 @@ class DeepSpeechLikeEncoder(nn.Module):
         self.convolutions = nn.Sequential( OrderedDict(conv_layers) )
 
         lstm_size = 2*self.params.speech_lstm_size
-        #self.conv2lstm = init_functions.LSTMLinear(self.params.speech_conv_size, lstm_size, bias=False)
+        #self.conv2lstm = slu_init_functions.LSTMLinear(self.params.speech_conv_size, lstm_size, bias=False)
 
         # 2. Recurrent layers
         recurrent_layers = [] 
@@ -300,7 +297,7 @@ class DeepSpeechLikeEncoder(nn.Module):
         self.rnns = nn.Sequential( OrderedDict(recurrent_layers) )
             
         #Linear Layer
-        #self.linear_layer = init_functions.LSTMLinear(2*self.params.speech_lstm_size, self.params.output_size)
+        #self.linear_layer = slu_init_functions.LSTMLinear(2*self.params.speech_lstm_size, self.params.output_size)
 
         self.encoder_output_units = self.params.speech_lstm_size
         if bidirectional:
@@ -354,7 +351,7 @@ class End2EndSLUEncoder(FairseqEncoder):
         self.speakers = None
 
         # NEW ARCHITECTURE FOR COMBINED LOSS
-        #self.output_projection = init_functions.LSTMLinear(args.encoder_hidden_dim*2, len(dictionary))
+        #self.output_projection = slu_init_functions.LSTMLinear(args.encoder_hidden_dim*2, len(dictionary))
         #self.output_norm = nn.LayerNorm(len(dictionary))
 
     def set_turn_speaker(self, val):
@@ -539,7 +536,7 @@ class BasicDecoder(FairseqIncrementalDecoder):
         #self.input_norm = nn.LayerNorm(hidden_dim)
 
         # NEW ARCHITECTURE FOR COMBINED LOSS: these components have been moved in the encoder
-        self.output_projection = init_functions.LSTMLinear(hidden_dim, len(dictionary))
+        self.output_projection = slu_init_functions.LSTMLinear(hidden_dim, len(dictionary))
         self.output_norm = nn.LayerNorm(len(dictionary))
 
     def set_turn_speaker(self, val):
@@ -612,7 +609,7 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
         if embeddings is not None:
             self.dec_embeddings = embeddings
         else:
-            self.dec_embeddings = init_functions.LSTMEmbedding(
+            self.dec_embeddings = slu_init_functions.LSTMEmbedding(
                 num_embeddings=len(dictionary),
                 embedding_dim=args.decoder_embed_dim,
                 padding_idx=dictionary.pad(),
@@ -622,12 +619,12 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
 
         mapping_size = args.decoder_embed_dim + args.decoder_hidden_dim
         if mapping_size != args.decoder_hidden_dim:
-            self.input_map = init_functions.LSTMLinear(mapping_size, args.decoder_hidden_dim, bias=False) 
+            self.input_map = slu_init_functions.LSTMLinear(mapping_size, args.decoder_hidden_dim, bias=False) 
         else:
             self.input_map = None
         if self.encoder_output_size != args.decoder_hidden_dim:
-            self.input_map_h = init_functions.LSTMLinear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
-            self.input_map_c = init_functions.LSTMLinear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
+            self.input_map_h = slu_init_functions.LSTMLinear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
+            self.input_map_c = slu_init_functions.LSTMLinear(self.encoder_output_size, args.decoder_hidden_dim, bias=False)
         else:
             self.input_map_h = None
             self.input_map_c = None
@@ -637,7 +634,7 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
         self.dropout = nn.Dropout(p=args.dropout)
 
         self.layers = nn.ModuleList([
-            init_functions.LSTMCell(
+            slu_init_functions.LSTMCell(
                 input_size=args.decoder_hidden_dim,
                 hidden_size=args.decoder_hidden_dim,
             )
@@ -655,13 +652,13 @@ class ICASSPDecoder(FairseqIncrementalDecoder):
         self.outs_norm = nn.LayerNorm(args.decoder_hidden_dim)
 
         # Linear layers to gate attention vectors and hidden state (instead of just using attention vectors)
-        self.att_gate_x = init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
-        self.att_gate_y = init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
+        self.att_gate_x = slu_init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
+        self.att_gate_y = slu_init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_hidden_dim, bias=False)
 
         if args.decoder_hidden_dim != args.decoder_embed_dim:
-            self.additional_fc = init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_embed_dim)
+            self.additional_fc = slu_init_functions.LSTMLinear(args.decoder_hidden_dim, args.decoder_embed_dim)
         if not self.share_input_output_embed:
-            self.fc_out = init_functions.LSTMLinear(args.decoder_embed_dim, len(dictionary), dropout=args.dropout)
+            self.fc_out = slu_init_functions.LSTMLinear(args.decoder_embed_dim, len(dictionary), dropout=args.dropout)
 
         self.speaker = None
 
@@ -891,14 +888,14 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
         if pretrained_embed is None:
-            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+            self.embed_tokens = slu_init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
         else:
             self.embed_tokens = pretrained_embed
 
         self.encoder_output_units = encoder_output_units
         if encoder_output_units != hidden_size and encoder_output_units != 0:
-            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
-            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_hidden_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
         else:
             self.encoder_hidden_proj = self.encoder_cell_proj = None
 
@@ -911,7 +908,7 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         self.lstm_flag = True
         if self.lstm_flag:
             self.layers = nn.ModuleList([
-                init_functions.LSTMCell(
+                slu_init_functions.LSTMCell(
                     input_size=input_feed_size + embed_dim if layer == 0 else hidden_size,
                     hidden_size=hidden_size,
                 )
@@ -934,13 +931,13 @@ class ICASSPDecoderEx(FairseqIncrementalDecoder):
         else:
             self.attention = None
         if hidden_size != out_embed_dim:
-            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
+            self.additional_fc = slu_init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
             # setting adaptive_softmax dropout to dropout_out for now but can be redefined
             self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
                                                     dropout=dropout_out)
         elif not self.share_input_output_embed:
-            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
+            self.fc_out = slu_init_functions.LSTMLinear(out_embed_dim, num_embeddings)
 
         self.speaker = None
 
@@ -1339,7 +1336,7 @@ class End2EndSLUDecoder(FairseqIncrementalDecoder):
     ):
         super().__init__(dictionary)
 
-        self.embed_tokens = init_functions.LSTMEmbedding(len(dictionary), embed_dim, padding_idx=dictionary.pad())
+        self.embed_tokens = slu_init_functions.LSTMEmbedding(len(dictionary), embed_dim, padding_idx=dictionary.pad())
 
         self.decoder_layers = num_layers
         self.boundary_decoder = ICASSPDecoderEx(
@@ -1610,14 +1607,14 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
         if pretrained_embed is None:
-            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+            self.embed_tokens = slu_init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
         else:
             self.embed_tokens = pretrained_embed
 
         self.encoder_output_units = encoder_output_units
         if encoder_output_units != hidden_size and encoder_output_units != 0:
-            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
-            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_hidden_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
         else:
             self.encoder_hidden_proj = self.encoder_cell_proj = None
 
@@ -1627,7 +1624,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         # input feeding is described in arxiv.org/abs/1508.04025
         input_feed_size = 0 if encoder_output_units == 0 else hidden_size
         self.layers = nn.ModuleList([
-            init_functions.LSTMCell(
+            slu_init_functions.LSTMCell(
                 input_size=input_feed_size + embed_dim if layer == 0 else hidden_size,
                 hidden_size=hidden_size,
             )
@@ -1639,13 +1636,13 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         else:
             self.attention = None
         if hidden_size != out_embed_dim:
-            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
+            self.additional_fc = slu_init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
             # setting adaptive_softmax dropout to dropout_out for now but can be redefined
             self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
                                                     dropout=dropout_out)
         elif not self.share_input_output_embed:
-            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
+            self.fc_out = slu_init_functions.LSTMLinear(out_embed_dim, num_embeddings)
 
         self.speaker = None
 
@@ -2006,14 +2003,14 @@ class DraftLSTMDecoder(FairseqIncrementalDecoder):
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
         if pretrained_embed is None:
-            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+            self.embed_tokens = slu_init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
         else:
             self.embed_tokens = pretrained_embed
 
         self.encoder_output_units = encoder_output_units
         if encoder_output_units != hidden_size and encoder_output_units != 0:
-            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
-            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_hidden_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
         else:
             self.encoder_hidden_proj = self.encoder_cell_proj = None
 
@@ -2023,7 +2020,7 @@ class DraftLSTMDecoder(FairseqIncrementalDecoder):
         # input feeding is described in arxiv.org/abs/1508.04025
         input_feed_size = 0 if encoder_output_units == 0 else hidden_size
         self.layers = nn.ModuleList([
-            init_functions.LSTMCell(
+            slu_init_functions.LSTMCell(
                 input_size=input_feed_size + embed_dim if layer == 0 else hidden_size,
                 hidden_size=hidden_size,
             )
@@ -2035,13 +2032,13 @@ class DraftLSTMDecoder(FairseqIncrementalDecoder):
         else:
             self.attention = None
         if hidden_size != out_embed_dim:
-            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
+            self.additional_fc = slu_init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
             # setting adaptive_softmax dropout to dropout_out for now but can be redefined
             self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
                                                     dropout=dropout_out)
         elif not self.share_input_output_embed:
-            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
+            self.fc_out = slu_init_functions.LSTMLinear(out_embed_dim, num_embeddings)
 
         self.speaker = None
 
@@ -2446,14 +2443,14 @@ class DeliberationLSTMDecoder(FairseqIncrementalDecoder):
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
         if pretrained_embed is None:
-            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+            self.embed_tokens = slu_init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
         else:
             self.embed_tokens = pretrained_embed
 
         self.encoder_output_units = encoder_output_units
         if encoder_output_units != hidden_size and encoder_output_units != 0:
-            self.encoder_hidden_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
-            self.encoder_cell_proj = init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_hidden_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
+            self.encoder_cell_proj = slu_init_functions.LSTMLinear(encoder_output_units, hidden_size)
         else:
             self.encoder_hidden_proj = self.encoder_cell_proj = None
 
@@ -2463,7 +2460,7 @@ class DeliberationLSTMDecoder(FairseqIncrementalDecoder):
         # input feeding is described in arxiv.org/abs/1508.04025
         input_feed_size = 0 if encoder_output_units == 0 else hidden_size
         self.layers = nn.ModuleList([
-            init_functions.LSTMCell(
+            slu_init_functions.LSTMCell(
                 input_size=input_feed_size + embed_dim + hidden_size if layer == 0 else hidden_size,
                 hidden_size=hidden_size,
             )
@@ -2475,13 +2472,13 @@ class DeliberationLSTMDecoder(FairseqIncrementalDecoder):
         else:
             self.attention = None
         if hidden_size != out_embed_dim:
-            self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
+            self.additional_fc = slu_init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
             # setting adaptive_softmax dropout to dropout_out for now but can be redefined
             self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, hidden_size, adaptive_softmax_cutoff,
                                                     dropout=dropout_out)
         elif not self.share_input_output_embed:
-            self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
+            self.fc_out = slu_init_functions.LSTMLinear(out_embed_dim, num_embeddings)
 
         self.speaker = None
 
@@ -3075,7 +3072,7 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         num_embeddings = len(dictionary)
         padding_idx = dictionary.pad()
         
-        emb = init_functions.LSTMEmbedding(num_embeddings, embed_dim, padding_idx)
+        emb = slu_init_functions.LSTMEmbedding(num_embeddings, embed_dim, padding_idx)
         # if provided, load from preloaded dictionaries
         if path:
             embed_dict = utils.parse_embedding(path)
