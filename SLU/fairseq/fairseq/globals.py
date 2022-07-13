@@ -9,6 +9,11 @@ pad_token = '_'
 pad_char = pad_token
 EOS_tag = 'EOS'
 unk_token = '<unk>'
+
+start_token = '<SOT>'
+end_token = '<EOT>'
+seq_separator = '_SEQ_SEP_'
+void_concept = 'null'
 machine_semantic = 'MachineSemantic'
 slu_start_concept_mark = '_SOC_'
 slu_end_concept_mark = '_EOC_'
@@ -16,6 +21,11 @@ tok_separator = '|'
 user_ID = 'User'
 machine_ID = 'Machine'
 bogus_ID = '_Bogus_'
+bogus_token = bogus_ID
+EOD_tag = '_EOD_'
+EOD_value = -3.141592
+
+slu_special_symbols = ['ã', ' ', machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, user_ID, machine_ID, bogus_ID, EOD_tag, start_token, end_token, seq_separator]  # The first is in MEDIA files not correctly encoded in utf-8. The second (space) is to keep MEDIA character-level encoding.
 
 LOSS_INIT_VALUE=999999.9
 ER_INIT_VALUE=LOSS_INIT_VALUE

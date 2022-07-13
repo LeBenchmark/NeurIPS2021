@@ -95,7 +95,9 @@ class SLUBaseCTCCriterion(FairseqCriterion):
         self.task = task
         self.args = args
         self.dictionary = task.target_dictionary
-        self.end_concept = self.dictionary.add_symbol(slu_end_concept_mark)
+        self.end_concept = self.dictionary.index(slu_end_concept_mark)
+        if self.end_concept == self.dictionary.unk():
+            raise ValueError('End concept symbol {} is expected to be defined in the dictionary'.format(slu_end_concept_mark))
 
         if args.slu_end2end:
             #self.aux_loss = CrossEntropyCriterion(task, False)

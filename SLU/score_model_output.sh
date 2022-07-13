@@ -1,8 +1,9 @@
 #!/bin/bash
 
-DECORE0_ID="_decore0"
-source ${HOME}/work/tools/venv_python3.7.2_torch1.4${DECORE0_ID}/bin/activate
-script_path=${HOME}/work/tools/fairseq_tools/end2end_slu/scripts/
+source ${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/activate 
+export FAIRSEQ_PATH=${HOME}/work/tools/venv_python3.7.2_torch1.4_decore0/bin/
+export PYTHONPATH=${PYTHONPATH}:${HOME}/work/tools/fairseq/
+script_path=/home/getalp/dinarelm/work/tools/fairseq_tools/end2end_slu/scripts/
 
 model_output=$1
 aux_opt=""

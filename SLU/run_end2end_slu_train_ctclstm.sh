@@ -15,16 +15,16 @@ echo "Using python: `which python`"
 echo " ---"
 
 # -----------------
-XP_HEAD='IS2022'
-FEATURES_HEAD='MEDIA'
+XP_HEAD='TowardDialogLevel'
+FEATURES_HEAD='MEDIA-NewMachineTurns'
 FEATURES_TYPE='FlowBERT'	# Use 'spectro', 'normspectro' or 'W2V' or 'W2V2' or 'FlowBERT' or 'FlowBBERT' ... see below
-FEATURES_SPEC='-7kl-tokSLU'		# Choose a meaningful infix to add into file names, you can leave it empty for spectrograms (*-spg)
-FEATURES_EXTN='.foo'	# Feature file extension, e.g. '.20.0ms-spg', '.bert-3kb', '.bert-3kl', '.bert-3klt', ...
+FEATURES_SPEC='-w2v2-fr-14kl-sb-2'		# Choose a meaningful infix to add into file names, you can leave it empty for spectrograms (*-spg)
+FEATURES_EXTN='.w2v2-fr-14kl-sb-2'	# Feature file extension, e.g. '.20.0ms-spg', '.bert-3kb', '.bert-3kl', '.bert-3klt', ...
 FEATURES_LANG='Fr'		# Use 'Fr' or 'En' ('En' only with 'W2V')
 NORMFLAG='Normalized'
 SUBTASK='concept'
 CORPUS='media'
-THEME='1Step-tokSLU-SpkMarkEx-OldInit-SLUAtt'	# No infix: Encoder+Decoder; 'PartDec': Encoder + Decoder embeddings and projection; 'NoDec': Encoder only 
+THEME='1Step-W2V2-14kl-SB-2'	# No infix: Encoder+Decoder; 'PartDec': Encoder + Decoder embeddings and projection; 'NoDec': Encoder only 
 # -----------------
 
 WORK_PATH=/home/getalp/dinarelm/work/tools/fairseq_tools/end2end_slu/
@@ -35,7 +35,7 @@ DATA_PATH=${HOME}/work/data/MEDIA-Original/semantic_speech_aligned_corpus/Dialog
 SERIALIZED_CORPUS=${WORK_PATH}/system_features/${FEATURES_HEAD}.user+machine.${FEATURES_TYPE}${FEATURES_SPEC}-${FEATURES_LANG}-${NORMFLAG}.data
 
 # LSTMs in the encoder are bi-directional, thus the decoder size must be twice the size of the encoder
-enc_type='deep-speech'
+enc_type='ziggurat'
 encoder_size=256
 decoder_size=$((${encoder_size}))
 ENC_FFN_DIM=$((${decoder_size}*4))
@@ -44,7 +44,7 @@ conv_desc=""
 if [[ ${enc_type} == 'deep-speech' ]]; then
 	conv_desc="${NCONV}Convx"
 fi
-NLSTM=2
+NLSTM=3
 ATT_HEADS=8
 DLAYERS=2
 DROP_RATIO=0.35
@@ -102,30 +102,22 @@ fi
 
 ANNEAL=1
 wu_epochs=4
-nbatches=5393
-wu_updates=$((${wu_epochs}*${nbatches}))	# Batch 5: MEDIA 5393, FSC 4627, PortMEDIA 2690, MEDIA+PortMEDIA 9275; Batch 10: MEDIA+PortMEDIA 5797
+curriculum=1
+ctx_fusion='sum'
+nbatches=5614	# Batch 5: MEDIA user turns only: 2758; MEDIA normalized for dialog-level SLU: 5614
+wu_updates=$((${wu_epochs}*${nbatches}))	# Batch 5: MEDIA 5394, FSC 4627, PortMEDIA 2690, MEDIA+PortMEDIA 9275; Batch 10: MEDIA+PortMEDIA 5797
 warmup_opt="--warmup-updates ${wu_updates}"
-SAVE_PATH=${XP_HEAD}_${FEATURES_HEAD}_${FEATURES_TYPE}${FEATURES_SPEC}-${FEATURES_LANG}_${NLSTM}x${conv_desc}Enc-${enc_type}-H${encoder_size}-${DLAYERS}xDec-${DECODER}-${SUBTASK}-H${decoder_size}-Drop-Enc${DROP_RATIO}-Dec${TRANS_DROP_RATIO}_BATCH${BATCH}_LR${LR}_WU${wu_updates}_${CRITERION}${LABEL_SMOOTH}_${THEME}_TEST/
+SAVE_PATH=${XP_HEAD}_${FEATURES_HEAD}_${FEATURES_TYPE}${FEATURES_SPEC}-${FEATURES_LANG}_${NLSTM}x${conv_desc}Enc-${enc_type}-H${encoder_size}-${DLAYERS}xDec-${DECODER}-${SUBTASK}-H${decoder_size}-Drop-Enc${DROP_RATIO}-Dec${TRANS_DROP_RATIO}_BATCH${BATCH}_LR${LR}_WU${wu_updates}_${CRITERION}${LABEL_SMOOTH}_${THEME}_Curriculum${curriculum}_DialogLevel-Context6-Last6_TEST/
 if [[ $# -ge 2 ]]; then
 	SAVE_PATH=${2}_LR${LR}/
 fi
 
 reg_options="--clip-norm ${CLIP_NORM} --weight-decay ${WDECAY}"
 
-TL_PM_DICT='system_features/PortMEDIA.user+machine.FlowBERT-7kl-split-Fr-Normalized.data.dict'
-TL_PM_MODEL='TALN2022/experiments/PortMEDIA/TALN2022_PortMEDIA_FlowBERT-7kl-split-Fr_Ziggurat121-Dec-ctclstm-concept-H256-Drop-Enc0.35-Dec0.12_BATCH5_LR0.0005_WU10760_forAVG5_slu_ctc_loss_1Step_TEST/checkpoint.best5_avg.pt'
+AUX_OPTIONS="${AUX_OPTIONS}" # --dialog-level-slu --normalize-dialog-batches --use-dialog-history --context-fusion ${ctx_fusion} --context-size 6 --context-first-turns 0"
 
-TL_PM_SLU_DICT='system_features/PortMEDIA.user+machine.FlowBERT-7kl-tokSLU-Fr-Normalized.data.dict'
-TL_PM_SLU_MODEL='TALN2022_PortMEDIA_FlowBERT-7kl-tokSLU-Fr_Ziggurat3-2xDec-ctclstm-concept-H256-Drop-Enc0.35-Dec0.12_BATCH5_LR0.0005_WU10760_forAVG5_slu_ctc_loss0.001_1Step_TEST/checkpoint.best5_avg.pt'
-
-TL_MPM_DICT='system_features/MEDIA+PortMEDIA.user+machine.FlowBERT-7kl-split-Fr-Normalized.data.dict'
-TL_MPM_MODEL='TALN2022_MEDIA+PortMEDIA_FlowBERT-7kl-split-Fr_Ziggurat121-Dec-ctclstm-concept-H256-Drop-Enc0.35-Dec0.12_BATCH5_LR0.0005_WU37100_forAVG5_slu_ctc_loss0.001_1Step-MEDIA+PortMEDIA_TEST/checkpoint.best5_avg.pt'
-
-TL_MPM_SLU_DICT='system_features/MEDIA+PortMEDIA.user+machine.FlowBERT-7kl-tokSLU-Fr-Normalized.data.dict'
-TL_MPM_SLU_MODEL='TALN2022_MEDIA+PortMEDIA_FlowBERT-7kl-tokSLU-Fr_Ziggurat121-Dec-ctclstm-concept-H256-Drop-Enc0.35-Dec0.12_BATCH5_LR0.0005_WU37100_forAVG5_slu_ctc_loss0.001_1Step-MEDIA+PortMEDIA_TEST/checkpoint.best5_avg.pt'
-
-#TL_FSC_DICT='system_features/FSCLatest.user+machine.XLSR53-xlsr53-56k-En-Normalized.data.dict'
-#TL_FSC_MODEL='TALN2022/experiments/FSC/TALN2022_FSCLatest_XLSR53-xlsr53-56k-En_Ziggurat121-Dec-ctclstm-concept-H256-Drop-Enc0.25-Dec0.12_BATCH5_LR0.00025_WU9254_forAVG5_slu_ctc_loss_3Steps_TEST/checkpoint.best5_avg.pt'
+MEDIA_DICT=/home/getalp/dinarelm/work/tools/fairseq_tools/tarc_multitask_repo/tarc_exps/system_inputs/MEDIA-MultiTask-BILOU_NoConceptChunking-forMachineTurnAnnotationONLY.multi-task.data.tabular.vocab
+MEDIA_EMB=/home/getalp/dinarelm/work/tools/fairseq_tools/tarc_multitask_repo/tarc_exps/system_inputs/MEDIA-MultiTask-BILOU_NoConceptChunking-forMachineTurnAnnotationONLY.multi-task.data.tabular.emb
 
 #CUDA_VISIBLE_DEVICES=1
 PYTHONPATH=${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-train ${DATA_PATH} \
@@ -142,8 +134,6 @@ PYTHONPATH=${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-train ${DATA_PATH
 	--serialized-data ${SERIALIZED_CORPUS} --slu-subtask ${SUBTASK} \
 	--lr-scheduler fixed --lr ${LR} --force-anneal ${ANNEAL} --lr-shrink ${LR_SHRINK} ${warmup_opt} \
 	--optimizer adam ${reg_options} \
-	--max-sentences ${BATCH} --max-epoch ${MAX_EPOCHS} --curriculum 1 --keep-best-checkpoints 5 --keep-last-epochs 5
+	--max-sentences ${BATCH} --max-epoch ${MAX_EPOCHS} --curriculum ${curriculum} --keep-best-checkpoints 5
 
-#deactivate
-#conda deactivate
 

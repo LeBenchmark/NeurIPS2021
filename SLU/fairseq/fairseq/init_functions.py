@@ -42,6 +42,32 @@ def LSTMCell(input_size, hidden_size, **kwargs):
                     param.data.uniform_(-math.sqrt(3/hidden_size), math.sqrt(3/hidden_size))
     return m
 
+def SLULSTM(input_size, hidden_size, **kwargs):
+    m = nn.LSTM(input_size, hidden_size, **kwargs)  # NOTE: use this default initialization for SLU and as default
+    '''for name, param in m.named_parameters():
+        if 'weight' in name or 'bias' in name:
+            if not _XAVIER_INIT_:
+                param.data.uniform_(-0.1, 0.1)
+            else:
+                if len(param.data.size()) > 1:
+                    nn.init.xavier_uniform_(param)
+                else:
+                    param.data.uniform_(-math.sqrt(3/hidden_size), math.sqrt(3/hidden_size))'''
+    return m
+
+
+def SLULSTMCell(input_size, hidden_size, **kwargs):
+    m = nn.LSTMCell(input_size, hidden_size, **kwargs)  # NOTE: use this default initialization for SLU and as default
+    '''for name, param in m.named_parameters():
+        if 'weight' in name or 'bias' in name:
+            if not _XAVIER_INIT_:
+                param.data.uniform_(-0.1, 0.1)
+            else:
+                if len(param.data.size()) > 1:
+                    nn.init.xavier_uniform_(param)
+                else:
+                    param.data.uniform_(-math.sqrt(3/hidden_size), math.sqrt(3/hidden_size))'''
+    return m
 
 def LSTMLinear(in_features, out_features, bias=True, dropout=0):
     """Linear layer (input: N x T x C)"""

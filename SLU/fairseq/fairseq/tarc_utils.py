@@ -4,16 +4,22 @@ import torch
 import re
 import sys
 
+from fairseq.globals import *
+
 _DEBUG_ = False
 
-bos_token = '<bos>'
-pad_token = '<pad>'
-eos_token = '<eos>'
-unk_token = '<unk>'
-start_token = '<SOT>'
-end_token = '<EOT>'
-space_token = '|'
-separator_ = '_SEQ_SEP_'
+#bos_token = 'SOS'
+#pad_token = '_'
+#eos_token = 'EOS'
+#unk_token = '<unk>'
+#start_token = '<SOT>'
+#end_token = '<EOT>'
+#space_token = '|'
+#separator_ = '_SEQ_SEP_'
+bos_token = SOS_tag
+eos_token = EOS_tag
+space_token = tok_separator
+separator_ = seq_separator
 
 fillerFOR = 'فلارفور'
 fillerEMO = 'فلاريمو'

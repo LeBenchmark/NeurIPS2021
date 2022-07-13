@@ -304,8 +304,8 @@ class EpochBatchIterator(EpochBatchIterating):
                 batches, self.num_shards, self.shard_id, fill_value=[]
             ))
 
-        #print(' *** EpochBatchIterator, batch shuffle flag: {}'.format(shuffle_flag))
-        #sys.stdout.flush()
+        print('[DEBUG] EpochBatchIterator, batch shuffle flag: {}'.format(shuffle_flag))
+        sys.stdout.flush()
 
         if offset > 0 and offset >= len(batches):
             return None

@@ -7,17 +7,21 @@ import re
 import sys
 import torch
 import math
+import numpy as np
 
 from fairseq.globals import *
-from fairseq.data import Dictionary, End2EndSLUDataset
+from fairseq.data import Dictionary, End2EndSLUDataset, FairseqDataset, data_utils, iterators
 from fairseq.tasks import FairseqTask, register_task
+
+import typing
+from typing import List
 
 import examples.speech_recognition.criterions.SLU_CTC_loss as slu_ctc
 
 #from carbontracker.tracker import CarbonTracker
 from codecarbon import EmissionsTracker
 
-_ADVANCED_SPK_MARK_ = True
+_ADVANCED_SPK_MARK_ = False
 
 class SLUDictionary(Dictionary):
     """Dictionary wrapping to initialize a dictionary from a raw python dictionary"""
@@ -101,6 +105,348 @@ class SLUDictionary(Dictionary):
         self.blank_word = blank
         return self.add_symbol(blank)
 
+    def blank(self):
+        idx = self.index(self.blank_word)
+        if idx == self.unk():
+            raise ValueError('Blank symbol {} is not defined in the dictionary'.format(self.blank_word))
+        return idx
+
+def init_slu_dictionary(args) -> SLUDictionary:
+
+    slu_dict = SLUDictionary(
+        pad=pad_token,
+        eos=EOS_tag,
+        unk=unk_token,
+        bos=SOS_tag,
+        extra_special_symbols=slu_special_symbols
+    )
+
+    slu_dict.reset() 
+    slu_dict.set_blank(blank_token)
+    slu_dict.set_pad_(pad_token)
+    slu_dict.set_eos_(EOS_tag)
+    slu_dict.set_unk_(unk_token)
+    slu_dict.set_bos_(SOS_tag)
+
+    if hasattr(args, 'sequence_separator') and args.sequence_separator not in slu_special_symbols:
+        slu_special_symbols[slu_special_symbols.index(seq_separator)] = args.sequence_separator
+
+    for s in slu_special_symbols:
+        slu_dict.add_symbol(s) 
+    slu_dict.set_nspecial_()  # We set the tokens added so far as being special tokens.
+
+    return slu_dict
+
+class SLUEpochBatchIterator(iterators.EpochBatchIterating):
+    """Exactly the same as EpochBatchIterator in iterators.py, except it assumes indices returned by the dataset.ordered_indices method are organized dialog level when curriculum is not used.
+
+    Compared to :class:`torch.utils.data.DataLoader`, this iterator:
+
+    - can be reused across multiple epochs with the :func:`next_epoch_itr`
+      method (optionally shuffled between epochs)
+    - can be serialized/deserialized with the :func:`state_dict` and
+      :func:`load_state_dict` methods
+    - supports sharding with the *num_shards* and *shard_id* arguments
+
+    Args:
+        dataset (~torch.utils.data.Dataset): dataset from which to load the data
+        collate_fn (callable): merges a list of samples to form a mini-batch
+        batch_sampler (~torch.utils.data.Sampler): an iterator over batches of
+            indices
+        seed (int, optional): seed for random number generator for
+            reproducibility (default: 1).
+        num_shards (int, optional): shard the data iterator into N
+            shards (default: 1).
+        shard_id (int, optional): which shard of the data iterator to
+            return (default: 0).
+        num_workers (int, optional): how many subprocesses to use for data
+            loading. 0 means the data will be loaded in the main process
+            (default: 0).
+        epoch (int, optional): the epoch to start the iterator from
+            (default: 1).
+    """
+
+    def __init__(
+        self, dataset, dictionary, collate_fn, batch_sampler, seed=1, num_shards=1, shard_id=0,
+        num_workers=0, epoch=1, curriculum=0, dialog_level=False
+    ):
+        assert isinstance(dataset, torch.utils.data.Dataset)
+        self.dataset = dataset
+        self.dictionary = dictionary
+        self.collate_fn = collate_fn
+        self.frozen_batches = tuple(batch_sampler)
+        self.seed = seed
+        self.num_shards = num_shards
+        self.shard_id = shard_id
+        self.num_workers = num_workers
+
+        self.epoch = max(epoch, 1)  # we use 1-based indexing for epochs
+        self.shuffle = True
+        self._cur_epoch_itr = None
+        self._next_epoch_itr = None
+        self._supports_prefetch = getattr(dataset, 'supports_prefetch', False)
+
+        self.curriculum = curriculum
+        self.dialog_level = dialog_level
+
+    def __len__(self):
+        return len(self.frozen_batches)
+
+    @property
+    def next_epoch_idx(self):
+        """Return the epoch index after *next_epoch_itr* is called."""
+        if self._next_epoch_itr is not None:
+            return self.epoch
+        elif self._cur_epoch_itr is not None and self.end_of_epoch():
+            return self.epoch + 1
+        else:
+            return self.epoch
+
+    def next_epoch_itr(self, shuffle=True, fix_batches_to_gpus=False):
+        """Return a new iterator over the dataset.
+
+        Args:
+            shuffle (bool, optional): shuffle batches before returning the
+                iterator (default: True).
+            fix_batches_to_gpus: ensure that batches are always
+                allocated to the same shards across epochs. Requires
+                that :attr:`dataset` supports prefetching (default: False).
+        """
+        self.epoch = self.next_epoch_idx
+        if self._next_epoch_itr is not None:
+            self._cur_epoch_itr = self._next_epoch_itr
+            self._next_epoch_itr = None
+        else:
+            self._cur_epoch_itr = self._get_iterator_for_epoch(
+                self.epoch, shuffle, fix_batches_to_gpus=fix_batches_to_gpus,
+            )
+        self.dataset.set_epoch(self.epoch)
+        self.shuffle = shuffle
+        return self._cur_epoch_itr
+
+    def end_of_epoch(self) -> bool:
+        """Returns whether the most recent epoch iterator has been exhausted"""
+        return not self._cur_epoch_itr.has_next()
+
+    @property
+    def iterations_in_epoch(self):
+        """The number of consumed batches in the current epoch."""
+        if self._cur_epoch_itr is not None:
+            return self._cur_epoch_itr.count
+        elif self._next_epoch_itr is not None:
+            return self._next_epoch_itr.count
+        return 0
+
+    def state_dict(self):
+        """Returns a dictionary containing a whole state of the iterator."""
+        return {
+            'epoch': self.epoch,
+            'iterations_in_epoch': self.iterations_in_epoch,
+            'shuffle': self.shuffle,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Copies the state of the iterator from the given *state_dict*."""
+        self.epoch = state_dict['epoch']
+        itr_pos = state_dict.get('iterations_in_epoch', 0)
+        if itr_pos > 0:
+            # fast-forward epoch iterator
+            self._next_epoch_itr = self._get_iterator_for_epoch(
+                self.epoch,
+                shuffle=state_dict.get('shuffle', True),
+                offset=itr_pos,
+            )
+            if self._next_epoch_itr is None:
+                # we finished the epoch, increment epoch counter
+                self.epoch += 1
+
+    def _get_iterator_for_epoch(self, epoch, shuffle, fix_batches_to_gpus=False, offset=0):
+
+        # DEBUG: Add a print message here to make sure batches are shuffled
+        shuffle_flag = False
+        linearized_flag = False
+
+        def shuffle_batches(batches, seed):
+            with data_utils.numpy_seed(seed):
+                np.random.shuffle(batches)
+            return batches
+
+        def linearize_batches(batches):
+            linear_batches = []
+            for bb in batches:
+                linear_batches.extend(bb)
+            return linear_batches
+
+        if self._supports_prefetch:
+            batches = self.frozen_batches
+
+            #print('[DEBUG] 1) SLUEpochBatchIterator, type of batches: {} (size: {})'.format(type(batches), len(batches)))
+            #print('[DEBUG]     * type of batches elements: {} (size: {})'.format(type(batches[0]), len(batches[0])))
+            #sys.stdout.flush()
+
+            if not shuffle and (type(batches[0]) == list or type(batches[0]) == tuple) and (type(batches[0][0]) == list or type(batches[0][0]) == tuple):
+                #print('[DEBUG] 1) SLUEpochBatchIterator: linearizing batches')
+                #sys.stdout.flush()
+                batches = linearize_batches(batches)
+                linearized_flag = True
+            shuffle_flag = False
+
+            #print('[DEBUG] 2) SLUEpochBatchIterator, type of batches: {} (size: {})'.format(type(batches), len(batches)))
+            #print('[DEBUG]     * type of batches elements: {} (size: {})'.format(type(batches[0]), len(batches[0])))
+            #sys.stdout.flush()
+
+            if shuffle and not fix_batches_to_gpus:
+                batches = shuffle_batches(list(batches), self.seed + epoch)
+                if (type(batches[0]) == list or type(batches[0]) == tuple) and (type(batches[0][0]) == list or type(batches[0][0]) == tuple):
+                    #print('[DEBUG] 2) SLUEpochBatchIterator: linearizing batches')
+                    #sys.stdout.flush()
+                    batches = linearize_batches(batches)
+                    linearized_flag = True
+                shuffle_flag = True
+
+            #print('[DEBUG] 3) SLUEpochBatchIterator, type of batches: {}'.format(type(batches)))
+            #print('[DEBUG]     * type of batches elements: {}'.format(type(batches[0])))
+            #sys.stdout.flush()
+
+            batches = list(iterators.ShardedIterator(
+                batches, self.num_shards, self.shard_id, fill_value=[]
+            ))
+            self.dataset.prefetch([i for s in batches for i in s])
+
+            if shuffle and fix_batches_to_gpus:
+                batches = shuffle_batches(batches, self.seed + epoch + self.shard_id)
+                if (type(batches[0]) == list or type(batches[0]) == tuple) and (type(batches[0][0]) == list or type(batches[0][0]) == tuple):
+                    #print('[DEBUG] 3) SLUEpochBatchIterator: linearizing batches')
+                    #sys.stdout.flush()
+                    batches = linearize_batches(batches)
+                    linearized_flag = True
+                shuffle_flag = True
+
+            #print('[DEBUG] 4) SLUEpochBatchIterator, type of batches: {}'.format(type(batches)))
+            #print('[DEBUG]     * type of batches elements: {}'.format(type(batches[0])))
+            #sys.stdout.flush()
+        else:
+            if shuffle:
+                batches = shuffle_batches(list(self.frozen_batches), self.seed + epoch)
+
+                '''print('[DEBUG] 5.a) SLUEpochBatchIterator, type of batches: {} (size: {})'.format(type(batches), len(batches)))
+                print('[DEBUG]     * type of batches elements: {} (size: {})'.format(type(batches[0]), len(batches[0])))
+                print('[DEBUG]     * type of elements of elements: {} (size: {})'.format(type(batches[0][0]), len(batches[0][0])))
+                num_elems = 0
+                for db in batches:
+                    prev = -1
+                    for tb in db:
+                        num_elems += len(tb) if type(tb) == list or type(tb) == tuple else 1
+                        if prev != -1:
+                            assert tb == prev+1
+                        prev = tb
+                print('[DEBUG]     * total number of turns: {}'.format(num_elems))
+                sys.stdout.flush()'''
+
+                if (type(batches[0]) == list or type(batches[0]) == tuple) and (type(batches[0][0]) == list or type(batches[0][0]) == tuple):
+                    #print('[DEBUG] 5.a) SLUEpochBatchIterator: linearizing batches')
+                    #sys.stdout.flush()
+                    batches = linearize_batches(batches)
+                    linearized_flag = True
+                shuffle_flag = True
+            else:
+                batches = self.frozen_batches
+
+                '''print('[DEBUG] 5.b) SLUEpochBatchIterator, type of batches: {} (size: {})'.format(type(batches), len(batches)))
+                print('[DEBUG]     * type of batches elements: {} (size: {})'.format(type(batches[0]), len(batches[0])))
+                print('[DEBUG]     * type of elements of elements: {} (size: {})'.format(type(batches[0][0]), len(batches[0][0])))
+                num_elems = 0
+                for db in batches:
+                    for tb in db:
+                        num_elems += len(tb) if type(tb) == list or type(tb) == tuple else 1
+                print('[DEBUG]     * total number of turns: {}'.format(num_elems))
+                print('[DEBUG] Visializing a dialog:')
+                mid_idx = int(len(batches)/2)
+                dialog_batch = batches[mid_idx]
+                for idx, turn_batch in enumerate(dialog_batch):
+                    print('* {}) {}'.format(idx, self.dictionary.string(self.dataset.tgt[turn_batch[0]])))
+                print('[DEBUG] -----')
+                sys.stdout.flush()'''
+
+                if (type(batches[0]) == list or type(batches[0]) == tuple) and (type(batches[0][0]) == list or type(batches[0][0]) == tuple):
+                    #print('[DEBUG] 5.b) SLUEpochBatchIterator: linearizing batches')
+                    #sys.stdout.flush()
+                    batches = linearize_batches(batches)
+                    linearized_flag = True
+                shuffle_flag = False
+
+            '''print('[DEBUG] 6) SLUEpochBatchIterator, type of batches: {} (size: {})'.format(type(batches), len(batches)))
+            print('[DEBUG]     * type of batches elements: {} (size: {})'.format(type(batches[0]), len(batches[0])))
+            num_elems = 0
+            for tb in batches:
+                num_elems += len(tb)
+            print('[DEBUG]     * total number of turns: {}'.format(num_elems))
+            print('[DEBUG] Visualizing a dialog after linearization:')
+            dlen_limit = 50
+            mid_idx = int(len(batches)/2)
+            for t_idx in range(dlen_limit):
+                #assert len(batches[mid_idx+t_idx]) == 5
+                print('* {}) {}'.format(mid_idx+t_idx, self.dictionary.string( self.dataset.tgt[batches[mid_idx+t_idx][0]] )))
+            print(' -----')
+            sys.stdout.flush()'''
+
+            batches = list(iterators.ShardedIterator(
+                batches, self.num_shards, self.shard_id, fill_value=[]
+            ))
+
+        '''print('[DEBUG] SLUEpochBatchIterator, batch shuffle flag: {}'.format(shuffle_flag))
+        print('[DEBUG] SLUEpochBatchIterator, type of batches after ShardedIterator: {} (size: {})'.format(type(batches), len(batches)))
+        print('[DEBUG]     * type of batches elements: {} (size: {})'.format(type(batches[0]), len(batches[0])))
+        num_elems = 0
+        for tb in batches:
+            num_elems += len(tb)
+        print('[DEBUG]     * total number of turns: {}'.format(num_elems))
+        sys.stdout.flush()'''
+
+        if linearized_flag:
+            #print('[DEBUG] SLUEpochBatchIterator, setting offset to 0')
+            #sys.stdout.flush()
+            offset = 0
+
+            '''print('[DEBUG] SLUEpochBatchIterator,')
+            print('[DEBUG]    *** Visualizing whole dialog after linearization (linear lenght: {}):'.format(len(batches)))
+            mid_idx = int(len(batches)/2)
+            dialog_idx = 0
+            turn_idx_limit = 50
+            for idx in range(turn_idx_limit):
+                #assert len(batches[mid_idx+idx]) == 5
+                print('[DEBUG] {}) {}'.format(idx, self.dictionary.string(self.dataset.tgt[batches[mid_idx+idx][dialog_idx]])))
+                sys.stdout.flush()
+            print('[DEBUG] ----------')
+            sys.stdout.flush()'''
+        '''else:
+            print('[DEBUG] *** Visualizing whole dialog before end:')
+            mid_idx = int(len(batches)/2)
+            dialog_batch = batches[mid_idx]
+            for i, idx in enumerate(dialog_batch):
+                print('[DEBUG] {} -> {}) {}'.format(i, idx, self.dictionary.string(self.dataset.tgt[dialog_batch[i]])))
+            print('[DEBUG] ----------')
+            sys.stdout.flush()'''
+
+        if offset > 0 and offset >= len(batches):
+            return None
+
+        if self.num_workers > 0:
+            os.environ['PYTHONWARNINGS'] = 'ignore:semaphore_tracker:UserWarning' 
+
+        #print('[DEBUG] SO FAR SO GOOD!')
+        #sys.exit(0)
+
+        return iterators.CountingIterator(
+            torch.utils.data.DataLoader(
+                self.dataset,
+                collate_fn=self.collate_fn,
+                batch_sampler=batches[offset:],
+                num_workers=self.num_workers,
+            ),
+            start=offset,
+        )
+
 def create_batch_(data, curr_batch_ids):
     
     dialog_len = len( data[curr_batch_ids[0]] ) # all dialogs in this batch have this same length
@@ -112,13 +458,17 @@ def create_batch_(data, curr_batch_ids):
 
     return dialog_batch
 
-def get_bogus_turn(real_turn, dd, turn_id=None):
+def get_bogus_turn(real_turn, dd, turn_id=None, filler=bogus_token):
     # EOS_tag, User_ID
     T, C = real_turn[1].size()
-    sig = torch.zeros(1, C).to(real_turn[1])
-    tt = torch.LongTensor( [dd.eos()] )
-    bogus_id = turn_id if turn_id is not None else real_turn[0]
-    return (bogus_id, sig, tt, tt, tt, bogus_ID)
+    sig = torch.zeros(3, C).to(real_turn[1])
+    if filler == EOD_tag:
+        sig.fill_( EOD_value )
+        #print('[DEBUG] get_bogus_turn: filling bogus turn with value {}'.format(EOD_value))
+        #sys.stdout.flush()
+    tt = torch.LongTensor( [dd.bos(), dd.index(filler), dd.eos()] ).to(real_turn[1].device)
+    bogus_turn_id = turn_id if turn_id is not None else real_turn[0]
+    return (bogus_turn_id, sig, tt, tt, tt, bogus_ID)    # NOTE: bogus_ID is defined in globals.py
 
 def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
 
@@ -172,7 +522,9 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
             assert len(data[did]) <= batch2len[bi]
     # END TMP DEBUG CHECK
 
-    # Now add bogus turns to dialogues so that to have: 1. all dialogues in the same batch of the same length; 2. num of dialogues multiple of batch-size (this is accomplished by creating whole bogus dialogues! Hope this work...) 
+    # Now add bogus turns to dialogues so that to have:
+    #     1. all dialogues in the same batch have the same length;
+    #     2. num of dialogues multiple of batch-size (this is accomplished by creating whole bogus dialogues! Hope this work...) 
     for bi, bb in enumerate(batches):
         max_len = batch2len[bi]
 
@@ -184,19 +536,22 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
                 dialog = data[did]
                 for ii in range(did2len[did]+1, max_len+1):
                     dialog.append( get_bogus_turn(dialog[0], dd, ii) )
+                    did2len[did] += 1
                 #data[did] = dialog # needed ???
 
     # NOTE: last batch may contain less dialogues than bs, so possibly whole bogus dialogues must be added to have a batch of the same size as the others.
     if len(batches[-1]) != bs:
-        did = 9900
+        bogus_did_base = 9900
         max_len = batch2len[-1]
 
         tmp = max( [did2len[did] for did in batches[-1]] )
         assert tmp == max_len
+        tmp = max( [len(data[did]) for did in batches[-1]] )
+        assert tmp == max_len
 
         for ii in range(bs-len(batches[-1])):
-            bogus_did = str(did+ii+1)
-            batches[-1].append(bogus_did) 
+            bogus_did = str(bogus_did_base+ii+1)
+            batches[-1].append(bogus_did)
             data[bogus_did] = []
             did2len[bogus_did] = 0
 
@@ -204,11 +559,15 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
 
         for did in batches[-1]:
             if did2len[did] < max_len: # actually only the bogus dialogues should satisfy this condition !
-                assert did2len[did] == 0
+                if str(bogus_did_base) in did:
+                    assert did2len[did] == 0
 
                 dialog = data[did]
                 for ii in range(did2len[did]+1, max_len+1):
-                    dialog.append( get_bogus_turn(batches[-1][0], dd, ii) )
+                    #print('[DEBUG] rearrange_dialogs, creating bogus turn from dialog id {}: {}'.format(batches[-1][0], data[batches[-1][0]]))
+                    #sys.stdout.flush()
+                    dialog.append( get_bogus_turn(data[batches[-1][0]][0], dd, ii) )
+                    did2len[did] += 1
                 #data[did] = dialog # needed ???
 
     # TMP DEBUG CHECK
@@ -219,8 +578,8 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
         plen = len(data[bb[0]])
         found = False
         for did in bb:
-            assert len(data[did]) == dlen
-            assert len(data[did]) == plen
+            assert len(data[did]) == dlen, 'Assertion 1: expected dialog length {}, got {}'.format(dlen, len(data[did]))
+            assert len(data[did]) == plen, 'Assertion 2: expected dialog length {}, got {}'.format(plen, len(data[did]))
 
             if torch.sum(data[did][-1][1]).item() != 0.0:
                 found = True
@@ -230,7 +589,7 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
 
     # TODO: add here an end of dialog marker in each and every dialog so that the model can detect when to re-initialize the dialog history cache
     for did in data:
-        data[did].append( get_bogus_turn(data[did][0], dd, len(data[did])+1) )
+        data[did].append( get_bogus_turn(data[did][0], dd, len(data[did])+1, filler=EOD_tag) )
 
     dialog_lengths = {}
     for dialog_id in data.keys():
@@ -245,10 +604,9 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
     for bb in batches:
         found = False
         for did in bb:
-            if torch.sum(data[did][-1][1]) != 0.0:
-                found = True
-        if found:
-            raise ValueError('Found a batch without End-of-dialogue marker')
+            T, C = data[did][-1][1].size()
+            if torch.sum(data[did][-1][1] == EOD_value).item() != T*C:
+                raise ValueError('Found a batch without End-of-dialogue marker. Expected value {}, got value {}. Expected num. of EOD values {} ({} x {}), got num. of EOD values {}'.format(T*C*EOD_value, torch.sum(data[did][-1][1]), T*C, T, C, torch.sum(data[did][-1][1] == EOD_value)))
     # END TMP DEBUG CHECK
 
     return dialog_lengths
@@ -257,6 +615,7 @@ def create_dialog_batches_(data, batch_size, infos):
 
     dd = infos['dict']
     dlevel_slu = infos['dialog_level_slu']
+    normalize_dialogs = infos['normalize_dialogs']
 
     dialog_lengths = {}
     for dialog_id in data.keys():
@@ -265,12 +624,11 @@ def create_dialog_batches_(data, batch_size, infos):
             dialog_lengths[curr_len] = []
         dialog_lengths[curr_len].append( dialog_id )
 
-    if dlevel_slu:
-        raise NotImplementedError()
-
-        dialog_lengths = rearrange_for_dialog_level_slu_(data, batch_size, dialog_lengths, dd)
+    if normalize_dialogs:
+        dialog_lengths = rearrange_for_dialog_level_slu_(data, batch_size, dialog_lengths, dd) 
 
     dialog_batches = []
+    batch_sizes = []
     for dlen in dialog_lengths.keys():
         
         if len(dialog_lengths[dlen]) > 1:
@@ -278,26 +636,29 @@ def create_dialog_batches_(data, batch_size, infos):
             num_batches = int(len(dialog_lengths[dlen]) / batch_size)
             remainder = len(dialog_lengths[dlen]) % batch_size
 
-            if dlevel_slu:
+            if normalize_dialogs:
                 assert remainder == 0
             
             b_idx = 0
             while b_idx < num_batches:
                 curr_batch_ids = dialog_lengths[dlen][b_idx*batch_size:(b_idx+1)*batch_size]
                 dialog_batches.append( create_batch_(data, curr_batch_ids) )
+                batch_sizes.append(batch_size)
                 b_idx += 1
             
             if remainder > 0:
                 curr_batch_ids = dialog_lengths[dlen][num_batches*batch_size:]
                 dialog_batches.append( create_batch_(data, curr_batch_ids) )
+                batch_sizes.append( remainder )
         else:
-            if dlevel_slu:
+            if normalize_dialogs and batch_size > 1:
                 raise ValueError()
 
             curr_batch_ids = dialog_lengths[dlen]
             dialog_batches.append( create_batch_(data, curr_batch_ids) )
+            batch_sizes.append(1)
 
-    return dialog_batches
+    return dialog_batches, batch_sizes
 
 def read_txt(txtpath):
  
@@ -481,12 +842,12 @@ def read_dialog_data(TurnList, args):
 
             # 3. The reference transcription 
             turn_txt = read_txt(turn.strip() + '.txt')
-            turn_data.append( turn_txt )
+            turn_data.append( turn_txt.strip() )
 
             # 4. The transcription "enriched" with semantic annotation
             basename = turn.split('/')[-1]
             if args.corpus_name in ['media', 'etape']:
-                if user_ID in basename:
+                if True: #user_ID in basename:
                     dialog_struct = parse_media_semantic_annotation( turn.strip() + '.sem' )
                     slu_turn = ''
                     for vals in dialog_struct.values():
@@ -495,11 +856,14 @@ def read_dialog_data(TurnList, args):
                                 if len(slu_turn) > 0:
                                     slu_turn = slu_turn + ' '
                                 slu_turn = slu_turn + slu_start_concept_mark + ' ' + c[2] + ' ' + c[1] + ' ' + slu_end_concept_mark
-                    turn_data.append( slu_turn )
-                    turn_data.append( user_ID )
+                    turn_data.append( slu_turn.strip() )
+                    if user_ID in basename:
+                        turn_data.append( user_ID )
+                    else:
+                        turn_data.append( machine_ID )
                 else:
                     slu_turn = slu_start_concept_mark + ' ' + turn_txt + ' ' + machine_semantic + ' ' + slu_end_concept_mark
-                    turn_data.append( slu_turn )
+                    turn_data.append( slu_turn.strip() )
                     turn_data.append( machine_ID )
 
                 if turn_id in dialog_data[dialog_id]:
@@ -517,6 +881,8 @@ def read_dialog_data(TurnList, args):
                 raise NotImplementedError 
 
             dialog_data[dialog_id].append( turn_data )
+        else:
+            sys.stderr.write(' *** read_dialog_data WARNING: discarding offending length turn (size: {})'.format(spg_tsr.size(0)))
 
     return dialog_data
 
@@ -574,14 +940,47 @@ def get_character_level_slu_turn(args, slu_turn_tsr, vocab):
 
     return char_slu_turn_str
 
-def references2indexes(args, data, vocab):
+def references2indexes(args, data, vocab, split):
 
     for did in data.keys():
         for idx in range(len(data[did])):
             (turn_id, spg, txt_turn, slu_turn, spk_ID) = data[did][idx]
-            char_list = [vocab.add_symbol(c) for c in txt_turn]
-            token_list = [vocab.add_symbol(t) for t in txt_turn.split()]
-            slu_list = [vocab.add_symbol(s) for s in slu_turn.split()]
+            if (hasattr(args, 'freeze_dictionary') and args.freeze_dictionary) or (hasattr(args, 'freeze_train_dictionary') and args.freeze_train_dictionary and split != 'train'):
+                '''char_list = []
+                for c in txt_turn:
+                    idx = vocab.index(c)
+                    if idx == vocab.unk():
+                        print(' #### Adding to dictionary symbol {}'.format(c))
+                        sys.stdout.flush()
+                    char_list.append(idx)'''
+                char_list = [vocab.index(c) for c in txt_turn]
+                token_list = [vocab.index(t) for t in txt_turn.split()]
+                slu_list = [vocab.index(s) for s in slu_turn.split()]
+            else:
+                '''char_list = []
+                for c in txt_turn:
+                    c_idx = vocab.index(c)
+                    if c_idx == vocab.unk():
+                        print(' #### (Char) Adding to dictionary symbol >{}<'.format(c))
+                        sys.stdout.flush()
+                    char_list.append(c_idx)'''
+                char_list = [vocab.add_symbol(c) for c in txt_turn]
+                '''token_list = []
+                for t in txt_turn.split():
+                    t_idx = vocab.index(t)
+                    if t_idx == vocab.unk():
+                        print(' #### (Token) Adding to dictionary symbol >{}<'.format(t))
+                        sys.stdout.flush()
+                    token_list.append(t_idx)'''
+                token_list = [vocab.add_symbol(t) for t in txt_turn.split()]
+                '''slu_list = []
+                for s in slu_turn.split():
+                    s_idx = vocab.index(s)
+                    if s_idx == vocab.unk():
+                        print(' #### (SLU) Adding to dictionary symbol >{}<'.format(s))
+                        sys.stdout.flush()
+                    slu_list.append(s_idx)'''
+                slu_list = [vocab.add_symbol(s) for s in slu_turn.split()]
 
             if args.padded_reference:
                 char_list = [vocab.bos()] + char_list + [vocab.eos()]
@@ -636,6 +1035,10 @@ class End2EndSLU(FairseqTask):
                             help='file containing the serialized corpus (with a previous torch.save)')
         parser.add_argument('--load-dictionary', type=str,
                             help='Load the dictionary for the task symbols from the specified file (e.g. to perform transfer learning)')
+        parser.add_argument('--load-embeddings', type=str, help='Load decoder token embeddings from the specified file')
+        parser.add_argument('--freeze-dictionary', action='store_true', default=False, help='Freeze the loaded dictionary, that is it does not add new found symbols')
+        parser.add_argument('--freeze-train-dictionary', action='store_true', default=False, help='Create the dictionary only from training data tokens')
+        parser.add_argument('--freeze-embeddings', action='store_true', default=False, help='Freeze loaded pre-trained embeddings')
         parser.add_argument('--source-dictionary', type=str,
                             help='When performing transfer learning, uses this dictionary as source domain dictionary')
         parser.add_argument('--target-dictionary', type=str,
@@ -685,7 +1088,19 @@ class End2EndSLU(FairseqTask):
         parser.add_argument('--padding-active', action='store_true', default=False, help='Determine if padding should be done or not')
         parser.add_argument('--unfreeze-encoder-at-cer', type=float, default=110.00, help='Unfreeze encoder parameters for training when the dev CER goes below the specified value')
         parser.add_argument('--dialog-level-slu', action='store_true', default=False, help='Re-arrange turns and dialogues to perform dialog-level SLU')
+        parser.add_argument('--normalize-dialog-batches', action='store_true', default=False, help='Rearrange dialogues so that to have all batches of the same size')
+        parser.add_argument('--parse-rich-semantic', action='store_true', default=False, help='Use enriched/annotated semantic sequences instead of the standard .sem annotation files')
+        parser.add_argument('--dialog-batches', action='store_true', default=False, help='Use a single dialog as a batch')
+        parser.add_argument('--use-dialog-history', action='store_true', default=False, help='If set to True, the model will exploit dialog history')
+        parser.add_argument('--context-discount', type=float, default=1.0, help='Context discount when using "sum" as context fusion method')
+        parser.add_argument('--context-fusion', type=str, default='sum', help='Method for integrating the context information: sum (default), gating')
+        parser.add_argument('--context-size', type=int, default=8, help='Number of turns used as context')
+        parser.add_argument('--context-first-turns', type=int, default=6, help='Number of turns used in the context and taken at the beginning of the dialog, the remainder are the last previous turns')
         parser.add_argument('--speech-encoder', type=str, default='ziggurat', help='Structure of speech encoder: ziggurat (NeurIPS 2021 paper), deep-speech (ICASSP 2020 paper)')
+        parser.add_argument('--model-beam', type=int, default=1, help='At generation phase and when using dialog context, tells to the model the beam size so that the model can manage correctly the dialog history (generate.py does not seem to add the beam argument to the namespace)')
+        parser.add_argument('--print-history-attn-weights', action='store_true', default=False, help='Print dialog history attention weights of the current decoded sequence, along with current target and history turn tokens')
+        parser.add_argument('--label-dictionary', type=str, help='Load a task specific label dictionary, e.g. to perform discounting on non-label tokens in the decoder')
+        parser.add_argument('--non-label-discounting', type=float, default=1.0, help='Discounting factor for non-label tokens in the decoder')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -694,30 +1109,32 @@ class End2EndSLU(FairseqTask):
         # loading Dictionaries, initializing shared Embedding layers, etc.
         # In this case we'll just initialize the label dictionary
         
-        label_vocab = SLUDictionary(
-            pad=pad_token,
-            eos=EOS_tag,
-            unk=unk_token,
-            bos=SOS_tag,
-            extra_special_symbols=[blank_token, machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, 'ã']
-        )
+        #label_vocab = SLUDictionary(
+        #    pad=pad_token,
+        #    eos=EOS_tag,
+        #    unk=unk_token,
+        #    bos=SOS_tag,
+        #    extra_special_symbols=[blank_token, machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, 'ã', EOD_tag]
+        #)
         # NOTE: we are ogliged to initialize the Dictionary as it is requested in Fairseq,
         #       but then we reset it and re-add symbols so that to have index 0 for the blank token, as needed by the CTC loss.
         #       (Added later: the index of the blank token to be passed to the CTC loss can be actually customized)
-        label_vocab.reset() 
-        label_vocab.set_blank(blank_token)
-        label_vocab.set_pad_(pad_token)
-        label_vocab.set_eos_(EOS_tag)
-        label_vocab.set_unk_(unk_token)
-        label_vocab.set_bos_(SOS_tag)
+        #label_vocab.reset() 
+        #label_vocab.set_blank(blank_token)
+        #label_vocab.set_pad_(pad_token)
+        #label_vocab.set_eos_(EOS_tag)
+        #label_vocab.set_unk_(unk_token)
+        #label_vocab.set_bos_(SOS_tag)
  
-        label_vocab.add_symbol(machine_semantic)
-        label_vocab.add_symbol(slu_start_concept_mark)
-        label_vocab.add_symbol(slu_end_concept_mark)
-        label_vocab.add_symbol(tok_separator)
-        label_vocab.add_symbol('ã')
-        label_vocab.set_nspecial_()  # We set the tokens added so far as being special tokens.
+        #label_vocab.add_symbol(machine_semantic)
+        #label_vocab.add_symbol(slu_start_concept_mark)
+        #label_vocab.add_symbol(slu_end_concept_mark)
+        #label_vocab.add_symbol(tok_separator)
+        #label_vocab.add_symbol('ã')
+        #label_vocab.add_symbol( EOD_tag )
+        #label_vocab.set_nspecial_()  # We set the tokens added so far as being special tokens.
 
+        label_vocab = init_slu_dictionary(args)
         if args.load_dictionary:
             print(' - Loading serialized dictionary...')
             sys.stdout.flush()
@@ -744,10 +1161,13 @@ class End2EndSLU(FairseqTask):
         self.max_epoch = args.max_epoch if hasattr(args, 'max_epoch') else 0
         self.tracker = EmissionsTracker(output_dir=args.save_dir if hasattr(args, 'save_dir') else './') #CarbonTracker(epochs=args.max_epoch, monitor_epochs=-1)
 
+        self.batching_change = False
+        self.batching_changed = True
+
         self.label_vocab = label_vocab
         self.num_features = 81
 
-        self.blank_idx = label_vocab.index( blank_token )
+        self.blank_idx = label_vocab.blank()
         self.sos_tag_idx = label_vocab.index( SOS_tag )
         self.eos_tag_idx = label_vocab.index( EOS_tag )
         self.slu_start_concept_idx = label_vocab.index( slu_start_concept_mark )
@@ -859,14 +1279,26 @@ class End2EndSLU(FairseqTask):
 
         n_ss_up = 0
         self.curr_epoch += 1
-        if self.curr_epoch <= 3:
+        if self.curr_epoch <= self.args.curriculum:
             self.datasets['train'].curriculum(value=True)
-            #print(' End2EndSLU, setting curriculum learning to True')
+            #print('[DEBUG] End2EndSLU, setting curriculum learning to True')
             #sys.stdout.flush()
-        if self.curr_epoch > 3:
+        if self.curr_epoch > self.args.curriculum:
             self.datasets['train'].curriculum(value=False)
-            #print(' End2EndSLU, setting curriculum learning to False')
-            #sys.stdout.flush() 
+            #print('[DEBUG] End2EndSLU, setting curriculum learning to False')
+            #sys.stdout.flush()
+
+            if self.args.curriculum == 0 or (not self.batching_changed and not self.batching_change and self.args.use_dialog_history):
+                print('[DEBUG] End2EndSLU, instructing the model for dialog history use!')
+                sys.stdout.flush()
+
+                model.decoder.use_dialog_history(value=True)
+
+            if self.args.curriculum > 0 and self.batching_changed:
+                print('[DEBUG] End2EndSLU, batching change scheduled...')
+                sys.stdout.flush()
+                self.batching_change = True
+                self.batching_changed = False
 
         if epoch > 1:
             self.init_ss_threshold *= 0.98
@@ -933,27 +1365,30 @@ class End2EndSLU(FairseqTask):
         channel_per_speaker = 2
         #spk_abs_val = 1.0
         (src_len, dim) = feats.size()
+        #eod_mark = torch.sum( feats == EOD_value ).item()
         if _ADVANCED_SPK_MARK_:
             speaker_mark = torch.zeros(src_len, channel_per_speaker*self.num_speakers).to(feats)
         spk_val = 0.0
         if spk == user_ID:
-            spk_val = +self.spk_abs_val
+            spk_val = +self.spk_abs_val 
             if _ADVANCED_SPK_MARK_:
-                speaker_mark[:,:channel_per_speaker] = spk_val
+                speaker_mark[:,:channel_per_speaker] = spk_val #if eod_mark == 0 else EOD_value
         elif spk == machine_ID:
             spk_val = -self.spk_abs_val
             if _ADVANCED_SPK_MARK_:
-                speaker_mark[:,channel_per_speaker:2*channel_per_speaker] = spk_val
+                speaker_mark[:,channel_per_speaker:2*channel_per_speaker] = spk_val #if eod_mark == 0 else EOD_value
         elif spk == bogus_ID: 
             spk_val = -2.0*self.spk_abs_val
             if _ADVANCED_SPK_MARK_:
-                speaker_mark[:,2*channel_per_speaker:] = spk_val
+                speaker_mark[:,2*channel_per_speaker:] = spk_val #if eod_mark == 0 else EOD_value
         else:
             raise NotImplementedError
 
         if _ADVANCED_SPK_MARK_:
             feats = torch.cat([feats, speaker_mark], 1)
             dim = dim + channel_per_speaker*self.num_speakers
+        #if eod_mark > 0:
+        #    spk_val = EOD_value
         padder = torch.zeros(3, dim).fill_(spk_val).to(feats)
         return torch.cat( [padder, feats, padder], 0 )
 
@@ -1053,6 +1488,152 @@ class End2EndSLU(FairseqTask):
 
         return corpus[split], (length_missmatch, missmatches, max_turn_length, total)
 
+    def create_batches_as_dialogs(self, data, batch_info, batch_sizes, split, slu_mode_info):
+
+        ratios = []
+        sources = []
+        src_lengths = []
+        targets = []
+        tgt_lengths = []
+        global_turn_idx = 0
+        idx_batches = []
+
+        for did in data.keys():
+
+            batched_turns_idx = []
+            for tid in range( len(data[did]) ):
+
+                turn = data[did][tid]
+                feats = turn[1]
+                feats = self.add_speaker_marker(feats, turn[-1])
+                sources.append( feats )
+                src_lengths.append( feats.size(0) )
+
+                batched_turns_idx.append( (global_turn_idx, turn[-1]) )
+                global_turn_idx += 1
+
+                if self.args.slu_subtask == 'char':
+                    targets.append( turn[2] )
+                    tgt_lengths.append( turn[2].size(0) )
+
+                    ratios.append( turn[2].size(0) / feats.size(0) )
+
+                elif self.args.slu_subtask == 'token':
+                    targets.append( turn[3] )
+                    tgt_lengths.append( turn[3].size(0) )
+
+                    ratios.append( turn[3].size(0) / feats.size(0) )
+
+                elif self.args.slu_subtask == 'concept':
+                    targets.append( turn[4] )
+                    tgt_lengths.append( turn[4].size(0) )
+
+                    ratios.append( turn[4].size(0) / feats.size(0) )
+
+                else:
+                    raise NotImplementedError
+
+            idx_batches.append( batched_turns_idx )
+        return idx_batches, (sources, src_lengths, targets, tgt_lengths), (ratios, global_turn_idx)
+
+    def rearrange_dialog_batches(self, data, batch_info, batch_sizes, split, slu_mode_info):
+
+        ratios = []
+        sources = []
+        src_lengths = []
+        targets = []
+        tgt_lengths = []
+        global_turn_idx = 0
+        idx_batches = []
+        #num_zeros = []
+        #for dialog_id in data.keys():
+        for batch, batch_size in zip(batch_info, batch_sizes):
+            #for turn in turns:
+            batched_turns_idx = []
+            curr_turn_batch = []
+            dialog_batch_size = batch_size #bsz
+            #while len(batch) % dialog_batch_size != 0:
+            #    dialog_batch_size -= 1
+            #if dialog_batch_size == 0:
+            #    raise ValueError('FATAL ERROR: zero dialog batch size detected')
+            #print('[DEBUG] End2EndSLU.rearrange_dialog_batches, current dialog batch size: {}, total length {}'.format(dialog_batch_size, len(batch)))
+            #sys.stdout.flush()
+            for (did, idx) in batch:
+                turn = data[did][idx]
+                if (split == 'train') or (turn[-1] == user_ID) or slu_mode_info['dialog_level_slu']:
+                    #if turn[-1] == user_ID:
+                    # if (not self.args.user_only and (split == 'train' or turn[-1] == user_ID)) or (self.args.user_only and turn[-1] == user_ID)
+                    feats = turn[1]
+                    feats = self.add_speaker_marker(feats, turn[-1])
+                    #tmp = int((feats == 0.0).sum())
+                    #if tmp > 0:
+                    #    num_zeros.append( tmp )
+                    sources.append( feats )
+                    src_lengths.append( feats.size(0) )
+
+                    '''print(' - End2EndSLU task data shapes:')
+                    print('   - feats shape: {}'.format(feats.size()))
+                    print('   - char seq shape: {}'.format(turn[2].size()))
+                    print('   - token seq shape: {}'.format(turn[3].size()))
+                    print('   - slu seq shape: {}'.format(turn[4].size()))
+                    print(' -----')
+                    sys.stdout.flush()'''
+
+                    if self.args.dialog_level_slu:
+                        curr_turn_batch.append( (global_turn_idx, turn[-1]) )
+                        if len(curr_turn_batch) >= dialog_batch_size:
+                            batched_turns_idx.append( curr_turn_batch )
+                            curr_turn_batch = []
+                    else:
+                        batched_turns_idx.append( (global_turn_idx, turn[-1]) )
+                    global_turn_idx += 1
+
+                        #print('[DEBUG] End2ENdSLU.rearrange_dialog_batches: stored batch of size {} (batch size reset to {})'.format(len(idx_batches[-1]), len(batched_turns_idx)))
+                        #sys.stdout.flush()
+
+                    if self.args.slu_subtask == 'char':
+                        targets.append( turn[2] )
+                        tgt_lengths.append( turn[2].size(0) )
+
+                        ratios.append( turn[2].size(0) / feats.size(0) )
+
+                    elif self.args.slu_subtask == 'token':
+                        targets.append( turn[3] )
+                        tgt_lengths.append( turn[3].size(0) )
+
+                        ratios.append( turn[3].size(0) / feats.size(0) )
+
+                    elif self.args.slu_subtask == 'concept':
+                        targets.append( turn[4] )
+                        tgt_lengths.append( turn[4].size(0) )
+
+                        ratios.append( turn[4].size(0) / feats.size(0) )
+
+                    else:
+                        raise NotImplementedError
+                else:
+                    data[did][idx] = None
+
+            if split == 'train':
+                assert len(curr_turn_batch) == 0, 'ERROR, wrong remainder size in current batch: {}. Expected 0 with batch size {} and total dialog length {}'.format(len(batched_turns_idx), dialog_batch_size, len(batch))
+            if self.args.dialog_level_slu:
+                if len(curr_turn_batch) > 0:
+                    assert len(curr_turn_batch) == bsz
+                    batched_turns_idx.append( curr_turn_batch )
+                if len(batched_turns_idx) > 0:
+                    idx_batches.append( batched_turns_idx )
+
+                '''print('[DEBUG]### End2EndSLU, storing {} dialog batches of size {}'.format(len(batched_turns_idx), len(batched_turns_idx[0])))
+                print('[DEBUG]###     * type of idx_batches: {}'.format(type(idx_batches))) # Expected List
+                print('[DEBUG]###     * type of elements of idx_batches: {} (size: {})'.format(type(idx_batches[-1]), len(idx_batches[-1])))  # Expected List
+                print('[DEBUG]###     * type of elements of elements of idx_batches: {}, length {}'.format(type(idx_batches[-1][0]), len(idx_batches[-1][0])))   # Expected List
+                print('[DEBUG]###     * type of deepest elements: {}'.format(type(idx_batches[-1][0][0])))  # Expected tuple
+                sys.stdout.flush()'''
+            else:
+                idx_batches.append( batched_turns_idx )
+
+        return idx_batches, (sources, src_lengths, targets, tgt_lengths), (ratios, global_turn_idx)
+
     def load_dataset(self, split, **kwargs):
     
         """Load a given dataset split (e.g., train, valid, test)."""
@@ -1119,9 +1700,9 @@ class End2EndSLU(FairseqTask):
 
             print(' - Mapping tokens to indexes...')
             sys.stdout.flush()
-            references2indexes(self.args, train_data, self.label_vocab)
-            references2indexes(self.args, dev_data, self.label_vocab)
-            references2indexes(self.args, test_data, self.label_vocab)
+            references2indexes(self.args, train_data, self.label_vocab, 'train')
+            references2indexes(self.args, dev_data, self.label_vocab, 'dev')
+            references2indexes(self.args, test_data, self.label_vocab, 'test')
             print('   - Dictionary size: {}'.format(len(self.label_vocab)))
             sys.stdout.flush()
 
@@ -1148,11 +1729,11 @@ class End2EndSLU(FairseqTask):
                 corpus['dictionary'] = torch.load(self.args.serialized_data + '.dict')
             self.label_vocab = corpus['dictionary'] 
             print(' - Loaded dictionary size: {}'.format(len(self.label_vocab)))
-            sys.stdout.flush()
+            sys.stdout.flush() 
 
         if my_split == 'train' and 'test' in corpus:
             corpus['test'] = None
-        self.blank_idx = self.label_vocab.index( blank_token )
+        self.blank_idx = self.label_vocab.blank()
         self.sos_tag_idx = self.label_vocab.index( SOS_tag )
         self.eos_tag_idx = self.label_vocab.index( EOS_tag )
         self.slu_start_concept_idx = self.label_vocab.index( slu_start_concept_mark )
@@ -1166,14 +1747,14 @@ class End2EndSLU(FairseqTask):
         print(' * End2EndSLU: checking for input-output sequence length incompatibility...')
         sys.stdout.flush()
 
-        print('[DEBUG] dict size before: {}'.format(len(self.label_vocab)))
+        #print('[DEBUG] dict size before: {}'.format(len(self.label_vocab)))
 
         cc, infos = self.pad_short_sequences(corpus, my_split)
         corpus[my_split] = cc
         length_missmatch, missmatches, max_turn_length, total = infos
 
-        print('[DEBUG] dict size after: {}'.format(len(self.label_vocab)))
-        sys.stdout.flush()
+        #print('[DEBUG] dict size after: {}'.format(len(self.label_vocab)))
+        #sys.stdout.flush()
 
         if length_missmatch > 0:
             msg = ''
@@ -1204,27 +1785,58 @@ class End2EndSLU(FairseqTask):
             bsz = bsz * 2
         if bsz > self.args.max_sentences:
             bsz = int(bsz / 2)
-        if self.args.max_sentences == 5:
-            bsz = 5
+        if bsz < self.args.max_sentences:
+            bsz = self.args.max_sentences
 
         print(' - Approximating batch size to {} from {}'.format(bsz, self.args.max_sentences))
         sys.stdout.flush()
         slu_mode_info = {}
         slu_mode_info['dict'] = self.label_vocab
         slu_mode_info['dialog_level_slu'] = self.args.dialog_level_slu if hasattr(self.args, 'dialog_level_slu') else False
-        batch_info = create_dialog_batches_(dialogs, bsz, slu_mode_info)
-        idx_batches = []
+        slu_mode_info['normalize_dialogs'] = self.args.normalize_dialog_batches if hasattr(self.args, 'normalize_dialog_batches') else False
+        batch_info, batch_sizes = create_dialog_batches_(dialogs, bsz, slu_mode_info)
 
+        #print('[DEBUG] batch_sizes content: {}'.format(batch_sizes))
+        #tmp_lst = [len(el) for el in batch_info]
+        #print('[DEBUG] batch_info batch sizes: {} (total: {})'.format(tmp_lst, sum(tmp_lst))) 
+        #sys.stdout.flush()
+
+        if self.args.dialog_batches:
+            idx_batches, split_data, info = self.create_batches_as_dialogs(dialogs, batch_info, batch_sizes, my_split, slu_mode_info)
+        else:
+            idx_batches, split_data, info = self.rearrange_dialog_batches(dialogs, batch_info, batch_sizes, my_split, slu_mode_info)
+
+            #print('[DEBUG] idx_batches structure:')
+            #for i in range( len(idx_batches) ):
+            #    print('[DEBUG]   * Size of current dialog batch: {}'.format(len(idx_batches[i])))
+            #    for j in range( len(idx_batches[i]) ):
+            #        print('[DEBUG]     ** Size of current turn batch: {}'.format(len(idx_batches[i][j])))
+            #sys.stdout.flush()
+            #sys.exit(0)
+
+        sources, src_lengths, targets, tgt_lengths = split_data
+        ratios, global_turn_idx = info
+
+        '''idx_batches = []
         ratios = []
         sources = []
         src_lengths = []
         targets = []
         tgt_lengths = []
         global_turn_idx = 0
+        num_zeros = []
         #for dialog_id in dialogs.keys():
-        for batch in batch_info:
+        for batch, batch_size in zip(batch_info, batch_sizes):
             #for turn in turns:
             batched_turns_idx = []
+            curr_turn_batch = []
+            dialog_batch_size = batch_size #bsz
+            #while len(batch) % dialog_batch_size != 0:
+            #    dialog_batch_size -= 1
+            #if dialog_batch_size == 0:
+            #    raise ValueError('FATAL ERROR: zero dialog batch size detected')
+            print('[DEBUG] End2EndSLU.load_dataset, current dialog batch size: {}, total length {}'.format(dialog_batch_size, len(batch)))
+            sys.stdout.flush()
             for (did, idx) in batch:
                 turn = dialogs[did][idx]
                 if (my_split == 'train') or (turn[-1] == user_ID) or slu_mode_info['dialog_level_slu']:
@@ -1232,20 +1844,31 @@ class End2EndSLU(FairseqTask):
                     # if (not self.args.user_only and (my_split == 'train' or turn[-1] == user_ID)) or (self.args.user_only and turn[-1] == user_ID)
                     feats = turn[1]
                     feats = self.add_speaker_marker(feats, turn[-1])
+                    tmp = int((feats == 0.0).sum())
+                    if tmp > 0:
+                        num_zeros.append( tmp )
                     sources.append( feats )
                     src_lengths.append( feats.size(0) ) 
 
-                    '''print(' - End2EndSLU task data shapes:')
+                    print(' - End2EndSLU task data shapes:')
                     print('   - feats shape: {}'.format(feats.size()))
                     print('   - char seq shape: {}'.format(turn[2].size()))
                     print('   - token seq shape: {}'.format(turn[3].size()))
                     print('   - slu seq shape: {}'.format(turn[4].size()))
                     print(' -----')
-                    sys.stdout.flush()'''
+                    sys.stdout.flush()
 
-                    batched_turns_idx.append( (global_turn_idx, turn[-1]) )
-                    #batched_turns_idx.append( global_turn_idx )
+                    if self.args.dialog_level_slu:
+                        curr_turn_batch.append( (global_turn_idx, turn[-1]) ) 
+                        if len(curr_turn_batch) >= dialog_batch_size:
+                            batched_turns_idx.append( curr_turn_batch )
+                            curr_turn_batch = []
+                    else:
+                        batched_turns_idx.append( (global_turn_idx, turn[-1]) )
                     global_turn_idx += 1
+
+                        #print('[DEBUG] End2ENdSLU.load_dataset: stored batch of size {} (batch size reset to {})'.format(len(idx_batches[-1]), len(batched_turns_idx)))
+                        #sys.stdout.flush()
 
                     if self.args.slu_subtask == 'char':
                         targets.append( turn[2] )
@@ -1270,10 +1893,36 @@ class End2EndSLU(FairseqTask):
                 else: 
                     dialogs[did][idx] = None
 
-            if len(batched_turns_idx) > 0:
-                idx_batches.append( batched_turns_idx )
+            if my_split == 'train':
+                assert len(curr_turn_batch) == 0, 'ERROR, wrong remainder size in current batch: {}. Expected 0 with batch size {} and total dialog length {}'.format(len(batched_turns_idx), dialog_batch_size, len(batch))
+            if self.args.dialog_level_slu:
+                if len(curr_turn_batch) > 0:
+                    assert len(curr_turn_batch) == bsz
+                    batched_turns_idx.append( curr_turn_batch )
+                if len(batched_turns_idx) > 0: 
+                    idx_batches.append( batched_turns_idx )
 
-        print(' - Reorganized {} turns for split {}'.format(global_turn_idx, my_split))
+                print('[DEBUG]### End2EndSLU, storing {} dialog batches of size {}'.format(len(batched_turns_idx), len(batched_turns_idx[0])))
+                print('[DEBUG]###     * type of idx_batches: {}'.format(type(idx_batches))) # Expected List
+                print('[DEBUG]###     * type of elements of idx_batches: {} (size: {})'.format(type(idx_batches[-1]), len(idx_batches[-1])))  # Expected List
+                print('[DEBUG]###     * type of elements of elements of idx_batches: {}, length {}'.format(type(idx_batches[-1][0]), len(idx_batches[-1][0])))   # Expected List
+                print('[DEBUG]###     * type of deepest elements: {}'.format(type(idx_batches[-1][0][0])))  # Expected tuple
+                sys.stdout.flush()
+            else:
+                idx_batches.append( batched_turns_idx )'''
+
+        # TMP FOR DEBUG
+        '''print('[DEBUG] *** Visualizing a sample dialog after normalization:')
+        sample_idx = 0
+        mid_idx = int(len(idx_batches)/2)
+        dialog_batch = idx_batches[mid_idx]
+        for idx, turn_batch in enumerate(dialog_batch):
+            print('[DEBUG]    {}) {}'.format(idx, self.label_vocab.string(targets[turn_batch[0][0]])))
+            sys.stdout.flush()
+        print(' -----')'''
+
+        print(' * End2EndSLU, reorganized {} turns for split {}'.format(global_turn_idx, my_split))
+        #print('   - Detected {} input tensors containing zeros: {}'.format(len(num_zeros), num_zeros))
         sys.stdout.flush()
         src_lengths_tsr = torch.FloatTensor( src_lengths )
         mean = torch.mean(src_lengths_tsr)
@@ -1291,22 +1940,21 @@ class End2EndSLU(FairseqTask):
         print('   * Mean target/source length ratio: {:.4f} (+/- {:.4f})'.format(rmean, rstd))
         print('   * Max. target/source length ratio: {:.4f}'.format(max(ratios)))
         print('   * Min. target/source length ratio: {:.4f}'.format(min(ratios)))
-        sys.stdout.flush()
-    
-        # Reorganize turns based on increasing source length for curriculum learning
-        #src_info = []
-        #for i in range(len(sources)):
-        #    src_info.append( (i, sources[i].size(0)) )
-        src_info = [(i, sources[i].size(0)) for i in range(len(sources))]
+        sys.stdout.flush() 
+
+        # Reorganize turns based on increasing source length for curriculum learning 
+        '''src_info = [(i, sources[i].size(0)) for i in range(len(sources))]
         sorted_structure = sorted(src_info, key=lambda tuple: tuple[1])
         sources = [sources[t[0]] for t in sorted_structure]
         src_lengths = [src_lengths[t[0]] for t in sorted_structure]
         targets = [targets[t[0]] for t in sorted_structure]
-        tgt_lengths = [tgt_lengths[t[0]] for t in sorted_structure]
+        tgt_lengths = [tgt_lengths[t[0]] for t in sorted_structure]'''
         self.num_features = sources[0].size(-1)
 
         input_feed = True 
         self.datasets[split] = End2EndSLUDataset.End2EndSLUDataset(
+            args=self.args,
+            split=split,
             src=sources,
             src_sizes=src_lengths,
             tgt=targets,
@@ -1319,9 +1967,12 @@ class End2EndSLU(FairseqTask):
             input_feeding=input_feed,
             shuffle=True,
         )
+        #self.datasets[split].set_split_id(value=split)
 
-        #if split == 'train':
-        #    self.datasets['train'].curriculum(value=True)
+        if split == 'train' and self.args.curriculum > 0:
+            #print('[DEBUG] End2EndSLU, setting curriculum learning to True for train split (curriculum epoch {})'.format(self.args.curriculum))
+            #sys.stdout.flush()
+            self.datasets['train'].curriculum(value=True)
 
     def max_positions(self):
         """Return the max input length allowed by the task."""
@@ -1338,12 +1989,133 @@ class End2EndSLU(FairseqTask):
     # are constructed, but it's not necessary for this tutorial since we can
     # reuse the batching provided by LanguagePairDataset.
     #
-    # def get_batch_iterator(
-    #     self, dataset, max_tokens=None, max_sentences=None, max_positions=None,
-    #     ignore_invalid_inputs=False, required_batch_size_multiple=1,
-    #     seed=1, num_shards=1, shard_id=0,
-    # ):
-    #     (...)
+    def get_batch_iterator(
+        self, dataset, max_tokens=None, max_sentences=None, max_positions=None,
+        ignore_invalid_inputs=False, required_batch_size_multiple=1,
+        seed=1, num_shards=1, shard_id=0, num_workers=0, epoch=1):
+
+        """
+        Get an iterator that yields batches of data from the given dataset.
+
+        Args:
+            dataset (~fairseq.data.FairseqDataset): dataset to batch
+            max_tokens (int, optional): max number of tokens in each batch
+                (default: None).
+            max_sentences (int, optional): max number of sentences in each
+                batch (default: None).
+            max_positions (optional): max sentence length supported by the
+                model (default: None).
+            ignore_invalid_inputs (bool, optional): don't raise Exception for
+                sentences that are too long (default: False).
+            required_batch_size_multiple (int, optional): require batch size to
+                be a multiple of N (default: 1).
+            seed (int, optional): seed for random number generator for
+                reproducibility (default: 1).
+            num_shards (int, optional): shard the data iterator into N
+                shards (default: 1).
+            shard_id (int, optional): which shard of the data iterator to
+                return (default: 0).
+            num_workers (int, optional): how many subprocesses to use for data
+                loading. 0 means the data will be loaded in the main process
+                (default: 0).
+            epoch (int, optional): the epoch to start the iterator from
+                (default: 1).
+        Returns:
+            SLUEpochBatchIterator: a batched iterator over the
+                given dataset split
+        """
+
+        #print('[DEBUG] End2EndSLU.get_batch_iterator: num_shards, shard_id, num_workers: {}, {}, {}'.format(num_shards, shard_id, num_workers))
+        #sys.stdout.flush()
+
+        # For default fairseq task, return same iterator across epochs
+        # as datasets are not dynamic, can be overridden in task specific
+        # setting.
+        if dataset in self.dataset_to_epoch_iter and not self.batching_change:
+            #print('[DEBUG] End2EndSLU.get_batch_iterator: returning buffered epoch iterator for split {} @epoch {}'.format(dataset.get_split_id(), self.curr_epoch))
+            #sys.stdout.flush()
+            return self.dataset_to_epoch_iter[dataset]
+
+        assert isinstance(dataset, FairseqDataset)
+
+        # initialize the dataset with the correct starting epoch
+        dataset.set_epoch(epoch)
+
+        # get indices ordered by example size
+        with data_utils.numpy_seed(seed):
+            indices = dataset.ordered_indices()
+
+        '''print('[DEBUG] 1) End2EndSLU.get_batch_iterator, got {} size indices structure @split {}:'.format(len(indices), dataset.get_split_id()))
+        print('[DEBUG]    * type of indices: {}'.format(type(indices)))
+        print('[DEBUG]    * type of indices element: {} (size: {})'.format(type(indices[0]), len(indices[0])))
+        sys.stdout.flush()'''
+
+        # filter examples that are too large
+        if max_positions is not None and not self.args.dialog_level_slu and not self.args.dialog_batches: 
+            indices = data_utils.filter_by_size(
+                indices,
+                dataset,
+                max_positions,
+                raise_exception=(not ignore_invalid_inputs),
+            )
+
+        '''print('[DEBUG] 2) End2EndSLU.get_batch_iterator, got {} size indices structure @split {}:'.format(len(indices), dataset.get_split_id()))
+        print('[DEBUG]    * type of indices: {}'.format(type(indices)))
+        print('[DEBUG]    * type of indices element: {} (size: {})'.format(type(indices[0]), len(indices[0])))
+        sys.stdout.flush()'''
+
+        # create mini-batches with given size constraints 
+        if type(indices[0]) != list and type(indices[0]) != tuple: #not self.args.dialog_level_slu or (self.curr_epoch <= self.args.curriculum and dataset.get_split_id() == 'train'):
+            #print('[DEBUG] End2EndSLU.get_batch_iterator: batchizing indices @split {}'.format(dataset.get_split_id()))
+            #sys.stdout.flush()
+
+            batch_sampler = data_utils.batch_by_size(
+                indices,
+                dataset.num_tokens,
+                max_tokens=max_tokens,
+                max_sentences=max_sentences,
+                required_batch_size_multiple=required_batch_size_multiple,
+            )
+        else:
+            batch_sampler = indices
+
+            #print('[DEBUG] End2EndSLU.get_batch_iterator: keeping original indices as batch sampler for split {}'.format(dataset.get_split_id()))
+            #sys.stdout.flush()
+
+        '''print('[DEBUG] End2EndSLU.get_batch_iterator, got {} size batch sampler @split {}:'.format(len(batch_sampler), dataset.get_split_id()))
+        print('[DEBUG]    * type of batch sampler: {}'.format(type(batch_sampler)))
+        print('[DEBUG]    * type of batch sampler element: {} (size: {})'.format(type(batch_sampler[0]), len(batch_sampler[0])))
+        print('[DEBUG]    * type of elements of elements: {} (size: {})'.format(type(batch_sampler[0][0]), len(batch_sampler[0][0])))
+        print('[DEBUG] *** Visualizing a dialog:')
+        mid_idx = int(len(batch_sampler)/2)
+        dialog_batch = batch_sampler[mid_idx]
+        for idx, turn_batch in enumerate(dialog_batch):
+            print('* {}) {}'.format(idx, self.label_vocab.string(dataset.tgt[turn_batch[0]])))
+        print('[DEBUG] -----')
+        sys.stdout.flush()'''
+
+        # return a reusable, sharded iterator
+        epoch_iter = SLUEpochBatchIterator(
+            dataset=dataset,
+            dictionary=self.label_vocab,
+            collate_fn=dataset.collater,
+            batch_sampler=batch_sampler,
+            seed=seed,
+            num_shards=num_shards,
+            shard_id=shard_id,
+            num_workers=num_workers,
+            epoch=epoch,
+            curriculum=self.args.curriculum if hasattr(self.args, 'curriculum') else 0,
+            dialog_level=self.args.dialog_level_slu
+        )
+        self.dataset_to_epoch_iter[dataset] = epoch_iter
+        if dataset.get_split_id() == 'train':
+            self.batching_change = False
+
+        #print('[DEBUG] End2EndSLU.get_batch_iterator: returning new epoch iterator for data split {} @epoch {}'.format(dataset.get_split_id(), self.curr_epoch))
+        #sys.stdout.flush()
+
+        return epoch_iter
 
     #def build_generator(self, args):
     #    from fairseq.slu_sequence_generator import SLUSequenceGenerator

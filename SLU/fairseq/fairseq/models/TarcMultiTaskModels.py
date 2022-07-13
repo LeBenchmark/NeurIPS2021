@@ -52,7 +52,9 @@ class TarcMultiTaskEncoder(FairseqEncoder):
         super().__init__(dictionary)
         self.args = args
         self.padding_idx = dictionary.pad_index
-        self.sequence_separator = dictionary.add_symbol( args.sequence_separator )
+        self.sequence_separator = dictionary.index( args.sequence_separator )
+        if self.sequence_separator == dictionary.unk():
+            raise ValueError('Sequence separator symbol {} is expected to be defined in the dictionary'.format(args.sequence_separator))
         self.encoders = encoders
         self.granularity_merging_flags = () 
 
@@ -170,7 +172,9 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
         super().__init__(dictionary)
 
         self.args = args
-        self.sequence_separator = dictionary.add_symbol(args.sequence_separator)
+        self.sequence_separator = dictionary.index(args.sequence_separator)
+        if self.sequence_separator == dictionary.unk():
+            raise ValueError('Sequence separator symbol {} is expected to be defined in the dictionary'.format(args.sequence_separator))
         self.decoders = decoders
         self.first_decoder = 0
         self.last_decoder = len(decoders)
@@ -585,7 +589,12 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
  
             encoder_embed_tokens = build_embedding(
                 args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
-            ) 
+            )
+            if hasattr(args, 'load_embeddings') and args.load_embeddings:
+                if hasattr(args, 'load_dictionary') and not args.load_dictionary:
+                    print('TArCMultiTask CRITICAL WARNING: loading pre-trained embeddings, but no pre-defined dictionary was specified!')
+                    sys.stdout.flush()
+                encoder_embed_tokens = torch.load(args.load_embeddings)
 
             decoder_embed_tokens = encoder_embed_tokens
             args.share_decoder_input_output_embed = True
@@ -708,7 +717,9 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
         self.dict = tgt_dict
         self.tmp_dict = {}
         self.num_of_tasks = len(decoder.decoders)
-        self.sequence_separator = tgt_dict.add_symbol(args.sequence_separator)
+        self.sequence_separator = tgt_dict.index(args.sequence_separator)
+        if self.sequence_separator == tgt_dict.unk():
+            raise ValueError('Sequence separator symbol is expected to be defined in the dictionary'.format(args.sequence_separator))
 
         # Kept for possible future use
         self.teacher_forcing = True

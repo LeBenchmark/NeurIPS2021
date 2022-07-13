@@ -93,13 +93,14 @@ def get_chars_from_tokens_(tokens, t2c_map, mdict):
 
     (B, T) = tokens.size()
     assert T == 1
+    tmp = []
     for bi in range(B): 
         t = tokens[bi,0].item()
         if t in t2c_map:
-            tmp = [t2c_map[t].to(tokens)]
+            tmp.append( t2c_map[t].to(tokens) ) # = [t2c_map[t].to(tokens)]
         else:
             sys.stderr.write(' *** get_chars_from_tokens WARNING: predicted token {} ({}) is not defined in current map, backing off to <bos>\n'.format(t, mdict.string(tokens[bi,:]))) 
-            tmp = [t2c_map[mdict.bos()].to(tokens)]
+            tmp.append( t2c_map[mdict.bos()].to(tokens) ) #= [t2c_map[mdict.bos()].to(tokens)]
     max_len = max( [t.size(0) for t in tmp if len(t.size()) > 0] )
     if max_len == 0:
         max_len = 1

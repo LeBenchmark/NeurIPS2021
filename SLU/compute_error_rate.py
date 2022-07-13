@@ -7,12 +7,19 @@ import random
 
 import torch
 
+'''
 blank_token = '__'
 bos_token = 'SOS'
 eos_token = 'EOS'
 void_concept = 'null'
 slu_start_concept_mark = '_SOC_'
 slu_end_concept_mark = '_EOC_'
+machine_semantic = 'MachineSemantic'
+'''
+
+from fairseq.globals import blank_token, SOS_tag, EOS_tag, void_concept, slu_start_concept_mark, slu_end_concept_mark, machine_semantic, EOD_tag, bogus_token
+bos_token = SOS_tag
+eos_token = EOS_tag
 
 blank_idx = 0
 sos_idx = -1
@@ -31,6 +38,8 @@ parser.add_argument('--slu-out', action='store_true', default=False, help='Keep 
 parser.add_argument('--corpus', type=str, default='media', help='Specify the corpus name for task specific post-processing')
 parser.add_argument('--etape-slu-clean', action='store_true', default=False, help='Remove the bogus SLU annotation used in the ETAPE data')
 parser.add_argument('--character-level-slu', action='store_true', default=False, help='Assume character-level SLU output format (as specified in training and generation with option --character-level-slu)')
+parser.add_argument('--filter-machine-turns', action='store_true', default=False, help='Filter our machine turns (used e.g. in dialog-level SLU)')
+parser.add_argument('--only-machine-turns', action='store_true', default=False, help='Keep only machine turns (used e.g. in dialog-level SLU)')
 args = parser.parse_args()
 
 def tsr_edit_distance(ref, hyp):
@@ -332,12 +341,16 @@ dict[slu_start_concept_mark] = len(dict)
 inv_dict[dict[slu_start_concept_mark]] = slu_start_concept_mark
 dict[slu_end_concept_mark] = len(dict)
 inv_dict[dict[slu_end_concept_mark]] = slu_end_concept_mark
+dict[machine_semantic] = len(dict)
+inv_dict[dict[machine_semantic]] = machine_semantic
 
 etape_clean_list = [void_concept, slu_start_concept_mark, slu_end_concept_mark]
 blank_idx = dict[blank_token]
 refs = {}
+ref_machine = 0
 ref_tokens = 0
 sem_dict = {}
+filter_idx = []
 c_shift = 1
 if args.character_level_slu:
     c_shift = 2
@@ -361,6 +374,12 @@ for line in f:
                 print(' - Adding {} to concept dictionary'.format(prev_token))
                 sys.stdout.flush()
         #prev_token = t
+    if machine_semantic in tokens:
+        ref_machine += 1 
+    if (args.filter_machine_turns and machine_semantic in tokens) or EOD_tag in tokens or bogus_token in tokens:
+        filter_idx.append(rid)
+    elif args.only_machine_turns and machine_semantic not in tokens:
+        filter_idx.append(rid)
     refs[rid] = torch.LongTensor( [dict[t] for t in tokens if not t in etape_clean_list] ) if args.etape_slu_clean else torch.LongTensor( [dict[t] for t in tokens] )
 f.close()
 
@@ -383,6 +402,7 @@ def preprocess_hyp(hyp):
 
 hyps = {}
 hyp_tokens = 0
+hyp_machine_missmatch = 0
 f = open(args.hyp)
 for line in f:
     line = line.rstrip("\r\n")
@@ -394,7 +414,9 @@ for line in f:
     for t in tokens:
         if not t in dict:
             dict[t] = len(dict)
-            inv_dict[dict[t]] = t 
+            inv_dict[dict[t]] = t
+    if ref_machine > 0 and torch.sum(refs[hid] == dict[machine_semantic]).item() > 0 and machine_semantic not in tokens:
+        hyp_machine_missmatch += 1
     hyps[hid] = torch.LongTensor( [dict[t] for t in tokens if not t in etape_clean_list] ) if args.etape_slu_clean else torch.LongTensor( [dict[t] for t in tokens] )
     assert hid in refs
 f.close()
@@ -443,6 +465,10 @@ sos_idx = dict[bos_token]
 eos_idx = dict[eos_token]
 soc_idx = dict[slu_start_concept_mark]
 eoc_idx = dict[slu_end_concept_mark]
+
+for fk in filter_idx:
+    del hyps[fk]
+    del refs[fk]
 
 clean_flag = args.clean_hyp
 slu_flag = args.slu_out
@@ -501,7 +527,9 @@ if total_toks == 0:
 print(' ***')
 print('{} VS. {}'.format(args.ref, args.hyp))
 print('   * Total error rate: {:.3f}%'.format( float(sum(total_er))*100.0 / float(total_toks) ))
-print('   * Total % corretc: {:.3f}%'.format( 100.0 - float(sum(total_er[1:]))*100.0 / float(total_toks) ))
+print('   * Total % correct: {:.3f}%'.format( 100.0 - float(sum(total_er[1:]))*100.0 / float(total_toks) ))
+if ref_machine > 0:
+    print('    * Machine turns missmatched: {}'.format(hyp_machine_missmatch))
 print(' ***')
 sys.stdout.flush()
 

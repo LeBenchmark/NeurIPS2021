@@ -58,7 +58,7 @@ def save_checkpoint(args, trainer, epoch_itr, val_loss):
         or is_better(val_loss, save_checkpoint.best)
     )
     if val_loss is not None and args.keep_best_checkpoints > 0:
-        checkpoint_conds["checkpoint.best_{}_{:.3f}.pt".format(
+        checkpoint_conds["checkpoint.best_{}_{:.4f}.pt".format(
             args.best_checkpoint_metric, val_loss)] = (
             not hasattr(save_checkpoint, "best")
             or is_better(val_loss, save_checkpoint.best)

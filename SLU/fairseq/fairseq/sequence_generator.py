@@ -282,10 +282,6 @@ class SequenceGenerator(object):
             lprobs[:, self.pad] = -math.inf  # never select pad
             lprobs[:, self.unk] -= self.unk_penalty  # apply unk penalty
 
-            '''print(' - sequence_generator, out of forward_decoder, lprobs type: {}'.format(type(lprobs)))
-            print(' - sequence_generator, out of forward_decoder, lprobs shape: {}'.format(lprobs.size()))
-            sys.stdout.flush()'''
-
             # handle max length constraint
             if step >= max_len:
                 lprobs[:, :self.eos] = -math.inf
@@ -361,15 +357,7 @@ class SequenceGenerator(object):
                     banned_tokens = [[] for bbsz_idx in range(bsz * beam_size)]
 
                 for bbsz_idx in range(bsz * beam_size):
-                    lprobs[bbsz_idx, banned_tokens[bbsz_idx]] = -math.inf
-
-            '''print(' - sequence_generator, lprobs type: {}'.format(type(lprobs)))
-            print(' - sequence_generator, scores type: {}'.format(type(scores)))
-            print(' - sequence_generator, lprobs shape: {}'.format(lprobs.size()))
-            print(' - sequence_generator, scores shape: {}'.format(scores.size()))
-            print('   lprobs view shape: {}'.format(lprobs.view(bsz, -1, self.vocab_size).size()))
-            print('   scores view shape: {}'.format(scores.view(bsz, beam_size, -1)[:,:,:step].size()))
-            sys.stdout.flush()'''
+                    lprobs[bbsz_idx, banned_tokens[bbsz_idx]] = -math.inf 
 
             cand_scores, cand_indices, cand_beams = self.search.step(
                 step,
@@ -406,11 +394,19 @@ class SequenceGenerator(object):
 
             assert num_remaining_sent >= 0
             if num_remaining_sent == 0:
+                for m in model.models:
+                    if hasattr(m.decoder, 'set_finalized_sequences'):
+                        m.decoder.finalize_sequences(finalized_sents)
+                        m.decoder.finalize_turn_batch(None)
                 break
             assert step < max_len
 
             if len(finalized_sents) > 0:
                 new_bsz = bsz - len(finalized_sents)
+
+                for m in model.models:
+                    if hasattr(m.decoder, 'set_finalized_sequences'):
+                        m.decoder.finalize_sequences(finalized_sents)
 
                 # construct batch_idxs which holds indices of batches to keep for the next pass
                 batch_mask = cand_indices.new_ones(bsz)
@@ -510,6 +506,10 @@ class SequenceGenerator(object):
 
             # reorder incremental state in decoder
             reorder_state = active_bbsz_idx
+
+        for m in model.models:
+            if hasattr(m, 'finalize_turn_batch'):
+                m.finalize_turn_batch(None)
 
         # sort by score descending
         for sent in range(len(finalized)):

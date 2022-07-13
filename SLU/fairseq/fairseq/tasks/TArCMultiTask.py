@@ -8,8 +8,9 @@ import glob
 import torch
 
 from fairseq.tarc_utils import *
-from fairseq.data import Dictionary, TarcMultiTaskDataset
+from fairseq.data import TarcMultiTaskDataset
 from fairseq.tasks import FairseqTask, register_task
+from fairseq.tasks.End2EndSLU import SLUDictionary, init_slu_dictionary
 
 from nltk.tree import Tree
 from typing import Dict, List
@@ -805,13 +806,16 @@ def read_tarc_parallel_data( file_prefix, args ):
 
     return (tok_sequences, char_sequences, char_seq_lengths, token2components)
 
-def map_tokens(data, dict, pad_flag):
+def map_tokens(args, data, dict, pad_flag, split):
 
     tensors = []
     for s in data:
         tok_lst = []
-        for t in s: 
-            tok_lst.append( dict.add_symbol(t) )
+        for t in s:
+            if args.freeze_dictionary or (args.freeze_train_dictionary and split != 'train'):
+                tok_lst.append( dict.index(t) )
+            else:
+                tok_lst.append( dict.add_symbol(t) )
         if pad_flag:
             tok_lst = [dict.bos()] + tok_lst + [dict.eos()] 
         tensors.append( torch.LongTensor( tok_lst ) )
@@ -906,6 +910,11 @@ class TarcMultiTask(FairseqTask):
         parser.add_argument('--load-transformer-layers', type=str, help='Load pre-trained transformer layers in the LSTM encoder')
         parser.add_argument('--freeze-transformer-layers', action='store_true', default=False, help='Freeze pre-trained Transformer layers in LSTM encoder')
         parser.add_argument('--apply-filling', action='store_true', default=False, help='Apply filler substitution whatever the subtask')
+        parser.add_argument('--save-embeddings', action='store_true', default=False, help='Save the token embeddings of the best model')
+        parser.add_argument('--load-dictionary', type=str, help='Load a pre-defined dictionary from the specified file')
+        parser.add_argument('--load-embeddings', type=str, help='Load embeddings from the specified file')
+        parser.add_argument('--freeze-dictionary', action='store_true', default=False, help='Don\'t add symbols from additionally read data to the dictionary')
+        parser.add_argument('--freeze-train-dictionary', action='store_true', default=False, help='Construct the dictionary only from training data tokens')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -913,14 +922,38 @@ class TarcMultiTask(FairseqTask):
         # Here we can perform any setup required for the task. This may include
         # loading Dictionaries, initializing shared Embedding layers, etc.
         # In this case we'll just initialize the label dictionary
+       
         
-        input_vocab = Dictionary(
-                                 pad=pad_token,
-                                 eos=eos_token,
-                                 unk=unk_token,
-                                 bos=bos_token,
-                                 extra_special_symbols=[start_token, end_token]
-        )
+        #blank_token = "__"
+        #pad_char = pad_token 
+        #machine_semantic = 'MachineSemantic'
+        #slu_start_concept_mark = '_SOC_'
+        #slu_end_concept_mark = '_EOC_'
+        #tok_separator = '|'
+        #user_ID = 'User'
+        #machine_ID = 'Machine'
+        #bogus_ID = '_Bogus_'
+        #EOD_tag = '_EOD_'
+
+        #input_vocab = Dictionary(
+        #                         pad=pad_token,
+        #                         eos=eos_token,
+        #                         unk=unk_token,
+        #                         bos=bos_token,
+        #                         extra_special_symbols=[start_token, end_token, args.sequence_separator, blank_token, machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, user_ID, machine_ID, bogus_ID, EOD_tag]
+        #)
+        input_vocab = init_slu_dictionary(args) # NOTE: defined in fairseq.tasks.End2EndSLU
+        if hasattr(args, 'load_dictionary') and args.load_dictionary:
+
+            if args.serialized_data is not None and os.path.exists(args.serialized_data + '.train') and os.path.isfile(args.serialized_data + '.train'):
+                print('')
+                print(' ######################################################################################################################################################')
+                print(' ### TArCMultiTask CRITICAL WARNING: loading pre-defined dictionary, did you regenerate serialized data with this dictionary to have correct indexing ?')
+                print(' ######################################################################################################################################################')
+                print('')
+                sys.stdout.flush()
+
+            input_vocab = torch.load(args.load_dictionary)
         output_vocab = input_vocab
 
         if hasattr(args, 'input_lm') and args.input_lm:
@@ -931,12 +964,13 @@ class TarcMultiTask(FairseqTask):
             input_vocab = lm_data['vocab']
             output_vocab = input_vocab
 
-            print('')
-            print(' ######################################################################################################################################################')
-            print(' ### TArCMultiTask CRITICAL WARNING: loading pre-defined dictionary, did you regenerate serialized data with this dictionary to have correct indexing ?')
-            print(' ######################################################################################################################################################')
-            print('')
-            sys.stdout.flush()
+            if args.serialized_data is not None and os.path.exists(args.serialized_data + '.train') and os.path.isfile(args.serialized_data + '.train'):
+                print('')
+                print(' ######################################################################################################################################################')
+                print(' ### TArCMultiTask CRITICAL WARNING: loading pre-defined dictionary, did you regenerate serialized data with this dictionary to have correct indexing ?')
+                print(' ######################################################################################################################################################')
+                print('')
+                sys.stdout.flush()
 
         print('| [token] dictionary: {} types'.format(len(input_vocab)))
         print('| [label] dictionary: {} types'.format(len(output_vocab)))
@@ -965,20 +999,23 @@ class TarcMultiTask(FairseqTask):
         self.input_vocab = input_vocab
         self.output_vocab = output_vocab
         if hasattr(args, 'lm_data') and args.lm_data:
-            self.lm_vocab = Dictionary(
-                                 pad=pad_token,
-                                 eos=eos_token,
-                                 unk=unk_token,
-                                 bos=bos_token,
-                                 extra_special_symbols=[start_token, end_token]
-            )
+            #self.lm_vocab = Dictionary(
+            #                     pad=pad_token,
+            #                     eos=eos_token,
+            #                     unk=unk_token,
+            #                     bos=bos_token,
+            #                     extra_special_symbols=[start_token, end_token, args.sequence_separator]
+            #)
+            self.lm_vocab = init_slu_dictionary(args)
             self.lm_vocab.update( input_vocab )
  
-        self.sequence_separator = self.input_vocab.add_symbol(args.sequence_separator)
+        self.sequence_separator = self.input_vocab.index(args.sequence_separator)
         self.token2components_tsr = []
         self.granularity_merging_flags = {}
         self.double_learning = args.double_learning 
         self.splits = {}
+        #if hasattr(args, 'load_dictionary') and args.load_dictionary:
+        #    self.splits['vocab'] = input_vocab
         self.num_of_inputs = 1 
 
     def set_granularity_merging_flags(self, g_flags):
@@ -987,7 +1024,7 @@ class TarcMultiTask(FairseqTask):
     def get_granularity_merging_flags(self):
         return self.granularity_merging_flags
 
-    def _t2c_to_tsr(self, t2c: Dict[str, List[str]], dict: Dictionary) -> Dict[int, torch.LongTensor]:
+    def _t2c_to_tsr(self, t2c: Dict[str, List[str]], dict: SLUDictionary) -> Dict[int, torch.LongTensor]:
  
         res_dict = {}
         for k in t2c.keys():
@@ -1010,7 +1047,8 @@ class TarcMultiTask(FairseqTask):
                 print('   * reading dictionary ...')
                 sys.stdout.flush()
 
-                self.input_vocab = torch.load( self.args.serialized_data + '.vocab' ) #self.splits['vocab']
+                if not (hasattr(self.args, 'load_dictionary') and self.args.load_dictionary):
+                    self.input_vocab = torch.load( self.args.serialized_data + '.vocab' ) #self.splits['vocab']
                 self.output_vocab = self.input_vocab
 
                 print('   * reading token-to-components map ...')
@@ -1055,7 +1093,7 @@ class TarcMultiTask(FairseqTask):
                     tk_idx = 0
                     #if not self.args.token_sequences:
                     #    tk_idx = 1
-                    tok_tt = map_tokens(data_sequences[tk_idx][d_idx], self.input_vocab, self.args.pad_reference)
+                    tok_tt = map_tokens(self.args, data_sequences[tk_idx][d_idx], self.input_vocab, self.args.pad_reference, my_split)
                     tok_tensors.append( tok_tt )
                     tok_ll = torch.LongTensor( [t.size(0) for t in tok_tt] )
                     tok_lengths.append( tok_ll )
@@ -1069,7 +1107,7 @@ class TarcMultiTask(FairseqTask):
                     ch_idx = 1
                     #if not self.args.char_sequences:
                     #    ch_idx = 0
-                    tt = map_tokens(data_sequences[ch_idx][d_idx], self.input_vocab, self.args.pad_reference)
+                    tt = map_tokens(self.args, data_sequences[ch_idx][d_idx], self.input_vocab, self.args.pad_reference, my_split)
                     tensors.append( tt )
                     ll = torch.LongTensor([t.size(0) for t in tt])
                     lengths.append(ll) 
@@ -1253,6 +1291,15 @@ class TarcMultiTask(FairseqTask):
     #     seed=1, num_shards=1, shard_id=0,
     # ):
     #     (...)
+
+    def begin_epoch(self, epoch, model):
+        """Hook function called before the start of each epoch."""
+
+        if epoch > 1 and hasattr(self.args, 'save_embeddings') and self.args.save_embeddings:
+            print('[DEBUG] * TArCMultiTask: saving current model embeddings')
+            sys.stdout.flush()
+
+            torch.save(model.encoder.encoders[0].embed_tokens, self.args.serialized_data + '.emb')
 
     def build_generator(self, args):
         

@@ -91,13 +91,14 @@ def collate(
     src_tokens = merge_features('source', left_pad=left_pad_source)
     # sort by descending source length
     src_lengths = torch.LongTensor([s['source'].size(0) for s in samples])
-    src_lengths, sort_order = src_lengths.sort(descending=True)
-    id = id.index_select(0, sort_order)
-    src_tokens = src_tokens.index_select(0, sort_order)
+    #src_lengths, sort_order = src_lengths.sort(descending=True)
+    #id = id.index_select(0, sort_order)
+    #src_tokens = src_tokens.index_select(0, sort_order)
 
     target = merge_tokens('target', left_pad=left_pad_target)
-    target = target.index_select(0, sort_order).type(torch.LongTensor)
-    tgt_lengths = torch.LongTensor([s['target'].size(0) for s in samples]).index_select(0, sort_order)
+    #target = target.index_select(0, sort_order).type(torch.LongTensor)
+    tgt_lengths = torch.LongTensor([s['target'].size(0) for s in samples])
+    #tgt_lengths = tgt_lengths.index_select(0, sort_order)
     ntokens = sum(len(s['target']) for s in samples)
 
     prev_output_tokens = None
@@ -112,7 +113,7 @@ def collate(
             eos=eos_idx,
             move_trail=True,
         )
-        prev_output_tokens = prev_output_tokens.index_select(0, sort_order).type(torch.LongTensor)
+        #prev_output_tokens = prev_output_tokens.index_select(0, sort_order).type(torch.LongTensor)
 
         # This is created but not used for now...
         next_output_tokens = merge_tokens(
@@ -122,7 +123,7 @@ def collate(
             eos=None,
             move_trail=True,
         )
-        next_output_tokens = next_output_tokens.index_select(0, sort_order).type(torch.LongTensor)
+        #next_output_tokens = next_output_tokens.index_select(0, sort_order).type(torch.LongTensor)
 
     batch = {
         'id': id,
@@ -182,7 +183,7 @@ class End2EndSLUDataset(FairseqDataset):
         """
 
     def __init__(
-        self, src, src_sizes,
+        self, args, split, src, src_sizes,
         tgt, tgt_sizes, tgt_dict,
         idx_structure,
         left_pad_target=False,
@@ -192,6 +193,8 @@ class End2EndSLUDataset(FairseqDataset):
         append_bos=False, eos=None
     ):
 
+        self.data_split_id = split
+        self.args = args
         self.src = src
         self.tgt = tgt
         self.src_sizes = np.array(src_sizes)
@@ -202,8 +205,61 @@ class End2EndSLUDataset(FairseqDataset):
 
         self.idx_spk_batches = idx_structure
         self.idx_batches = []
-        for s in idx_structure:
-            self.idx_batches.append( [t[0] for t in s] )
+        #print('[DEBUG] End2ENDSLUDataset, type of idx_structure: {} (size: {})'.format(type(idx_structure), len(idx_structure)))
+        #sys.stdout.flush()
+        for dialog_batch in idx_structure:
+
+            #print('[DEBUG] End2EndSLUDataset, type of elements in idx_structure: {} (size: {})'.format(type(dialog_batch), len(dialog_batch)))
+            #sys.stdout.flush()
+
+            if args.dialog_level_slu:
+                tmp_d = []
+                for turn_batch in dialog_batch:
+
+                    #print('[DEBUG] End2EndSLUDataset, type of elements of elements: {} (size: {})'.format(type(turn_batch), len(turn_batch)))
+                    #print('[DEBUG] End2EndSLUDataset, type of deepest elements: {}'.format(type(turn_batch[0])))
+                    #sys.stdout.flush()
+
+                    tmp_b = []
+                    for turn_info in turn_batch:
+                        tmp_b.append( turn_info[0] )
+                    tmp_d.append( tmp_b )
+                self.idx_batches.append( tmp_d )
+
+                '''print('[DEBUG]### End2EndSLUdataset, reorganizing batches @split {}'.format(self.data_split_id))
+                print('[DEBUG]###     * type of self.idx_batches: {} (size: {})'.format(type(self.idx_batches), len(self.idx_batches)))
+                print('[DEBUG]###     * type of elements: {} (length: {})'.format(type(self.idx_batches[-1]), len(self.idx_batches[-1])))
+                print('[DEBUG]###     * type of elements of elements: {} (length: {})'.format(type(self.idx_batches[-1][0]), len(self.idx_batches[-1][0])))
+                print('[DEBUG]###     * type of deepest elements: {}'.format(type(self.idx_batches[-1][0][0])))''' 
+            else:
+                self.idx_batches.append( [t[0] for t in dialog_batch] )
+
+        '''if args.dialog_level_slu:
+            assert len(self.idx_batches) == len(idx_structure)
+            for didx in range(len(idx_structure)):
+                assert len(idx_structure[didx]) == len(self.idx_batches[didx])
+                for tidx in range(len(idx_structure[didx])):
+                    assert len(idx_structure[didx][tidx]) == len(self.idx_batches[didx][tidx])
+                    for idx in range(len(idx_structure[didx][tidx])):
+                        assert idx_structure[didx][tidx][idx][0] == self.idx_batches[didx][tidx][idx]
+
+            mid_idx = int(len(self.idx_batches)/2)
+            print('[DEBUG] End2EndSLUDataset, *** Visualizing a whole dialog:')
+            dialog_batch = self.idx_batches[mid_idx]
+            dialog_idx = 0
+            for tidx in range(len(dialog_batch)):
+                print('[DEBUG] {}) {}'.format(tidx, self.tgt_dict.string(self.tgt[dialog_batch[tidx][dialog_idx]])))
+                sys.stdout.flush()
+            print('[DEBUG] ---------------')
+            sys.stdout.flush()
+        if args.dialog_batches:
+            mid_idx = int(len(self.idx_batches)/2)
+            print('[DEBUG] End2EndSLUDataset, *** Visualizing a whole dialog @initialization:')
+            dialog_batch = self.idx_batches[mid_idx]
+            for i, idx in enumerate(dialog_batch):
+                print('[DEBUG] {} -> {}) {}'.format(i, idx, self.tgt_dict.string(self.tgt[dialog_batch[i]])))
+            print('[DEBUG] ----------')
+            sys.stdout.flush()'''
 
         # Curriculum solution 1: sort all turns by length, without regard to the speaker
         lengths = [(i, t.size(0)) for i, t in enumerate(src)]
@@ -245,10 +301,23 @@ class End2EndSLUDataset(FairseqDataset):
     def curriculum(self, value=False):
         self.shuffle = not value
 
+    def set_split_id(self, value='train'):
+        print('[DEBUG] End2EndSLUDataset, data split id set to: {}'.format(value))
+        sys.stdout.flush()
+
+        self.data_split_id = value
+        return self.data_split_id
+
+    def get_split_id(self):
+        return self.data_split_id
+
     def __getitem__(self, index):
         tgt_item = self.tgt[index]
         src_item = self.src[index]
-        
+
+        #print('[DEBUG] End2EndSLUDataset.getitem: demanded index {}'.format(index))
+        #sys.stdout.flush()
+
         # Append EOS to end of tgt sentence if it does not have an EOS and remove
         # EOS from end of src sentence if it exists. This is useful when we use
         # use existing datasets for opposite directions i.e., when we want to
@@ -345,24 +414,64 @@ class End2EndSLUDataset(FairseqDataset):
         if self.shuffle:
             batch_shuffle_idx = np.random.permutation(len(self.idx_batches))
             #[id for sid in shuffle for id in lists[sid]]
-            indices = np.array([idx for sidx in batch_shuffle_idx for idx in self.idx_batches[sidx]])
+            if not self.args.dialog_level_slu and not self.args.dialog_batches:
+                indices = np.array([idx for sidx in batch_shuffle_idx for idx in self.idx_batches[sidx]])
+            elif self.args.dialog_batches:
+                indices = []
+                for idx in batch_shuffle_idx:
+                    indices.append( self.idx_batches[idx] )
 
-            #print(' - End2EndSLUDataset, using shuffled indices')
-            #sys.stdout.flush()
+                '''print('[DEBUG] End2EndSLUDataset, using dialog-batches shuffled indices:')
+                print('[DEBUG]     * type of indices: {} (size: {})'.format(type(indices), len(indices)))
+                print('[DEBUG]     * type of elements of indices: {} (size: {})'.format(type(indices[0]), len(indices[0])))
+                print('[DEBUG]   *** Visualizing a whole dialog in ordered_indices:')
+                mid_idx = int(len(indices)/2)
+                dialog_batch = indices[mid_idx]
+                for i, idx in enumerate(dialog_batch):
+                    print('[DEBUG] {} -> {}) {}'.format(i, idx, self.tgt_dict.string(self.tgt[dialog_batch[i]])))
+                print('[DEBUG] ----------')
+                sys.stdout.flush()'''
+            else:
+                indices = []
+                for idx in batch_shuffle_idx:
+                    indices.append( self.idx_batches[idx] ) # NOTE: this allows to keep original dialog structures, so this should allow to perform dialog-level SLU when --dialog-level-slu is used
+
+                for el in indices:
+                    assert type(el) == list
+                    for b in el:
+                        assert type(b) == list
+                        for tt in b:
+                            assert type(tt) != list and type(tt) != tuple
+
+                print('[DEBUG] End2EndSLUDataset, using shuffled indices @split {}'.format(self.data_split_id))
+                '''print('[DEBUG]     *** Visualizing a whole dialog in ordered_indices:')
+                mid_idx = int(len(indices)/2)
+                dialog_batch = indices[mid_idx]
+                dialog_idx = 0
+                for tidx in range(len(dialog_batch)):
+                    print('[DEBUG] {}) {}'.format(tidx, self.tgt_dict.string(self.tgt[dialog_batch[tidx][dialog_idx]])))
+                print(' ----------')'''
+                sys.stdout.flush()
 
             #indices = np.random.permutation(len(self)) 
         else:
             #indices = np.arange(len(self))
-            indices = np.array(self.curriculum_indices)
+            if self.args.curriculum > 0:
+                indices = np.array(self.curriculum_indices)
+            else:
+                indices = self.idx_batches
 
-            #print(' - End2EndSLUDataset, using curriculum indices')
-            #sys.stdout.flush()
+            print('[DEBUG] End2EndSLUDataset, using curriculum indices @split {}'.format(self.data_split_id))
+            sys.stdout.flush()
 
             return indices
 
-        if self.tgt_sizes is not None:
-            indices = indices[np.argsort(self.tgt_sizes[indices], kind='mergesort')]
-        return indices[np.argsort(self.src_sizes[indices], kind='mergesort')]
+        if not self.args.dialog_level_slu and not self.args.dialog_batches:
+            if self.tgt_sizes is not None:
+                indices = indices[np.argsort(self.tgt_sizes[indices], kind='mergesort')]
+            return indices[np.argsort(self.src_sizes[indices], kind='mergesort')]
+        else:
+            return indices
 
     @property
     def supports_prefetch(self):

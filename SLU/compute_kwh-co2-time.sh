@@ -11,4 +11,5 @@ while [[ $# -gt 0 ]]; do
 done
 
 cat $log_file | awk 'BEGIN{time=0; kwh=0; co2=0;} {time=time+$1; kwh=kwh+$3; co2=co2+$2;} END{hours=int(time/3600); mins=int((time-hours*3600)/60); print "Time:",hours"h"mins"m.","KWh:",kwh,"CO2:",co2,"(KWh to CO2 factor:",kwh/co2"; Wh/minute",(kwh*1000)/(time/60)")"}'
+rm -f tmp.consumption.log
 

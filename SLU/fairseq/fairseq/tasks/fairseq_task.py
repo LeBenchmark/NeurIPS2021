@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import warnings
+import sys
 
 import torch
 
@@ -151,7 +152,7 @@ class FairseqTask(object):
         # For default fairseq task, return same iterator across epochs
         # as datasets are not dynamic, can be overridden in task specific
         # setting.
-        if dataset in self.dataset_to_epoch_iter:
+        if dataset in self.dataset_to_epoch_iter: 
             return self.dataset_to_epoch_iter[dataset]
 
         assert isinstance(dataset, FairseqDataset)
@@ -179,7 +180,7 @@ class FairseqTask(object):
             max_tokens=max_tokens,
             max_sentences=max_sentences,
             required_batch_size_multiple=required_batch_size_multiple,
-        )
+        ) 
 
         # return a reusable, sharded iterator
         epoch_iter = iterators.EpochBatchIterator(
@@ -192,7 +193,8 @@ class FairseqTask(object):
             num_workers=num_workers,
             epoch=epoch,
         )
-        self.dataset_to_epoch_iter[dataset] = epoch_iter
+        self.dataset_to_epoch_iter[dataset] = epoch_iter 
+
         return epoch_iter
 
     def build_model(self, args):
