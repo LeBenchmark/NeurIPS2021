@@ -252,6 +252,9 @@ class TarcLSTMEncoder(FairseqEncoder):
 
         x = F.dropout(x, p=self.dropout_in, training=self.training)
 
+        #print('[DEBUG] x shape after embedding: {}'.format(x.size()))
+        #sys.stdout.flush()
+
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
         (T, B, C) = x.size() 
@@ -280,8 +283,15 @@ class TarcLSTMEncoder(FairseqEncoder):
             #print('   * Encoder: concatenating zeros')
             #sys.stdout.flush()
 
+        #print('[DEBUG] x shape before packing: {}'.format(x.size()))
+        #print('[DEBUG] toks_src_lengths: {}'.format(toks_src_lengths.data.tolist()))
+        #sys.stdout.flush()
+
         # pack embedded source tokens into a PackedSequence
-        packed_x = nn.utils.rnn.pack_padded_sequence(x, toks_src_lengths.data.tolist())
+        #packed_x = nn.utils.rnn.pack_padded_sequence(x, toks_src_lengths.data.tolist()) # TODO: solve the length missmatch problem and use packed sequences again !
+
+        #print('[DEBUG] packed_x shape: {}'.format(packed_x))
+        #sys.stdout.flush()
 
         # apply LSTM
         if self.bidirectional:
@@ -290,12 +300,19 @@ class TarcLSTMEncoder(FairseqEncoder):
             state_size = self.num_layers, bsz, self.hidden_size
         h0 = x.new_zeros(*state_size)
         c0 = x.new_zeros(*state_size)
-        packed_outs, (final_hiddens, final_cells) = lstm(packed_x, (h0, c0))
+        x, (final_hiddens, final_cells) = lstm(x, (h0, c0)) # TODO: see TODO above and use packed_x instead of input x and packed_outs instead of output x
+
+        #print('[DEBUG] packed_out shape: {}'.format(packed_outs))
+        #sys.stdout.flush()
 
         # unpack outputs and apply dropout
-        x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=self.padding_idx)
+        #x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=self.padding_idx)
+
+        #print('[DEBUG] final x shape: {}'.format(x.size()))
+        #sys.stdout.flush()
+
         x = F.dropout(x, p=self.dropout_out, training=self.training)
-        assert list(x.size()) == [seqlen, bsz, self.output_units]
+        assert list(x.size()) == [seqlen, bsz, self.output_units], 'Expected encoder output shape: {} x {} x {}; got {}'.format(seqlen, bsz, self.output_units, list(x.size()))
 
         if self.bidirectional:
 

@@ -27,6 +27,7 @@ Flask==2.0.2
 Flask-Compress==1.10.1
 future==0.18.2
 geocoder==1.38.1
+h5py==3.7.0
 idna==2.9
 importlib-metadata==4.6.1
 itsdangerous==2.0.1

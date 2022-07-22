@@ -15,23 +15,20 @@ echo "Using python: `which python`"
 echo " ---"
 
 # -----------------
-XP_HEAD='TowardDialogLevel'
-FEATURES_HEAD='MEDIA-SpeechAndText'
-FEATURES_TYPE='FlowBERT'	# Use 'spectro', 'normspectro' or 'W2V' or 'W2V2' or 'FlowBERT' or 'FlowBBERT' ... see below
-FEATURES_SPEC='-7kl-tokSLU'		# Choose a meaningful infix to add into file names, you can leave it empty for spectrograms (*-spg)
-FEATURES_EXTN='.7kl-tslu'	# Feature file extension, e.g. '.20.0ms-spg', '.bert-3kb', '.bert-3kl', '.bert-3klt', ...
-FEATURES_LANG='Fr'		# Use 'Fr' or 'En' ('En' only with 'W2V')
+XP_HEAD='DSTC'
+FEATURES_HEAD='DSTC'
+FEATURES_TYPE='spectro'	# Use 'spectro', 'normspectro' or 'W2V' or 'W2V2' or 'FlowBERT' or 'FlowBBERT' ... see below
+FEATURES_SPEC='-spectro-16kHz'		# Choose a meaningful infix to add into file names, you can leave it empty for spectrograms (*-spg)
+FEATURES_EXTN='.16kHz.20.0ms-spg'	# Feature file extension, e.g. '.20.0ms-spg', '.bert-3kb', '.bert-3kl', '.bert-3klt', ...
+FEATURES_LANG='En'		# Use 'Fr' or 'En' ('En' only with 'W2V')
 NORMFLAG='Normalized'
 SUBTASK='concept'
-CORPUS='media'
-THEME='1Step-SpeechAndTextInput-Gate-Check'	# No infix: Encoder+Decoder; 'PartDec': Encoder + Decoder embeddings and projection; 'NoDec': Encoder only 
+CORPUS='fsc'
+THEME='1Step-UserOnly-DialogLevel'	# No infix: Encoder+Decoder; 'PartDec': Encoder + Decoder embeddings and projection; 'NoDec': Encoder only 
 # -----------------
 
 WORK_PATH=/home/getalp/dinarelm/work/tools/fairseq_tools/end2end_slu/
-DATA_PATH=${HOME}/work/data/MEDIA-Original/semantic_speech_aligned_corpus/DialogMachineAndUser_SemTextAndWav_FixedChannel/
-#DATA_PATH=${HOME}/work/data/FluentSpeechCommands/fluent_speech_commands_dataset/wavs/
-#DATA_PATH=${HOME}/work/data/PortMEDIA/DialogTextAndWav/
-#DATA_PATH=${HOME}/work/data/ETAPE/
+DATA_PATH=${HOME}/work/data/DSTC/
 SERIALIZED_CORPUS=${WORK_PATH}/system_features/${FEATURES_HEAD}.user+machine.${FEATURES_TYPE}${FEATURES_SPEC}-${FEATURES_LANG}-${NORMFLAG}.data
 
 # LSTMs in the encoder are bi-directional, thus the decoder size must be twice the size of the encoder
@@ -53,7 +50,7 @@ MAX_EPOCHS=150
 LR=0.0005
 LR_SHRINK=0.98
 WDECAY=0.0001
-BATCH=5
+BATCH=16
 MAX_TOKENS=4750
 # ----------------
 NUM_FEATURES=81
@@ -103,24 +100,20 @@ fi
 ANNEAL=1
 wu_epochs=4
 curriculum=1
-ctx_fusion='sum'
-nbatches=5394	# Batch 5: MEDIA user turns only: 2758; MEDIA normalized for dialog-level SLU: 5614
+ctx_fusion='gating'
+nbatches=3547	# Batch 16, user only: 3547; Batch 16, user+machine: 6567
 wu_updates=$((${wu_epochs}*${nbatches}))	# Batch 5: MEDIA 5394, FSC 4627, PortMEDIA 2690, MEDIA+PortMEDIA 9275; Batch 10: MEDIA+PortMEDIA 5797
 warmup_opt="--warmup-updates ${wu_updates}"
-SAVE_PATH=${XP_HEAD}_${FEATURES_HEAD}_${FEATURES_TYPE}${FEATURES_SPEC}-${FEATURES_LANG}_${NLSTM}x${conv_desc}Enc-${enc_type}-H${encoder_size}-${DLAYERS}xDec-${DECODER}-${SUBTASK}-H${decoder_size}-Drop-Enc${DROP_RATIO}-Dec${TRANS_DROP_RATIO}_BATCH${BATCH}_LR${LR}_WU${wu_updates}_${CRITERION}${LABEL_SMOOTH}_${THEME}_Curriculum${curriculum}_TEST/
+SAVE_PATH=${XP_HEAD}_${FEATURES_HEAD}_${FEATURES_TYPE}${FEATURES_SPEC}-${FEATURES_LANG}_${NLSTM}x${conv_desc}Enc-${enc_type}-H${encoder_size}-${DLAYERS}xDec-${DECODER}-${SUBTASK}-H${decoder_size}-Drop-Enc${DROP_RATIO}-Dec${TRANS_DROP_RATIO}_BATCH${BATCH}_LR${LR}_WU${wu_updates}_${CRITERION}${LABEL_SMOOTH}_${THEME}_Curriculum${curriculum}_DialogLevel_TEST/
 if [[ $# -ge 2 ]]; then
 	SAVE_PATH=${2}_LR${LR}/
 fi
 
 reg_options="--clip-norm ${CLIP_NORM} --weight-decay ${WDECAY}"
 
-AUX_OPTIONS="${AUX_OPTIONS} --use-transcription-as-input" #--dialog-level-slu --normalize-dialog-batches --use-dialog-history --context-fusion ${ctx_fusion} --context-size 6 --context-first-turns 0"
+AUX_OPTIONS="${AUX_OPTIONS} --dialog-level-slu --normalize-dialog-batches --use-dialog-history --context-fusion ${ctx_fusion} --context-size 6 --context-first-turns 0"
 
-MEDIA_DICT=/home/getalp/dinarelm/work/tools/fairseq_tools/tarc_multitask_repo/tarc_exps/system_inputs/MEDIA-MultiTask-BILOU_NoConceptChunking-forMachineTurnAnnotationONLY.multi-task.data.tabular.vocab
-MEDIA_EMB=/home/getalp/dinarelm/work/tools/fairseq_tools/tarc_multitask_repo/tarc_exps/system_inputs/MEDIA-MultiTask-BILOU_NoConceptChunking-forMachineTurnAnnotationONLY.multi-task.data.tabular.emb
-
-#CUDA_VISIBLE_DEVICES=1
-PYTHONPATH=${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-train ${DATA_PATH} \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=${HOME}/work/tools/fairseq/ ${FAIRSEQ_PATH}/fairseq-train ${DATA_PATH} \
 	--task end2end_slu --arch end2end_slu_arch --criterion ${CRITERION} --num-workers=0 --distributed-world-size 1 --feature-extension ${FEATURES_EXTN} \
 	--decoder ${DECODER} --padded-reference --corpus-name ${CORPUS} ${AUX_OPTIONS} \
 	--save-dir ${SAVE_PATH} --patience 20 --no-epoch-checkpoints \

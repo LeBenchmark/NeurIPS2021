@@ -235,6 +235,11 @@ class SLUBaseCTCCriterion(FairseqCriterion):
             #else:
  
         sample_size = sample["ntokens"] -pad_count # if the reference is padded with bos and eos, do not account for them.
+        nframes = 0
+        if isinstance(sample["net_input"]["src_lengths"], tuple):
+            nframes = torch.sum( sample['net_input']['src_lengths'][0]).item()
+        else:
+            nframes = torch.sum( sample['net_input']['src_lengths']).item()
         logging_output = {
             "loss": utils.item( ber.data ) if reduce else ber.data, #utils.item(loss.data) if reduce else loss.data,
             "ctc": utils.item(loss.data) if reduce else loss.data,
@@ -245,7 +250,7 @@ class SLUBaseCTCCriterion(FairseqCriterion):
             "total": total - pad_count,
             "predicted" : hyps,
             "target" : refs,
-            "nframes": torch.sum(sample["net_input"]["src_lengths"]).item(),
+            "nframes": nframes
         }
 
         #print(' - SLUCTCCriterion, loss computed, lprobs shape: {}'.format(bound_lprobs.size()))

@@ -430,8 +430,8 @@ if args.slu_scores:
     for l in lines:
         tokens = l.strip().split()
         sid = tokens[0][2:]
-        tokens = tokens[2:-1]
-        assert sid in hyps and len(hyps[sid]) == len(tokens)
+        tokens = tokens[1:-1] if sid in hyps and len(hyps[sid]) == len(tokens)-2 else tokens[1:-(len(tokens) - len(hyps[sid]))+1]
+        assert sid in hyps and len(hyps[sid]) == len(tokens), 'sid in hyps ? {}; len(hyps[sid]) vs. len(tokens): {} vs. {}'.format(sid in hyps, len(hyps[sid]) if sid in hyps else 'n.a.', len(tokens))
         scores[sid] = tokens
         #scores = [l.rstrip().split()[start_idx:-1] for l in lines]
     nscores = sum( [len(scores[k]) for k in scores.keys()] )

@@ -72,7 +72,12 @@ def collate(
             [s[key] for s in samples],
             pad_idx, eos_idx, left_pad,
         )
-    
+
+    def merge_features_ex(key, left_pad, bos=None, eos=None, move_trail=False):
+        src_sig = collate_features([s[key][0] for s in samples], pad_idx, eos_idx, left_pad)
+        src_trs = collate_tokens_ex([s[key][1] for s in samples], pad_idx, bos_idx=bos, eos_idx=eos, left_pad=left_pad, move_trail=move_trail)
+        return (src_sig, src_trs)
+
     def merge_tokens(key, left_pad, bos=None, eos=None, move_trail=False):
         return collate_tokens_ex(
             [s[key] for s in samples],
@@ -87,10 +92,22 @@ def collate(
     print(' *****')
     sys.stdout.flush()'''
 
+    use_trs_flag = isinstance(samples[0]['source'], tuple)
+
     id = torch.LongTensor([s['id'] for s in samples])
-    src_tokens = merge_features('source', left_pad=left_pad_source)
+    src_signals, src_tokens = None, None
+    if use_trs_flag:
+        src_signals, src_tokens = merge_features_ex('source', left_pad=left_pad_source)
+    else:
+        src_tokens = merge_features('source', left_pad=left_pad_source)
     # sort by descending source length
-    src_lengths = torch.LongTensor([s['source'].size(0) for s in samples])
+    src_lengths, src_tok_lengths = None, None
+    if use_trs_flag:
+        src_lengths = torch.LongTensor( [s['source'][0].size(0) for s in samples] )
+        src_tok_lengths = torch.LongTensor( [s['source'][1].size(0) for s in samples] )
+        #src_lengths = (src_sig_lengths, src_trs_lengths)
+    else:
+        src_lengths = torch.LongTensor([s['source'].size(0) for s in samples])
     #src_lengths, sort_order = src_lengths.sort(descending=True)
     #id = id.index_select(0, sort_order)
     #src_tokens = src_tokens.index_select(0, sort_order)
@@ -130,8 +147,10 @@ def collate(
         'nsentences': len(samples),
         'ntokens': ntokens,
         'net_input': {
+            'src_signals': src_signals,
             'src_tokens': src_tokens,
             'src_lengths': src_lengths,
+            'src_tok_lengths': src_tok_lengths,
         },
         'target': target,
         'target_lengths' : tgt_lengths,
@@ -199,7 +218,7 @@ class End2EndSLUDataset(FairseqDataset):
         self.tgt = tgt
         self.src_sizes = np.array(src_sizes)
         self.tgt_sizes = np.array(tgt_sizes) if tgt_sizes is not None else None
-        self.tgt_dict = tgt_dict
+        self.tgt_dict = tgt_dict 
 
         #self.idx_batches = idx_structure
 
@@ -262,7 +281,7 @@ class End2EndSLUDataset(FairseqDataset):
             sys.stdout.flush()'''
 
         # Curriculum solution 1: sort all turns by length, without regard to the speaker
-        lengths = [(i, t.size(0)) for i, t in enumerate(src)]
+        lengths = [(i, t[0].size(0)) for i, t in enumerate(src)] if isinstance(src[0], tuple) else [(i, t.size(0)) for i,t in enumerate(src)]
         sorted_structure = sorted(lengths, key=lambda tuple: tuple[1])
         self.curriculum_indices = [t[0] for t in sorted_structure]
 
@@ -400,12 +419,18 @@ class End2EndSLUDataset(FairseqDataset):
     def num_tokens(self, index):
         """Return the number of tokens in a sample. This value is used to
         enforce ``--max-tokens`` during batching."""
-        return max(self.src_sizes[index], self.tgt_sizes[index])
+        if len(self.src_sizes.shape) == 2:
+            return max(self.src_sizes[index,0], self.tgt_sizes[index])
+        else:
+            return max(self.src_sizes[index], self.tgt_sizes[index])
 
     def size(self, index):
         """Return an example's size as a float or tuple. This value is used when
         filtering a dataset with ``--max-positions``."""
-        return (self.src_sizes[index], self.tgt_sizes[index])
+        if len(self.src_sizes.shape) == 2:
+            return (self.src_sizes[index,0], self.tgt_sizes[index])
+        else:
+            return (self.src_sizes[index], self.tgt_sizes[index])
 
     def ordered_indices(self):
         """Return an ordered list of indices. Batches will be constructed based
@@ -469,7 +494,10 @@ class End2EndSLUDataset(FairseqDataset):
         if not self.args.dialog_level_slu and not self.args.dialog_batches:
             if self.tgt_sizes is not None:
                 indices = indices[np.argsort(self.tgt_sizes[indices], kind='mergesort')]
-            return indices[np.argsort(self.src_sizes[indices], kind='mergesort')]
+            if len(self.src_sizes.shape) == 2:
+                return indices[np.argsort(self.src_sizes[indices,0], kind='mergesort')]
+            else:
+                return indices[np.argsort(self.src_sizes[indices], kind='mergesort')]
         else:
             return indices
 

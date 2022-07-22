@@ -303,15 +303,43 @@ def choose_column_processing(num_columns, args):
         column_processing = []
         gflags[args.sub_task] = []
         for ti in range(num_columns):
-            if ti == 0 and (args.token_sequences and args.char_sequences):
-                column_processing.append( opmap['char'] )
-                gflags[args.sub_task].append(True)
-            elif args.char_sequences and not args.token_sequences:
-                column_processing.append( opmap['char'] )
-                gflags[args.sub_task].append(False)
+            if hasattr(args, 'class_index') and args.class_index != -1 and args.class_index == ti:
+                column_processing.append( opmap['nop'])
+                if args.token_sequences and args.char_sequences:
+                    gflags[args.sub_task].append(True)
+                else:
+                    gflags[args.sub_task].append(False)
+
+                print('[DEBUG] TArCMultiTask, processing for column {} set to <nop> for sub-task {}'.format(ti, args.sub_task))
+                sys.stdout.flush()
+            elif hasattr(args, 'pos_index') and args.pos_index != -1 and args.pos_index == ti:
+                column_processing.append( opmap['pos'] )
+                if args.token_sequences and args.char_sequences:
+                    gflags[args.sub_task].append(True)
+                else:
+                    gflags[args.sub_task].append(False)
+
+                print('[DEBUG] TArCMultiTask, processing for column {} set to <pos> for sub-task {}'.format(ti, args.sub_task))
+                sys.stdout.flush()
             else:
-                column_processing.append( opmap['nop'] )
-                gflags[args.sub_task].append(False)
+                if args.token_sequences and args.char_sequences:
+                    column_processing.append( opmap['char'] )
+                    gflags[args.sub_task].append(True)
+
+                    print('[DEBUG] TArCMultiTask, processing for column {} (with tokens and chars) set to <char> for sub-task {}'.format(ti, args.sub_task))
+                    sys.stdout.flush()
+                elif args.char_sequences and not args.token_sequences:
+                    column_processing.append( opmap['char'] )
+                    gflags[args.sub_task].append(False)
+
+                    print('[DEBUG] TArCMultiTask, processing for column {} (with chars) set to <char> for sub-task {}'.format(ti, args.sub_task))
+                    sys.stdout.flush()
+                else:
+                    column_processing.append( opmap['nop'] )
+                    gflags[args.sub_task].append(False)
+
+                    print('[DEBUG] TArCMultiTask, processing for column {} (with tokens) set to <nop> for sub-task {}'.format(ti, args.sub_task))
+                    sys.stdout.flush()
     elif args.sub_task == 'tiger-mt':
         print(' - TArCMultiTask, processing mode set to tiger-mt')
         sys.stdout.flush()
@@ -915,6 +943,8 @@ class TarcMultiTask(FairseqTask):
         parser.add_argument('--load-embeddings', type=str, help='Load embeddings from the specified file')
         parser.add_argument('--freeze-dictionary', action='store_true', default=False, help='Don\'t add symbols from additionally read data to the dictionary')
         parser.add_argument('--freeze-train-dictionary', action='store_true', default=False, help='Construct the dictionary only from training data tokens')
+        parser.add_argument('--class-index', type=int, default=-1, help='Specify the index of the column, for data in tabular format, of the class level')
+        parser.add_argument('--pos-index', type=int, default=-1, help='Specify the index of the column, for data in tabular format, of the POS level')
 
     @classmethod
     def setup_task(cls, args, **kwargs):

@@ -259,6 +259,34 @@ class PyramidalRNNEncoder(nn.Module):
 
         return H
 
+class TranscriptionEncoder(nn.Module):
+
+    def __init__(self, args, dictionary):
+
+        super(TranscriptionEncoder, self).__init__()
+
+        self.args = args
+        self.dictionary = dictionary
+        num_embeddings = len(dictionary)
+        embed_dim = self.args.decoder_embed_dim
+        self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.dictionary.pad())
+        recurrent_layers = []
+        for i in range(self.args.num_lstm_layers):
+            input_size = 2*self.args.speech_lstm_size
+            if i == 0:
+                input_size = embed_dim
+            recurrent_layers.append( ('LSTM'+str(i+1), LSTMWrapper(input_size, self.args.speech_lstm_size, True, self.args.drop_ratio)) )
+        self.rnns = nn.Sequential( OrderedDict(recurrent_layers) )
+
+    def forward(self, x):
+
+        x = self.embed_tokens(x)
+        x = F.dropout(x, p=self.args.drop_ratio, training=self.training)
+        x = x.transpose(0, 1)
+        x = self.rnns(x)
+
+        return x
+
 
 class DeepSpeechLikeEncoder(nn.Module):
     
@@ -337,6 +365,9 @@ class End2EndSLUEncoder(FairseqEncoder):
         self.padding_idx = dictionary.pad_index
         self.blank_idx = dictionary.blank() 
 
+        if hasattr(self.args, 'use_transcription_as_input') and self.args.use_transcription_as_input:
+            self.trs_encoder = TranscriptionEncoder(args, dictionary)
+
         if hasattr(args, 'speech_encoder') and args.speech_encoder == 'deep-speech':
             self.encoder = DeepSpeechLikeEncoder(args)
             self.se_type = 'ds'
@@ -386,10 +417,18 @@ class End2EndSLUEncoder(FairseqEncoder):
                 c_idx += 1
         return c_padding
 
-    def forward(self, src_tokens, src_lengths):
-        # B x T x C -> T x B x C
+    def forward(self, src_signals, src_tokens, src_lengths, src_tok_lengths):
+        # B x T x C -> T x B x C 
 
-        x = src_tokens.transpose(0,1) 
+        trs_x = None
+        trs_mask = None
+        if hasattr(self, 'trs_encoder'):
+            #src_sig, src_trs = src_tokens
+            trs_x = self.trs_encoder(src_tokens)
+            x = src_signals.transpose(0, 1)
+            trs_mask = src_tokens.eq(self.dictionary.pad()).transpose(0, 1)
+        else:
+            x = src_tokens.transpose(0,1) 
 
         if self.se_type == 'ds':
             (conv_states, hidden_states) = self.encoder( x )
@@ -436,7 +475,9 @@ class End2EndSLUEncoder(FairseqEncoder):
 
             return {
                     'encoder_out': (encoder_out, final_hiddens, final_cells),
-                    'encoder_padding_mask': None    # NEW ARCHITECTURE FOR COMBINED LOSS: set this back to None to come back to previous architecture.
+                    'encoder_padding_mask': None,    # NEW ARCHITECTURE FOR COMBINED LOSS: set this back to None to come back to previous architecture.
+                    'trs_out': trs_x,
+                    'trs_mask': trs_mask,
             }
 
     # Encoders are required to implement this method so that we can rearrange
@@ -490,10 +531,18 @@ class End2EndSLUEncoder(FairseqEncoder):
             hidden_states = encoder_out['encoder_out'][0]
             new_hidden_states = hidden_states if hidden_states is None else hidden_states.index_select(1, new_order)
             new_final_h, new_final_c = create_lstm_final_states_(self.args.decoder_layers, new_hidden_states)
+            trs_x = encoder_out['trs_out']
+            if trs_x is not None:
+                trs_x = trs_x.index_select(1, new_order)
+            trs_mask = encoder_out['trs_mask']
+            if trs_mask is not None:
+                trs_mask = trs_mask.index_select(1, new_order)
 
             return {
                     'encoder_out': (new_hidden_states, new_final_h, new_final_c),
-                    'encoder_padding_mask': None
+                    'encoder_padding_mask': None,
+                    'trs_out': trs_x,
+                    'trs_mask': trs_mask
             }
         elif self.args.decoder == 'end2end_slu':
             # TODO: add the branch for the transformer as above
@@ -1656,6 +1705,10 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             self.attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
         else:
             self.attention = None
+        if hasattr(self.args, 'use_transcription_as_input') and self.args.use_transcription_as_input:
+            self.trs_attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
+            #self.sig_gate = init_functions.LSTMLinear(hidden_size, hidden_size)
+            #self.trs_gate = init_functions.LSTMLinear(hidden_size, hidden_size)
         if hidden_size != out_embed_dim:
             self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
@@ -1799,7 +1852,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         #print('[DEBUG] LSTMDecoderEx batch@0: -----\n{}'.format(self.dictionary.string(prev_output_tokens[0,:])))
         B, T = prev_output_tokens.size()
         nEOD = torch.sum( prev_output_tokens == self.dictionary.index(EOD_tag)).item()
-        if nEOD > 0 and nEOD < B:
+        if nEOD > 0 and nEOD < B and self.use_dhistory:
             nBogus = torch.sum( prev_output_tokens == self.dictionary.index(bogus_token) ).item()
             assert T == 3 and nEOD+nBogus == B, 'Dialog-level data organization has probably been corrupted'
             print('End2EndSLU FATAL ERROR: you probably recharged a previously run training and this corrupted dialog-level data organization (got {} end-of-dialog markers, expected {})'.format(nEOD, B))
@@ -1807,7 +1860,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             #print('[DEBUG] LSTMDecoderEx: detected {} EOD tags (batch size = {}; T = {})'.format(nEOD, B, T))
             #print('[DEBUG]    - complete batch: {}'.format(self.dictionary.string(prev_output_tokens)))
             #sys.stdout.flush()
-        EOD_flag = torch.sum(prev_output_tokens == self.dictionary.index(EOD_tag)).item() == B and T == 3
+        EOD_flag = nEOD == B and T == 3
         if EOD_flag and incremental_state is None:
             self.dialog_history = []
             #print('[DEBUG] LSTMDecoderEx: End-of-Dialog marker detected!')
@@ -1923,6 +1976,8 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         """
         Similar to *forward* but only return features.
         """
+        trs_x = encoder_out['trs_out']
+        trs_mask = encoder_out['trs_mask']
         if encoder_out is not None:
             encoder_padding_mask = encoder_out['encoder_padding_mask']
             encoder_out = encoder_out['encoder_out']
@@ -2100,6 +2155,15 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
                 out, attn_scores[:, j, :] = self.attention(hidden, encoder_outs, encoder_padding_mask)
             else:
                 out = hidden
+            if hasattr(self, 'trs_attention'):
+                #trs_x = encoder_out['trs_out']
+                #trs_mask = encoder_out['trs_mask']
+                trs_att, _ = self.trs_attention(hidden, trs_x, trs_mask)
+                # Solution 1.
+                out = out + trs_att
+                # Solution 2.
+                #gate = F.softmax( self.sig_gate(out) + self.trs_gate(trs_att), dim=-1 )
+                #out = gate * out + (1.0 - gate) * trs_att
             out = F.dropout(out, p=self.dropout_out, training=self.training)
             
             if hasattr(self, 'dialog_history') and len(self.dialog_history) > 0:
@@ -3524,12 +3588,22 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
     # tutorial since we can inherit the default implementation provided by
     # the FairseqEncoderDecoderModel base class, which looks like:
     #
-    def forward(self, src_tokens, src_lengths, prev_output_tokens):
+    def forward(self, src_signals, src_tokens, src_lengths, src_tok_lengths, prev_output_tokens):
         """
             Returns:
                     - the decoder's features of shape `(batch, tgt_len, embed_dim)`
                     - an extra dictionary with task specific content
         """
+        '''src_sig, src_trs = None, None
+        if isinstance(src_tokens, tuple):
+            src_sig, src_trs = src_tokens
+            #if str(src_sig.device) == 'cpu':
+            #    src_sig = src_sig.to(prev_output_tokens.device)
+            #    src_trs = src_trs.to(prev_output_tokens.device)
+            src_tokens = src_sig'''
+        tmp = src_tokens
+        if src_signals is not None:
+            src_tokens = src_signals
 
         B, T, C = src_tokens.size()
         user_pad = src_tokens.new_zeros(3,C).fill_(self.spk_abs_val)
@@ -3553,9 +3627,12 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         if not isinstance(self.decoder, LSTMDecoder):
             self.decoder.set_turn_speaker( speakers )
 
+        if src_signals is not None:
+            src_tokens = tmp
+
         #if self.args.freeze_encoder: 
         #    self.encoder.eval()
-        encoder_out = self.encoder(src_tokens, src_lengths)
+        encoder_out = self.encoder(src_signals, src_tokens, src_lengths, src_tok_lengths)
 
         if False: #self.scheduled_sampling:
             raise NotImplementedError

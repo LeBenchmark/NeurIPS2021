@@ -113,6 +113,10 @@ class SequenceGenerator(object):
         }
 
         src_tokens = encoder_input['src_tokens']
+        #if isinstance(src_tokens, tuple):
+        #    src_tokens = src_tokens[0]
+        if 'src_signals' in encoder_input and encoder_input['src_signals'] is not None:
+            src_tokens = encoder_input['src_signals']
         src_lengths = (src_tokens.ne(self.eos) & src_tokens.ne(self.pad)).long().sum(dim=1)
         input_size = src_tokens.size()
         # batch dimension goes first followed by source lengths
