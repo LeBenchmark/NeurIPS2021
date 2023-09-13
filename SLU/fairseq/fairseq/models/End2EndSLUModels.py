@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 
 from fairseq.globals import *
 from fairseq import utils, init_functions
@@ -22,10 +22,12 @@ from fairseq.models import (
     register_model_architecture, 
 )
 
-#from fairseq.models.slu_models import BasicEncoder, BasicSpeechEncoder, BasicSpeechSeqEncoder, BasicSpeechBiseqEncoder, MLSpeechEncoder, MLSpeechSeqEncoder, SLUSimpleDecoder, SLUBiDecoder
+from fairseq.modules import LinformerEncoderLayer, TransformerEncoderLayer
+
+from fairseq.data.End2EndSLUDataset import collate_tokens_ex
 
 from fairseq.models.transformer import TransformerModel, base_architecture as trans_ba
-#from fairseq.models.ctc_transformer import CTCTransformerDecoder
+from fairseq.models.ctc_transformer import CTCTransformerDecoder
 from fairseq.models.lstm import LSTMModel, LSTMDecoder, base_architecture as lstm_ba
 
 # Importing for compatibilities with the Transformer model
@@ -37,6 +39,26 @@ from fairseq.modules import (
     SinusoidalPositionalEmbedding,
 )
 from torch import Tensor
+
+from speechbrain.lobes.models.huggingface_wav2vec import HuggingFaceWav2Vec2
+
+_DSLU_DEBUG_ = False
+
+
+EncoderOut = NamedTuple(
+    "EncoderOut",
+    [
+        ("encoder_out", Tensor),  # T x B x C
+        ("encoder_padding_mask", Optional[Tensor]),  # B x T
+        ("encoder_embedding", Optional[Tensor]),  # B x T x C
+        ("encoder_states", Optional[List[Tensor]]),  # List[T x B x C]
+        ("trs_idx", Optional[Tensor]),
+        ("trs_idx_len", Optional[Tensor]),
+        ("trs_emb", Optional[Tensor]),
+        ("trs_out", Optional[Tensor]),
+        ("trs_mask", Optional[Tensor]),
+    ],
+)
 
 class Conv1dNormWrapper(nn.Module):
     '''
@@ -141,22 +163,72 @@ class LSTMWrapper(nn.Module):
 
 class FFNN(nn.Module):
 
-    def __init__(self, input_size, output_size, dropout_ratio=0.5):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2, dropout_ratio=0.5):
 
         super(FFNN,self).__init__()
 
+        self.input_size = input_size
+        self.output_size = output_size
         self.dropout_ratio = dropout_ratio
         self.activation_fn = utils.get_activation_fn('relu')
-        self.fc1 = init_functions.LSTMLinear(input_size, 2*output_size)
-        self.fc2 = init_functions.LSTMLinear(2*output_size, output_size)
+        self.fc_in = init_functions.LSTMLinear(input_size, hidden_size)
+        self.norm_in = nn.LayerNorm(input_size)
+        self.fc_out = init_functions.LSTMLinear(hidden_size, output_size)
+        
+        hids = []
+        self.hiddens = None
+        for i in range(num_layers-2):
+            hids.append( ('Hidden-' + str(i+1), init_functions.LSTMLinear(hidden_size, hidden_size)) )
+        if len(hids) > 0:
+            self.hiddens = nn.Sequential( OrderedDict(hids) )
 
     def forward(self, x):
 
         residual = x
-        x = self.activation_fn(self.fc1(x))
+        x = self.norm_in(x)
+        x = self.activation_fn(self.fc_in(x))
         x = F.dropout(x, p=self.dropout_ratio, training=self.training)
-        x = self.fc2(x)
+        if self.hiddens is not None:
+            for layer in self.hiddens:
+                x = self.activation_fn( layer(x) )
+                x = F.dropout(x, p=self.dropout_ratio, training=self.training)
+        x = self.fc_out(x)
+        x = F.dropout(x, p=self.dropout_ratio, training=self.training)
+        if self.input_size == self.output_size:
+            x = residual + x
         return x
+
+class SLUMHA2(nn.Module):
+    def __init__(self, input_embed_dim, source_embed_dim, output_embed_dim, bias=False):
+        super().__init__()
+
+        self.att1 = SLUAttentionLayer(input_embed_dim, source_embed_dim, output_embed_dim//2)
+        self.att2 = SLUAttentionLayer(input_embed_dim, source_embed_dim, output_embed_dim//2)
+
+    def forward(self, input, source_hids, encoder_padding_mask):
+
+        att1, att_scores1 = self.att1(input, source_hids, encoder_padding_mask)
+        att2, att_scores2 = self.att2(input, source_hids, encoder_padding_mask)
+
+        return torch.cat([att1, att2], dim=-1), att_scores1 + att_scores2
+
+class SLUMHA4(nn.Module):
+    def __init__(self, input_embed_dim, source_embed_dim, output_embed_dim, bias=False):
+        super().__init__()
+
+        self.att1 = SLUAttentionLayer(input_embed_dim, source_embed_dim, output_embed_dim//4)
+        self.att2 = SLUAttentionLayer(input_embed_dim, source_embed_dim, output_embed_dim//4)
+        self.att3 = SLUAttentionLayer(input_embed_dim, source_embed_dim, output_embed_dim//4)
+        self.att4 = SLUAttentionLayer(input_embed_dim, source_embed_dim, output_embed_dim//4)
+
+    def forward(self, input, source_hids, encoder_padding_mask):
+
+        att1, att_scores1 = self.att1(input, source_hids, encoder_padding_mask)
+        att2, att_scores2 = self.att2(input, source_hids, encoder_padding_mask)
+        att3, att_scores3 = self.att1(input, source_hids, encoder_padding_mask)
+        att4, att_scores4 = self.att2(input, source_hids, encoder_padding_mask)
+
+        return torch.cat([att1, att2, att3, att4], dim=-1), att_scores1 + att_scores2 + att_scores3 + att_scores4
 
 class SLUAttentionLayer(nn.Module):
     def __init__(self, input_embed_dim, source_embed_dim, output_embed_dim, bias=False):
@@ -228,6 +300,9 @@ class PyramidalRNNEncoder(nn.Module):
     def forward(self, x):
         # x is expected as Length x Batch-size x Num. of features, that is T x B x C
 
+        #print(" * Input size: {}".format(x.size()))
+        #sys.stdout.flush()
+
         T, B, C = x.size()
         '''if self.params.character_level_slu:
             idxs = torch.LongTensor( [(i,i) for i in range(T)] )
@@ -259,9 +334,102 @@ class PyramidalRNNEncoder(nn.Module):
 
         return H
 
+class PyramidalTransformerEncoder(nn.Module):
+
+    def __init__(self, params, dictionary):
+
+        super(PyramidalTransformerEncoder,self).__init__()
+
+        self.params = params
+        bidirectional = True
+        self.kheops_base_height = 1
+        self.kheops_hidd_height = params.pyramid_hidden_layers
+        self.kheops_ptop_height = 1
+        self.min_output_length = 15
+
+        #self.embed_positions = (
+        #    PositionalEmbedding(
+        #        params.max_source_positions,
+        #        2*params.speech_lstm_size,
+        #        padding_idx=0,
+        #        learned=params.encoder_learned_pos,
+        #    )
+        #    if not params.no_token_positional_embeddings
+        #    else None
+        #)
+
+        self.layers = nn.ModuleList() 
+        for i in range(self.params.num_lstm_layers):
+            input_size = self.params.speech_lstm_size
+            nlayers = 1
+            if i == 0:
+                #input_size = self.params.num_features
+                nlayers = self.kheops_base_height
+            elif i < self.params.num_lstm_layers-1:
+                nlayers = self.kheops_hidd_height
+            else:
+                nlayers = self.kheops_ptop_height
+
+            # NOTE, concerned arguments:
+            # - encoder_embed_dim
+            # - encoder_attention_heads
+            # - attention_dropout
+            # - dropout
+            # - activation_fn
+            # - activation_dropout
+            # - relu_dropout
+            # - encoder_normalize_before
+            # - encoder_ffn_embedding_dim
+            orig_embed_dim = self.params.encoder_embed_dim
+            orig_att_heads = self.params.encoder_attention_heads
+            self.params.encoder_embed_dim = input_size
+
+            max_seq_len = 10000 + (self.params.speech_lstm_size - 10000 % self.params.speech_lstm_size)
+            compressed = max_seq_len // self.params.speech_lstm_size
+            if input_size % orig_att_heads != 0:
+                self.params.encoder_attention_heads = 1
+            self.layers.append( nn.ModuleList([LinformerEncoderLayer(self.params, max_seq_len=max_seq_len, compressed=compressed) for j in range(nlayers)]) )
+            #self.layers.append( nn.ModuleList([TransformerEncoderLayer(self.params) for j in range(nlayers)]) )
+            self.params.encoder_embed_dim = orig_embed_dim
+            self.params.encoder_attention_heads = orig_att_heads
+
+        self.layer_norm = None
+        if self.params.encoder_normalize_before:
+            self.layer_norm = nn.LayerNorm( self.params.speech_lstm_size )
+        self.encoder_output_units = self.params.speech_lstm_size
+
+    def forward(self, x):
+        # x is expected as Length x Batch-size x Num. of features, that is T x B x C 
+
+        T, B, C = x.size()
+        if T % 2 != 0: 
+            x = torch.cat( [x,torch.zeros(1,B,C).to(x)], 0 )
+            T, B, C = x.size() 
+
+        #x = x + self.embed_positions(x)
+
+        H = x
+        for i in range(len(self.layers)):
+            for layer in self.layers[i]:
+                H = layer(H, encoder_padding_mask=None)
+
+            if i < len(self.layers)-1: 
+                T, B, h = H.size()
+                indices = torch.LongTensor( [(i-1,i) for i in range(1,T,2)] ).to(H.device) 
+                H = torch.mean(H[indices], 1) 
+            
+        if H.size(0) < self.min_output_length:
+            idxs = [int(i * (H.size(0) / (self.min_output_length+2))) for i in range(1, self.min_output_length+1)]    # We exclude first and last frame which may encode just the speaker marker.
+            H = H[idxs,:,:]
+
+        if self.layer_norm is not None:
+            H = self.layer_norm(H)
+
+        return H
+
 class TranscriptionEncoder(nn.Module):
 
-    def __init__(self, args, dictionary):
+    def __init__(self, args, dictionary, RoBERTa=None):
 
         super(TranscriptionEncoder, self).__init__()
 
@@ -269,23 +437,56 @@ class TranscriptionEncoder(nn.Module):
         self.dictionary = dictionary
         num_embeddings = len(dictionary)
         embed_dim = self.args.decoder_embed_dim
-        self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.dictionary.pad())
-        recurrent_layers = []
-        for i in range(self.args.num_lstm_layers):
-            input_size = 2*self.args.speech_lstm_size
-            if i == 0:
-                input_size = embed_dim
-            recurrent_layers.append( ('LSTM'+str(i+1), LSTMWrapper(input_size, self.args.speech_lstm_size, True, self.args.drop_ratio)) )
-        self.rnns = nn.Sequential( OrderedDict(recurrent_layers) )
+        self.use_dhistory = False
+        self.dialog_history = []
+        self.roberta = RoBERTa
+        if self.roberta is None:
+            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.dictionary.pad()) if RoBERTa is None else None 
+        else:
+            #embed_dim = 1024   # OLD DL-SLU
+            assert self.dictionary.pad() == self.roberta.task.source_dictionary.pad()
+            #for param in self.roberta.parameters():
+            #    param.requires_grad = False
+
+        if self.roberta is None: # NEW DL-SLU
+            recurrent_layers = []
+            for i in range(self.args.num_lstm_layers):
+                input_size = 2*self.args.speech_lstm_size
+                if i == 0:
+                    input_size = embed_dim 
+                recurrent_layers.append( ('LSTM'+str(i+1), LSTMWrapper(input_size, self.args.speech_lstm_size, True, self.args.drop_ratio)) )
+            self.rnns = nn.Sequential( OrderedDict(recurrent_layers) ) 
 
     def forward(self, x):
 
-        x = self.embed_tokens(x)
-        x = F.dropout(x, p=self.args.drop_ratio, training=self.training)
-        x = x.transpose(0, 1)
-        x = self.rnns(x)
+        trs_mask=None
 
-        return x
+        if _DSLU_DEBUG_:
+            print('[DEBUG] =====================')
+            print('[DEBUG] TrsEncoder, src@0: {}'.format(self.dictionary.string(x[0,:])))
+            print('[DEBUG] =====================')
+            sys.stdout.flush()
+
+        if self.roberta is not None:
+            if self.use_dhistory:
+                # TODO: store concatenated source transcriptions as dialog history in self.dialog_history
+                pass
+            samples = [ self.roberta.encode( self.dictionary.string(t) ) for t in x ] 
+            src_tokens = collate_tokens_ex( samples, self.dictionary.pad() )
+            src_tokens = src_tokens.to(x.device)
+
+            #trs_mask = x.eq( self.dictionary.pad() ).transpose(0, 1)
+            trs_e = self.roberta.extract_features( src_tokens )
+            trs_mask = src_tokens.eq(self.dictionary.pad()).transpose(0, 1)
+        else:
+            trs_mask = x.eq(self.dictionary.pad()).transpose(0, 1)
+            trs_e = self.embed_tokens(x)
+        x = F.dropout(trs_e, p=self.args.drop_ratio, training=self.training)
+        x = x.transpose(0, 1)
+        if self.roberta is None: # NEW DL-SLU
+            x = self.rnns(x)
+
+        return trs_e.transpose(0, 1), x, trs_mask
 
 
 class DeepSpeechLikeEncoder(nn.Module):
@@ -357,36 +558,57 @@ def create_lstm_final_states_(decoder_layers, hidden_state):
 class End2EndSLUEncoder(FairseqEncoder):
     
     def __init__(
-                 self, args, dictionary,
+                 self, args, dictionary, RoBERTa=None, blank=0,
                  ):
         
         super().__init__(dictionary)
         self.args = args
         self.padding_idx = dictionary.pad_index
-        self.blank_idx = dictionary.blank() 
+        self.blank_idx = blank 
 
         if hasattr(self.args, 'use_transcription_as_input') and self.args.use_transcription_as_input:
-            self.trs_encoder = TranscriptionEncoder(args, dictionary)
+            self.trs_encoder = TranscriptionEncoder(args, dictionary, RoBERTa=RoBERTa)
 
-        if hasattr(args, 'speech_encoder') and args.speech_encoder == 'deep-speech':
+        if args.speech_encoder == 'deep-speech':
             self.encoder = DeepSpeechLikeEncoder(args)
             self.se_type = 'ds'
-        elif hasattr(args, 'speech_encoder') and args.speech_encoder == 'ziggurat':
-            self.encoder = PyramidalRNNEncoder(args, dictionary)
+        elif args.speech_encoder == 'ziggurat':
+            if args.decoder == 'transformer':
+                self.pre_encoder = init_functions.TransformerConv1d(args.num_features, args.speech_lstm_size, args.speech_lstm_size // args.num_features +1)
+                self.pre_encoder_norm = LayerNorm(args.speech_lstm_size)
+                self.pre_encoder_activation = utils.get_activation_fn( activation='gelu' )
+                self.encoder = PyramidalTransformerEncoder(args, dictionary)
+            else:
+                self.encoder = PyramidalRNNEncoder(args, dictionary)
             self.se_type = 'zg'
-        elif not hasattr(args, 'speech_encoder'):
-            self.encoder = PyramidalRNNEncoder(args, dictionary)
-            self.se_type = 'zg'
+        elif args.speech_encoder == 'sb-wav2vec2':
+            model_hub = args.sb_model_path
+            save_path = './foo/'
+            self.encoder = HuggingFaceWav2Vec2(model_hub, save_path, freeze=args.freeze_fe)
+            self.se_type = 'sb'
+            self.len_threshold = 630000 # NOTE: this depends on (effective) batch size and GPU VRAM
+            self.state_change = not args.freeze_fe
         else:
             raise NotImplementedError('{} speech encoder not defined'.format(args.speech_encoder if hasattr(args, 'speech_encoder') else 'unknown'))
 
-        self.encoder_output_units = self.encoder.encoder_output_units  # NEW ARCHITECTURE FOR COMBINED LOSS: the current output is the projection to the output dict, unless we are giving hidden states to the decoder instead of output projections
+        self.encoder_output_units = self.encoder.encoder_output_units if args.speech_encoder != 'sb-wav2vec2' else args.se_size
         self.return_all_hiddens = False
         self.speakers = None
 
         # NEW ARCHITECTURE FOR COMBINED LOSS
         #self.output_projection = init_functions.LSTMLinear(args.encoder_hidden_dim*2, len(dictionary))
         #self.output_norm = nn.LayerNorm(len(dictionary))
+
+    def reset_dialog_history(self):
+        if self.args.use_transcription_as_input:
+            self.dialog_history = []
+
+    def set_use_history_flag(self, value):
+        if self.args.use_transcription_as_input:
+            self.trs_encoder.use_dhistory = value
+
+    def max_positions(self):
+        return self.args.max_source_positions
 
     def set_turn_speaker(self, val):
         self.speakers = val
@@ -420,20 +642,38 @@ class End2EndSLUEncoder(FairseqEncoder):
     def forward(self, src_signals, src_tokens, src_lengths, src_tok_lengths):
         # B x T x C -> T x B x C 
 
+        trs_e = None
         trs_x = None
         trs_mask = None
-        if hasattr(self, 'trs_encoder'):
-            #src_sig, src_trs = src_tokens
-            trs_x = self.trs_encoder(src_tokens)
+
+        #print('[DEBUG] End2EndSLUEncoder, src_signals sum (shape: {}): {}'.format( src_signals.size(), torch.sum(src_signals) ))
+        #print('[DEBUG] End2EndSLUEncoder, src_tokens (shape: {}): {}'.format( src_tokens.size(), self.dictionary.string(src_tokens[0,:]) ))
+        #sys.stdout.flush()
+
+        if hasattr(self, 'trs_encoder'): 
+            trs_e, trs_x, trs_mask = self.trs_encoder(src_tokens)
+            x = src_signals.transpose(0, 1) 
+        elif src_signals is not None:
             x = src_signals.transpose(0, 1)
-            trs_mask = src_tokens.eq(self.dictionary.pad()).transpose(0, 1)
         else:
             x = src_tokens.transpose(0,1) 
 
+        #print('[DEBUG] End2EndSLUEncoder, input shape: {} (norm: {})'.format(x.size(), torch.norm(x)))
+        #sys.stdout.flush()
+
         if self.se_type == 'ds':
             (conv_states, hidden_states) = self.encoder( x )
-        else:
-            hidden_states = self.encoder( x ) 
+        elif self.se_type == 'zg':
+            if hasattr(self, 'pre_encoder'):
+                x = self.pre_encoder( x.permute(1, 2, 0) ).permute(2, 0, 1)
+                x = F.dropout(x, p=self.args.drop_ratio, training=self.training)
+                x = self.pre_encoder_norm(x)
+                x = self.pre_encoder_activation(x)
+            hidden_states = self.encoder( x )
+        elif self.se_type == 'sb':
+            hidden_states = self.encoder(x.transpose(0, 1))
+            hidden_states = hidden_states.transpose(0, 1)
+
         (src_len, bsz, dim) = hidden_states.size() #conv_states.size() 
 
         # TODO: uncomment this to debug dialog-level SLU, batch size should be the same as long as a whole dialog (or a batch of dialogs having the same length) is processed.
@@ -447,19 +687,17 @@ class End2EndSLUEncoder(FairseqEncoder):
         encoder_padding = torch.LongTensor(bsz, src_len).fill_(self.padding_idx+13).to(src_tokens.device)
         encoder_padding_mask = encoder_padding.eq(self.padding_idx)
 
+        #print('[DEBUG] speech encoder, any True element in encoder_padding_mask ? {}'.format(torch.sum( encoder_padding_mask )))
+        #sys.stdout.flush()
+
         encoder_states = [] if self.return_all_hiddens else None
 
         x = hidden_states
-
-        # NEW ARCHITECTURE FOR COMBINED LOSS
-        #x = self.output_projection(x)
-        #x = self.output_norm(x)
-        #scores = F.softmax(x, -1)
-        #_, preds = torch.max(scores, -1)
-        #encoder_embedding = x.transpose(0, 1)
-        #encoder_padding_mask = preds.eq(self.blank_idx)
-
         encoder_out = x
+
+        #print('[DEBUG] so far so good (decoder: {})'.format(self.args.decoder))
+        #sys.stdout.flush()
+        #sys.exit(0)
 
         # Return the Encoder's output. This can be any object and will be
         # passed directly to the Decoder.
@@ -469,13 +707,21 @@ class End2EndSLUEncoder(FairseqEncoder):
                 encoder_padding_mask=encoder_padding_mask,    # B x T   # NEW ARCHITECTURE FOR COMBINED LOSS: this mask must be transposed with the new architecture
                 encoder_embedding=encoder_embedding,    # B x T x C
                 encoder_states=encoder_states, # List[T x B x C]
+                trs_idx=src_tokens.transpose(0,1),   # T x B
+                trs_idx_len=src_tok_lengths,
+                trs_emb=trs_e,
+                trs_out=trs_x,
+                trs_mask=trs_mask,
             )
         else: 
-            final_hiddens, final_cells = create_lstm_final_states_(self.args.decoder_layers, encoder_out)
+            final_hiddens, final_cells = create_lstm_final_states_(self.args.decoder_layers, encoder_out) 
 
             return {
                     'encoder_out': (encoder_out, final_hiddens, final_cells),
-                    'encoder_padding_mask': None,    # NEW ARCHITECTURE FOR COMBINED LOSS: set this back to None to come back to previous architecture.
+                    'encoder_padding_mask': None,
+                    'trs_idx': src_tokens.transpose(0, 1),
+                    'trs_idx_len': src_tok_lengths,
+                    'trs_emb': trs_e,
                     'trs_out': trs_x,
                     'trs_mask': trs_mask,
             }
@@ -521,11 +767,28 @@ class End2EndSLUEncoder(FairseqEncoder):
                 for idx, state in enumerate(encoder_states):
                     encoder_states[idx] = state.index_select(1, new_order)
 
+            trs_x = encoder_out.trs_out
+            if trs_x is not None:
+                trs_x = trs_x.index_select(1, new_order)
+            trs_mask = encoder_out.trs_mask
+            if trs_mask is not None:
+                trs_mask = trs_mask.index_select(1, new_order)
+            trs_idx = encoder_out.trs_idx.index_select(1, new_order)
+            trs_idx_len = encoder_out.trs_idx_len.index_select(0, new_order) if encoder_out.trs_idx_len is not None else None
+            trs_e = encoder_out.trs_emb
+            if trs_e is not None:
+                trs_e = trs_e.index_select(1, new_order)
+
             return EncoderOut(
                 encoder_out=new_encoder_out["encoder_out"],  # T x B x C
                 encoder_padding_mask=new_encoder_out["encoder_padding_mask"],  # B x T
                 encoder_embedding=new_encoder_out["encoder_embedding"],  # B x T x C
                 encoder_states=encoder_states,  # List[T x B x C]
+                trs_idx=trs_idx,
+                trs_idx_len=trs_idx_len,
+                trs_out=trs_x,
+                trs_emb=trs_e,
+                trs_mask=trs_mask,
             )
         elif self.args.decoder in ['lstm', 'ctclstm', 'icassp_lstm', 'deliberation']:
             hidden_states = encoder_out['encoder_out'][0]
@@ -537,10 +800,17 @@ class End2EndSLUEncoder(FairseqEncoder):
             trs_mask = encoder_out['trs_mask']
             if trs_mask is not None:
                 trs_mask = trs_mask.index_select(1, new_order)
+ 
+            trs_idx = encoder_out['trs_idx'].index_select(1, new_order)
+            trs_idx_len = encoder_out['trs_idx_len'].index_select(0, new_order) if encoder_out['trs_idx_len'] is not None else None
+            trs_e = encoder_out['trs_emb'].index_select(1, new_order) if encoder_out['trs_emb'] is not None else None
 
             return {
                     'encoder_out': (new_hidden_states, new_final_h, new_final_c),
                     'encoder_padding_mask': None,
+                    'trs_idx': trs_idx,
+                    'trs_idx_len': trs_idx_len,
+                    'trs_emb': trs_e,
                     'trs_out': trs_x,
                     'trs_mask': trs_mask
             }
@@ -1635,7 +1905,8 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         num_layers=1, dropout_in=0.1, dropout_out=0.1, attention=True,
         encoder_output_units=512, pretrained_embed=None,
         share_input_output_embed=False, adaptive_softmax_cutoff=None,
-        max_target_positions=1024
+        max_target_positions=1024,
+        RoBERTa=False, blank=0,
     ):
         super().__init__(dictionary)
         self.dropout_in = dropout_in
@@ -1646,9 +1917,25 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         self.need_attn = True
         self.max_target_positions = max_target_positions
         self.args = args
-        self.blank_idx = dictionary.blank()
+        self.blank_idx = blank
+        self.bogus_idx = dictionary.index(bogus_token)
+        self.eod_idx = dictionary.index(EOD_tag)
+        self.eod_flag = False
         self.num_masked_tokens = 0
 
+        self.roberta_flag = RoBERTa
+        att_embed_dim = embed_dim
+        '''if self.roberta is not None:
+            att_embed_dim = 1024 
+            for param in self.roberta.parameters():
+                param.requires_grad = False
+
+            ttmp = self.roberta.encode(bogus_token)
+            assert ttmp.size(0) == 3 and ttmp[0].item() == self.roberta.task.source_dictionary.bos() and ttmp[-1].item() == self.roberta.task.source_dictionary.eos()
+            self.bogus_idx = ttmp[1].item()
+            ttmp = self.roberta.encode(EOD_tag)
+            assert ttmp.size(0) == 3 and ttmp[0].item() == self.roberta.task.source_dictionary.bos() and ttmp[-1].item() == self.roberta.task.source_dictionary.eos()
+            self.eod_idx = ttmp[1].item()'''
         self.use_dhistory = False
  
         self.scheduled_sampling = False
@@ -1659,7 +1946,10 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
         self.adaptive_softmax = None
         num_embeddings = len(dictionary)
+        #if self.roberta is not None:
+        #    num_embeddings = len(self.roberta.task.source_dictionary)
         self.padding_idx = dictionary.pad()
+        #if self.roberta is None:
         if pretrained_embed is None:
             self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
         else:
@@ -1672,23 +1962,64 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         else:
             self.encoder_hidden_proj = self.encoder_cell_proj = None
 
-        self.pred_attention = SLUAttentionLayer(hidden_size, embed_dim, hidden_size, bias=False)  # TODO: use this as input to the LSTM instead of x
+        if self.args.attention_type == 'std':
+            self.pred_attention = SLUAttentionLayer(hidden_size, att_embed_dim, hidden_size, bias=False)  # TODO: use this as input to the LSTM instead of x
+        elif self.args.attention_type == 'mha2':
+            self.pred_attention = SLUMHA2(hidden_size, att_embed_dim, hidden_size, bias=False)
+        elif self.args.attention_type == 'mha4':
+            self.pred_attention = SLUMHA4(hidden_size, att_embed_dim, hidden_size, bias=False)
+        else:
+            raise NotImplementedError()
 
         if (args.dialog_batches or args.dialog_level_slu) and args.use_dialog_history:
-            self.dh_hidden_states = []
-            self.dialog_history = [] 
+            self.curr_source_state = None     # At inference phase, keep the encoder state until a batch is finalized. At this moment the state is moved in the 'self.source_history' buffer.
+            self.source_history = []
+            self.source_history_backup = [] # Needed for exactly the same reason as 'self.dialog_history_backup'
+
+            self.dh_hidden_states = []      # partial hidden states to be collated to form finalized hypotheses
+            self.dialog_history = []        # dialog history, that is all previous finalized dialog turns (possibly as batches)
             self.dialog_history_backup = [] # NOTE: this is needed at inference phase as the reorder_incremental_state function modifies the history in size along the batch dimension
-            self.turn_completed = []
-            self.finalized_sequences = []
-            self.context_attention_weights = None
-            self.context_attention = SLUAttentionLayer(hidden_size, out_embed_dim, hidden_size)
-            self.hal = SLUAttentionLayer(hidden_size, hidden_size, hidden_size)
+            self.turn_completed = []        # finalized hypotheses so far. When all hypotheses in a batch are finalized, they are 'collated' and stored in the dialog history
+            self.finalized_sequences = []   # finalized hypotheses indices, as provided by the 'sequence generator' (see sequence_generator.py)
+            self.target_context_attention_weights = None
+            self.source_context_attention_weights = None
+            self.context_idxs = None
+            if self.args.attention_type == 'std':
+                self.context_attention = SLUAttentionLayer(hidden_size, out_embed_dim, hidden_size) # NEW: att_embed_dim instead of out_embed_dim for using gold tgt
+                self.hal = SLUAttentionLayer(hidden_size, hidden_size, hidden_size)
+            elif self.args.attention_type == 'mha2':
+                self.context_attention = SLUMHA2(hidden_size, out_embed_dim, hidden_size)
+                self.hal = SLUMHA2(hidden_size, hidden_size, hidden_size)
+            elif self.args.attention_type == 'mha4':
+                self.context_attention = SLUMHA4(hidden_size, out_embed_dim, hidden_size)
+                self.hal = SLUMHA4(hidden_size, hidden_size, hidden_size)
+
+            src_ctx_size = encoder_output_units
+            if self.roberta_flag:   # NEW DL-SLU 
+                src_ctx_size = 1024 # NEW DL-SLU
+            if self.args.attention_type == 'std':
+                self.source_context_attention = SLUAttentionLayer(hidden_size, src_ctx_size, hidden_size, bias=False)
+                self.source_hal = SLUAttentionLayer(hidden_size, hidden_size, hidden_size)
+            elif self.args.attention_type == 'mha2':
+                self.source_context_attention = SLUMHA2(hidden_size, src_ctx_size, hidden_size, bias=False)
+                self.source_hal = SLUMHA2(hidden_size, hidden_size, hidden_size)
+            else:
+                self.source_context_attention = SLUMHA4(hidden_size, src_ctx_size, hidden_size, bias=False)
+                self.source_hal = SLUMHA4(hidden_size, hidden_size, hidden_size)
+
+            #self.ffnn = FFNN(3*hidden_size, 2*hidden_size, hidden_size, num_layers=2, dropout_ratio=self.dropout_out)
 
             if self.args.context_fusion == 'gating':
-                self.context_gate_h = init_functions.LSTMLinear(hidden_size, hidden_size)
-                self.context_gate_y = init_functions.LSTMLinear(hidden_size, hidden_size)
+                self.src_gate_h = init_functions.LSTMLinear(hidden_size, hidden_size)
+                self.src_gate_x = init_functions.LSTMLinear(hidden_size, hidden_size)
+                self.tgt_gate_h = init_functions.LSTMLinear(hidden_size, hidden_size)
+                self.tgt_gate_y = init_functions.LSTMLinear(hidden_size, hidden_size)
+
             if self.args.context_fusion not in ['sum', 'gating']:
                 raise ValueError('SLUEnd2EndModel.LSTMDecoderEx: on of "sum" and "gating" is expected with --context-fusion option')
+
+            print(' * LSTMDecoderEx: using a context discount of {} (for both source and target context)'.format(self.args.context_discount))
+            sys.stdout.flush()
 
         # disable input feeding if there is no encoder
         # input feeding is described in arxiv.org/abs/1508.04025
@@ -1702,13 +2033,32 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         ])
         if attention:
             # TODO make bias configurable
-            self.attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
+            if self.args.attention_type == 'std':
+                self.attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
+            elif self.args.attention_type == 'mha2':
+                self.attention = SLUMHA2(hidden_size, encoder_output_units, hidden_size, bias=False)
+            else:
+                self.attention = SLUMHA4(hidden_size, encoder_output_units, hidden_size, bias=False)
         else:
             self.attention = None
         if hasattr(self.args, 'use_transcription_as_input') and self.args.use_transcription_as_input:
-            self.trs_attention = SLUAttentionLayer(hidden_size, encoder_output_units, hidden_size, bias=False)
-            #self.sig_gate = init_functions.LSTMLinear(hidden_size, hidden_size)
-            #self.trs_gate = init_functions.LSTMLinear(hidden_size, hidden_size)
+            trs_size = encoder_output_units
+            if self.roberta_flag and self.args.roberta_model is not None:   # NEW DL-SLU
+                if 'base' in self.args.roberta_model:
+                    trs_size = 768
+                else:
+                    trs_size = 1024     # NEW DL-SLU
+            if self.args.attention_type == 'std':
+                self.trs_attention = SLUAttentionLayer(hidden_size, trs_size, hidden_size, bias=False)
+            elif self.args.attention_type == 'mha2':
+                self.trs_attention = SLUMHA2(hidden_size, trs_size, hidden_size, bias=False)
+            else:
+                self.trs_attention = SLUMHA4(hidden_size, trs_size, hidden_size, bias=False)
+
+            self.trs_gating = self.args.trs_fusion if hasattr(self.args, 'trs_fusion') else False
+            if self.trs_gating:
+                self.sig_gate = init_functions.LSTMLinear(hidden_size, hidden_size)
+                self.trs_gate = init_functions.LSTMLinear(hidden_size, hidden_size)
         if hidden_size != out_embed_dim:
             self.additional_fc = init_functions.LSTMLinear(hidden_size, out_embed_dim)
         if adaptive_softmax_cutoff is not None:
@@ -1718,7 +2068,19 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         elif not self.share_input_output_embed:
             self.fc_out = init_functions.LSTMLinear(out_embed_dim, num_embeddings)
 
+        self.decoder_norm = args.decoder_norm_layers
+        if self.decoder_norm:
+            # NOTE: new, to control final output norm (which seems very big and seems to create problems on OAR)
+            self.embed_norm = nn.LayerNorm(embed_dim) 
+            if hidden_size != out_embed_dim:
+                self.add_fc_norm = nn.LayerNorm( out_embed_dim )
+            if hasattr(self, 'fc_out'):
+                self.final_out_norm = nn.LayerNorm( num_embeddings )
+
         self.speaker = None
+
+    def get_eod_flag(self):
+        return self.eod_flag
 
     def set_turn_speaker(self, val):
         self.speaker = val
@@ -1726,6 +2088,9 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
     #def set_eos_flag(self, flag):
     #    self.eos_flag = flag 
+
+    def get_use_history_flag(self):
+        return self.use_dhistory
 
     def use_dialog_history(self, value):
         self.use_dhistory = value and (self.args.dialog_batches or self.args.dialog_level_slu)
@@ -1738,6 +2103,9 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         self.finalized_sequences = fh
 
     def build_eos_idx(self):
+        """
+        Creates a LongTensor containing the indices of the finalized hypotheses provided by the 'sequence_generator'.
+        """
 
         EOS_idx = torch.LongTensor(len(self.finalized_sequences), 2).fill_(0).to(self.embed_tokens.weight.device)
         #new_list = list(new_order.view(-1))
@@ -1748,7 +2116,17 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             idx += 1
         return EOS_idx
 
-    def finalize_sequences(self, finalized_sequences): #, EOS_idx, curr_hidden_state):
+    def finalize_sequences(self, finalized_sequences):
+        """
+        At inference phase, finalize hypotheses which indices are in 'finalized_sequences'.
+            Finalized hypotheses are stored in the internal decoder buffer 'self.turn_completed', together with their index with respect to the original batch size, that is:
+            'self.turn_completed' contains (i, t), with i an index and t a tensor. i is the index in the batch of the finalized hypothesis t. t is the tensor containing the corresponding finalized hypothesis.
+            'self.finalized_sequences' is reset (set to []) at the end.
+            Like in the 'sequence_generator', finalized hypotheses are ignored in the following decoding steps, if any.
+            When all sequences in a batch are finalized, 'self.turn_completed' contains as many hypotheses as the batch size, and 'self.finalize_turn_batch' method can be called.
+        """
+
+        # NOTE: NEW implementation where we store embeddings of predicted tokens instead of hidden state. The whole context turn is stored in the dialog_history list in the forward function. 
 
         self.set_finalized_sequences( finalized_sequences )
         EOS_idx = self.build_eos_idx()
@@ -1780,27 +2158,42 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
                 #print('[DEBUG]# Attention weights from turn shape: {}'.format(tmp_completed[0][1].size()))
                 #sys.stdout.flush()
                 assert len(tmp_completed) == 1
-                assert len(self.context_attention_weights) <= len(self.dialog_history)
+                assert len(self.target_context_attention_weights) <= len(self.dialog_history)
                 t_scores = F.log_softmax( self.output_layer(tmp_completed[0][1].squeeze()), -1 )
                 _, preds = torch.max(t_scores, -1)
                 print('ATTN-SCORES:START')
-                print('ATTN-SCORES:TARGET {}'.format(SOS_tag + ' ' + self.dictionary.string(preds) + ' ' + EOS_tag))
-                for h_idx in range(len(self.context_attention_weights)):
-                    s_scores = F.log_softmax( self.output_layer(self.dialog_history[h_idx].squeeze()), -1 )
+                print('ATTN-SCORES:TARGET (shape: {}) {}'.format(t_scores.size(), SOS_tag + ' ' + self.dictionary.string(preds) + ' ' + EOS_tag))
+                for h_idx in range(len(self.target_context_attention_weights)):
+                    s_scores = F.log_softmax( self.output_layer(self.dialog_history[self.context_idxs[h_idx]].squeeze()), -1 )
                     _, preds = torch.max(s_scores, -1)
-                    print('ATTN-SCORES:SOURCE {}'.format(SOS_tag + ' ' + self.dictionary.string(preds) + ' ' + EOS_tag))
-                    self.context_attention_weights[h_idx] = torch.stack( self.context_attention_weights[h_idx], 1 )
-                    #print('[DEBUG]# Attention weights @{} (shape: {}): {}'.format(h_idx, self.context_attention_weights[h_idx].size(), self.context_attention_weights[h_idx]))
-                    print('ATTN-SCORES:WEIGHTS')
-                    for j in range(self.context_attention_weights[h_idx].size(1)):
-                        print( ' '.join([str(val) for val in self.context_attention_weights[h_idx][:, j].tolist()]) )
+                    print('ATTN-SCORES:TGT-CTX-{} (shape: {}) {}'.format(self.context_idxs[h_idx], s_scores.size(), SOS_tag + ' ' + self.dictionary.string(preds) + ' ' + EOS_tag))
+                    self.target_context_attention_weights[h_idx] = torch.stack( self.target_context_attention_weights[h_idx], 1 )
+                    self.source_context_attention_weights[h_idx] = torch.stack( self.source_context_attention_weights[h_idx], 1 )
+                    assert self.target_context_attention_weights[h_idx].size(1) == t_scores.size(0), 'attention weights have not the correct target size: {} vs. {}'.format(self.target_context_attention_weights[h_idx].size(1), t_scores.size(0))
+                    assert self.target_context_attention_weights[h_idx].size(0) == s_scores.size(0), 'attention weights have not the correct source size: {} vs. {}'.format(self.target_context_attention_weights[h_idx].size(0), s_scores.size(0))
+
+                    #print('[DEBUG]# Attention weights @{} (shape: {}): {}'.format(h_idx, self.target_context_attention_weights[h_idx].size(), self.target_context_attention_weights[h_idx]))
+                    print('ATTN-SCORES:TGT-WEIGHTS (shape: {})'.format(self.target_context_attention_weights[h_idx].size()))
+
+                    #print('ATTN-SCORES:SRC-CTX-{} (shape: {}) {}'.format())
+
+                    #s_scores = F.log_softmax()
+                    for j in range(self.target_context_attention_weights[h_idx].size(1)):
+                        print( ' '.join([str(val) for val in self.target_context_attention_weights[h_idx][:, j].tolist()]) )
                     sys.stdout.flush()
-                print('ATTN-WEIGHTS:END')
+                print('ATTN-SCORES:END')
                 sys.stdout.flush()
         self.finalized_sequences = []
         #print('[DEBUG] -----')
 
     def finalize_turn_batch(self, incremental_state):
+        """
+        At inference phase, this method is called when all the hypotheses in a batch are finished.
+            At this moment, tensors in 'self.turn_completed' are <collated> to form a unique tensor to be used as part of the dialog history.
+            The finalized batch is stored in the decoder internal buffer 'self.dialog_history_backup', and the 'self.turn_completed' buffer is reset, as well as the buffer 'self.dh_hidden_states'.
+        """
+
+        # NOTE: NEW  implementation where we store embeddings of predicted tokens instead of hidden states. The whole context turn is stored in the dialog_history list in the forward function.
 
         if len(self.finalized_sequences) > 0:
 
@@ -1828,6 +2221,11 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
                 dialog_turn_batch[:tt[1].size(1),tt[0]*self.args.model_beam:(tt[0]+1)*self.args.model_beam,:] = tt[1].expand(self.args.model_beam, -1, -1).transpose(0, 1) # TODO: same as for the 1 in the expand in the 'finalize_sequences' function. ALSO THE ONES MULTIPLYING THE tt[0] IN THE dialog_turn_batch TENSOR
             #self.dialog_history.append(dialog_turn_batch)
+            self.source_history_backup.append( self.curr_source_state )
+            self.curr_source_state = None
+            self.source_history = []
+            for tb in self.source_history_backup:
+                self.source_history.append( tb.clone() )
             self.dialog_history_backup.append( dialog_turn_batch )
             self.dialog_history = []
             for tb in self.dialog_history_backup:
@@ -1836,7 +2234,9 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             #self.last_order_state = None 
             #utils.set_incremental_state(self, incremental_state, 'curr_hidden_state', curr_hidden_state)
             self.dh_hidden_states = []
-            self.context_attention_weights = None
+            self.target_context_attention_weights = None
+            self.source_context_attention_weights = None
+            self.context_idxs = None
 
         #print('[DEBUG] LSTMDecoderEx.finalize_turn_batch, end-of-turn @batch detected, hidden state reset')
         #print('[DEBUG] LSTMDecoderEx.finalize_turn_batch, dialog history size: {}'.format(len(self.dialog_history)))
@@ -1845,75 +2245,123 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
         return [] #curr_hidden_state
 
-    def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None, **kwargs):
+    def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None, **kwargs): 
 
         # NOTE: this is for debuggin dialog-level SLU
-        #print('[DEBUG] ******************************')
-        #print('[DEBUG] LSTMDecoderEx batch@0: -----\n{}'.format(self.dictionary.string(prev_output_tokens[0,:])))
+        if _DSLU_DEBUG_:
+            print('\n[DEBUG] ******************************')
+            print('[DEBUG] LSTMDecoderEx batch@0: -----\n{}'.format(self.dictionary.string(prev_output_tokens[0,:])))
+            #print('[DEBUG] LSTMDecoderEx, prev_output_tokens: {}'.format(prev_output_tokens))
+            sys.stdout.flush()
         B, T = prev_output_tokens.size()
-        nEOD = torch.sum( prev_output_tokens == self.dictionary.index(EOD_tag)).item()
+        nEOD = torch.sum( prev_output_tokens == self.eod_idx).item()
         if nEOD > 0 and nEOD < B and self.use_dhistory:
-            nBogus = torch.sum( prev_output_tokens == self.dictionary.index(bogus_token) ).item()
-            assert T == 3 and nEOD+nBogus == B, 'Dialog-level data organization has probably been corrupted'
+            nBogus = torch.sum( prev_output_tokens == self.bogus_idx ).item()
+            assert T == 3 and nEOD+nBogus == B, 'Dialog-level data organization has probably been corrupted'    # NOTE: bogus and end-of-dialog turns contain only 3 tokens by definition.
             print('End2EndSLU FATAL ERROR: you probably recharged a previously run training and this corrupted dialog-level data organization (got {} end-of-dialog markers, expected {})'.format(nEOD, B))
             sys.exit(0)
-            #print('[DEBUG] LSTMDecoderEx: detected {} EOD tags (batch size = {}; T = {})'.format(nEOD, B, T))
-            #print('[DEBUG]    - complete batch: {}'.format(self.dictionary.string(prev_output_tokens)))
-            #sys.stdout.flush()
         EOD_flag = nEOD == B and T == 3
+        if incremental_state is None:
+            self.eod_flag = EOD_flag
         if EOD_flag and incremental_state is None:
             self.dialog_history = []
-            #print('[DEBUG] LSTMDecoderEx: End-of-Dialog marker detected!')
-        #print('[DEBUG] ==========')
-        #print('[DEBUG] LSTMDecoderEx, current output turn length (batch size: {}): {}'.format(B, prev_output_tokens.size(1)))
-        #print('[DEBUG] LSTMDecoderEx: dialog history size: {}'.format(len(self.dialog_history)))
-        #sys.stdout.flush()
-        #sys.exit(0)
+            self.source_history = []
+            if _DSLU_DEBUG_:
+                print('[DEBUG] LSTMDecoderEx: End-of-Dialog marker detected!')
+        if _DSLU_DEBUG_:
+            print('[DEBUG] ==========')
+            #print('[DEBUG] LSTMDecoderEx, current output turn length (batch size: {}): {}'.format(B, prev_output_tokens.size(1)))
+            print('[DEBUG] LSTMDecoderEx: dialog history size: {}'.format(len(self.dialog_history)))
+            sys.stdout.flush()
         
         x, attn_scores = self.extract_features(
             prev_output_tokens, encoder_out, incremental_state
         )
-        if hasattr(self, 'dialog_history') and incremental_state is None:
+        if hasattr(self, 'dialog_history') and incremental_state is None: # and self.use_dhistory: # NOTE: use_dhistory is normally set to True after curriculum epochs, during which context would not be constistent with current sequence predictions.
             if not EOD_flag:
                 self.dialog_history.append(x.clone().detach().transpose(0,1))
-        elif hasattr(self, 'dialog_history'): 
+                if hasattr(self, 'trs_attention'):
+                    self.source_history.append( encoder_out['trs_out'].clone().detach() )
+                else:
+                    self.source_history.append( encoder_out['encoder_out'][0].clone().detach() )
+        elif hasattr(self, 'dialog_history') and incremental_state is not None:
+            if hasattr(self, 'trs_attention'):
+                self.curr_source_state = encoder_out['trs_out'].clone().detach()
+            else:
+                self.curr_source_state = encoder_out['encoder_out'][0].clone().detach()
+
             # 1. Recover current hidden state from the incremental state and add (to the list) x
             #curr_hidden_state = utils.get_incremental_state(self, incremental_state, 'curr_hidden_state')
             curr_hidden_state = self.dh_hidden_states
             if curr_hidden_state is None: 
                 curr_hidden_state = []
+            # Solution 2: we store last layer decoder representations
             curr_hidden_state.append(x)
             # 2. Predict current tokens and...
             scores = F.log_softmax(self.output_layer(x), -1)
             _, preds = torch.max(scores, -1)
             B = preds.size(0)
 
-            #print('[DEBUG] LSTMDecoderEx:')
-            #print('[DEBUG]    * Internal predictions: {} (EOS index: {})'.format(preds, self.dictionary.eos()))
-            #print('[DEBUG]    * Stored output state of shape: {}'.format(x.size()))
-            #print('[DEBUG]    * curr_hidden_state size: {}'.format(len(curr_hidden_state)))
-            #tmp_src_len = encoder_out['encoder_out'][0].size(0) if encoder_out is not None else -1
-            #print('[DEBUG]    * source size: {}'.format(tmp_src_len))
-            #print('[DEBUG]    * decoding size limit: {} x {} + {} = {}'.format(self.args.max_len_a, tmp_src_len, self.args.max_len_b, self.args.max_len_a * tmp_src_len + self.args.max_len_b))
+            # Solution 1: we store embeddings of predicted labels
+
+            if _DSLU_DEBUG_:
+                print('[DEBUG] LSTMDecoderEx:')
+                print('[DEBUG]    * Internal predictions: {} (EOS index: {})'.format(preds, self.dictionary.eos()))
+                print('[DEBUG]    * Stored output state of shape: {}'.format(x.size()))
+                print('[DEBUG]    * curr_hidden_state size: {}'.format(len(curr_hidden_state)))
+                #tmp_src_len = encoder_out['encoder_out'][0].size(0) if encoder_out is not None else -1
+                #print('[DEBUG]    * source size: {}'.format(tmp_src_len))
+                #print('[DEBUG]    * decoding size limit: {} x {} + {} = {}'.format(self.args.max_len_a, tmp_src_len, self.args.max_len_b, self.args.max_len_a * tmp_src_len + self.args.max_len_b))
             
-            #print('[DEBUG]   * current batch size: {}'.format(B))
-            #print('[DEBUG]   * Internal predictions (str): {}'.format(self.dictionary.string(preds)))
-            #print('[DEBUG] ----------')
-            #sys.stdout.flush()
-            #sys.exit(0)
+                print('[DEBUG]   * current batch size: {}'.format(B))
+                print('[DEBUG]   * Internal predictions (str): {}'.format(self.dictionary.string(preds)))
+                #print('[DEBUG]   * Internal predictions (str): {}'.format(self.roberta.decode(preds[0].cpu())))
+                print('[DEBUG] ----------')
+                sys.stdout.flush()
+                #sys.exit(0)
      
             self.dh_hidden_states = curr_hidden_state
             #utils.set_incremental_state(self, incremental_state, 'curr_hidden_state', curr_hidden_state)
             # 4. If EOD is predicted everywhere that's the end of a dialog: reset current hidden state and dialog history
-            if torch.sum( preds == self.dictionary.index(EOD_tag) ).item() == B:
+            if torch.sum( preds == self.eod_idx ).item() == B:
+                self.curr_source_state = None
+                self.source_history = []
+                self.source_history_backup = []
                 self.dialog_history = []
                 self.dialog_history_backup = []
                 #utils.set_incremental_state(self, incremental_state, 'curr_hidden_state', [])
                 self.dh_hidden_states = []
+                self.eod_flag = True
 
-                #print('[DEBUG] LSTMDecoderEx: end-of-dialog mark detected!')
-                #sys.stdout.flush()
-        return self.output_layer(x), attn_scores
+                if _DSLU_DEBUG_:
+                    print('[DEBUG] LSTMDecoderEx: end-of-dialog mark detected!')
+                    sys.stdout.flush()
+            else:
+                self.eod_flag = False
+
+        if self.args.asr_slu_loss:
+            asr_out = encoder_out['encoder_out'][0]
+
+            #print('[DEBUG] asr_out shape: {}'.format(asr_out.size()))
+
+            if hasattr(self, 'encoder_hidden_proj'):
+                asr_out = self.encoder_hidden_proj( asr_out )
+
+                #print('[DEBUG] (encoder_hidden_proj) asr_out shape: {}'.format(asr_out.size()))
+
+            if hasattr(self, 'additional_fc'):
+                asr_out = self.additional_fc( asr_out )
+
+                #print('[DEBUG] (additional_fc) asr_out shape: {}'.format(asr_out.size()))
+
+            asr_out = self.output_layer( asr_out )
+
+            #print('[DEBUG] asr_out shape: {}'.format(asr_out.size()))
+            #sys.stdout.flush()
+
+            return self.output_layer(x), {'attn': attn_scores, 'asr_in': encoder_out['trs_idx'], 'asr_in_len': encoder_out['trs_idx_len'], 'asr_out': asr_out}
+        else:
+            return self.output_layer(x), attn_scores
 
     def set_scheduled_sampling(self, val=False, epoch=1):
         self.scheduled_sampling = val
@@ -1948,27 +2396,48 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
     def get_context_length(self):
         assert self.args.context_size >= self.args.context_first_turns
-        context_limit = self.args.context_first_turns
+        assert len(self.dialog_history) == len(self.source_history)
+ 
         context_last = self.args.context_size - self.args.context_first_turns
         context_bound = 0
         if hasattr(self, 'dialog_history') and len(self.dialog_history) > 0:
-            context_bound = min(len(self.dialog_history), context_limit)
+            context_bound = min(len(self.dialog_history), self.args.context_first_turns)
             curr_last = 0
             while curr_last < context_last and context_bound+curr_last < len(self.dialog_history):
                 curr_last += 1
             context_bound += curr_last 
-            if self.context_attention_weights is None and self.args.print_history_attn_weights:
-                self.context_attention_weights = [[] for i in range(context_bound)]
+            if self.target_context_attention_weights is None and self.args.print_history_attn_weights:
+                self.target_context_attention_weights = [[] for i in range(context_bound)]
+                self.source_context_attention_weights = [[] for i in range(context_bound)]
         return context_bound
 
     def get_dialog_context(self, context_bound):
+        assert len(self.dialog_history) == len(self.source_history)
+
         bounded_dialog_history = []
+        bounded_source_dialog_history = []
         if hasattr(self, 'dialog_history'):
             context_size = min(len(self.dialog_history), self.args.context_first_turns)
+            self.context_idxs = list(range(context_size))
+
+            #print('[DEBUG] LSTMDecoderEx, context size: {}'.format(context_size))
+            #sys.stdout.flush()
+
+            bounded_source_dialog_history = self.source_history[:context_size]
             bounded_dialog_history = self.dialog_history[:context_size]    # NOTE: first turns are always the most informative
             if context_bound > self.args.context_first_turns:
+
+                #print('[DEBUG] LSTMDecoderEx, additional context boundaries: {} - {}'.format(len(self.source_history)-(context_bound-self.args.context_first_turns), len(self.source_history)))
+                #sys.stdout.flush()
+
+                self.context_idxs.extend( list( range( len(self.source_history)-(context_bound-self.args.context_first_turns), len(self.source_history), +1 ) ) )
+
+                #print('[DEBUG] LSTMDecoderEx, context indices: {}'.format(self.context_idxs))
+                #sys.stdout.flush()
+
+                bounded_source_dialog_history = bounded_source_dialog_history + self.source_history[-(context_bound-self.args.context_first_turns):]
                 bounded_dialog_history = bounded_dialog_history + self.dialog_history[-(context_bound-self.args.context_first_turns):]  # NOTE: plus some of the last turns
-        return bounded_dialog_history
+        return bounded_source_dialog_history, bounded_dialog_history
 
     def extract_features(
         self, prev_output_tokens, encoder_out, incremental_state=None
@@ -1976,6 +2445,8 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         """
         Similar to *forward* but only return features.
         """
+        #trs_i = encoder_out['trs_idx']
+        #trs_e = encoder_out['trs_emb']
         trs_x = encoder_out['trs_out']
         trs_mask = encoder_out['trs_mask']
         if encoder_out is not None:
@@ -2038,6 +2509,8 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
         # embed tokens
         x = self.embed_tokens(prev_predictions)
+        if self.decoder_norm:
+            x = self.embed_norm(x)
         x = F.dropout(x, p=self.dropout_in, training=self.training)
 
         # B x T x C -> T x B x C
@@ -2051,12 +2524,16 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         elif encoder_out is not None:
             # setup recurrent cells
             num_layers = len(self.layers)
-            prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
-            prev_cells = [encoder_cells[i] for i in range(num_layers)]
-            if self.encoder_hidden_proj is not None:
-                prev_hiddens = [self.encoder_hidden_proj(x) for x in prev_hiddens]
-                prev_cells = [self.encoder_cell_proj(x) for x in prev_cells]
-            input_feed = x.new_zeros(bsz, self.hidden_size)
+            if self.use_dhistory and len(self.dialog_history) > 0:
+                prev_hiddens = [self.encoder_hidden_proj(self.dialog_history[-1][-1,:,:]) for i in range(num_layers)]
+                prev_cells = [self.encoder_cell_proj(self.dialog_history[-1][-1,:,:]) for i in range(num_layers)]
+            else:
+                prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
+                prev_cells = [encoder_cells[i] for i in range(num_layers)]
+                if self.encoder_hidden_proj is not None:
+                    prev_hiddens = [self.encoder_hidden_proj(x) for x in prev_hiddens]
+                    prev_cells = [self.encoder_cell_proj(x) for x in prev_cells]
+            input_feed = x.new_zeros(bsz, self.hidden_size) # NOTE: should I initialize also this differently when context is available ?
             prev_predictions = prev_output_tokens
         else:
             # setup zero cells, since there is no encoder
@@ -2071,14 +2548,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             "attention is not supported if there are no encoder outputs"
         attn_scores = x.new_zeros(srclen, seqlen, bsz) if self.attention is not None else None
         outs = []
-
-        #ss_backup_val = self.scheduled_sampling
-        #if self.scheduled_sampling:
-        #    p = random.random()
-        #    if p < self.scheduled_sampling_p:
-        #        self.scheduled_sampling = False
-        #    else:
-        #        self.n_scheduled_sampling += 1
+ 
         finalized_hypos = 0
         train_flag = incremental_state is None and self.scheduled_sampling
         if train_flag:
@@ -2087,50 +2557,28 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
             prev_output_tokens_h.fill_(self.dictionary.pad())
             prev_output_tokens_h[:,0] = self.dictionary.eos()
 
-        '''context_limit = 6
-        context_bound = 0 
-        if hasattr(self, 'dialog_history') and len(self.dialog_history) > 0:
-            context_bound = min(len(self.dialog_history), context_limit)
-            if context_bound+2 <= len(self.dialog_history):
-                context_bound += 2
-            elif context_bound+1 <= len(self.dialog_history):
-                context_bound += 1
-            if self.context_attention_weights is None and self.args.print_history_attn_weights:
-                self.context_attention_weights = [[] for i in range(context_bound)]'''
-        context_bound = self.get_context_length()
+        context_bound = 0
+        if hasattr(self, 'dialog_history'):
+            context_bound = self.get_context_length()
         for j in range(seqlen):
             curr_pred = x
             curr_pred_mask = prev_predictions_mask
             if incremental_state is None:
                 if self.scheduled_sampling:
-                    #cacheB, cacheT = prev_output_tokens_h.size()
-                    #if cacheB != bsz:
-                    #    print(' - LSTMDecoderEx, reducing scheduled sampling predicted tokens cache: {} vs. {} (length: {} vs. {})'.format(cacheB, bsz, cacheT, seqlen))
-                    #    sys.stdout.flush()
-
                     prev_predictions = prev_output_tokens_h[:,:j+1].clone() #torch.cat( scheduled_sampling_prev_lst, 1 )
                     prev_predictions_mask = prev_predictions.eq(self.padding_idx)
                     prev_predictions_mask[prev_predictions == self.blank_idx] = True
                     prev_predictions_mask = prev_predictions_mask.transpose(0, 1)
                     x = self.embed_tokens(prev_predictions)
                     x = F.dropout(x, p=self.dropout_in, training=self.training)
-                    x = x.transpose(0, 1)
-                    #tgt_idx = j+1
-                #else:
-                #    dec_idx = j
-                curr_pred = x[:j+1,:,:]   # We mask the future 
-                curr_pred_mask = prev_predictions_mask[:j+1,:]
+                    x = x.transpose(0, 1) 
 
-            '''if train_flag:
-                cacheB, cacheT = prev_output_tokens_h.size()
-                if cacheB != bsz:
-                    print(' - LSTMDecoderEx, attention input shapes:')
-                    print('   - prev_hiddens[0]: {}'.format(prev_hiddens[0].size()))
-                    print('   - curr_pred: {}'.format(curr_pred.size()))
-                    print('   - curr_pred_mask: {}'.format(curr_pred_mask.size()))
-                    sys.stdout.flush()'''
+                # NOTE: if we are here this is the training phase, we must hide future labels to the prediction attention mechanism.
+                curr_pred = x[:j+1,:,:]
+                curr_pred_mask = prev_predictions_mask[:j+1,:] 
 
-            pred_attn, _ = self.pred_attention(prev_hiddens[-1], curr_pred, curr_pred_mask)
+            # We compute the attention to the previous predictions
+            pred_attn, _ = self.pred_attention(prev_hiddens[-1], curr_pred, curr_pred_mask) 
             pred_attn = F.dropout(pred_attn, p=self.dropout_out, training=self.training)
 
             # input feeding: concatenate context vector from previous time step
@@ -2141,7 +2589,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
 
             for i, rnn in enumerate(self.layers):
                 # recurrent cell
-                hidden, cell = rnn(input, (prev_hiddens[i], prev_cells[i]))
+                hidden, cell = rnn(input, (prev_hiddens[i], prev_cells[i])) 
 
                 # hidden state becomes the input to the next layer
                 input = F.dropout(hidden, p=self.dropout_out, training=self.training)
@@ -2150,68 +2598,84 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
                 prev_hiddens[i] = hidden
                 prev_cells[i] = cell
 
-            # apply attention using the last layer's hidden state
+            # apply attention to the encoder's hidden states using the last layer's hidden state as query
             if self.attention is not None: 
                 out, attn_scores[:, j, :] = self.attention(hidden, encoder_outs, encoder_padding_mask)
             else:
                 out = hidden
-            if hasattr(self, 'trs_attention'):
-                #trs_x = encoder_out['trs_out']
-                #trs_mask = encoder_out['trs_mask']
+
+            if hasattr(self, 'trs_attention'):  # NOTE: if we have transcriptions as input, we compute attention to them
                 trs_att, _ = self.trs_attention(hidden, trs_x, trs_mask)
-                # Solution 1.
-                out = out + trs_att
-                # Solution 2.
-                #gate = F.softmax( self.sig_gate(out) + self.trs_gate(trs_att), dim=-1 )
-                #out = gate * out + (1.0 - gate) * trs_att
+
+                if not self.trs_gating:
+                    # Solution 1.
+                    out = out + trs_att # NOTE: this (very simple) solution seems to work better !
+                else:
+                    # Solution 2.
+                    gate = F.softmax( self.sig_gate(out) + self.trs_gate(trs_att), dim=-1 )
+                    out = gate * out + (1.0 - gate) * trs_att
+ 
             out = F.dropout(out, p=self.dropout_out, training=self.training)
             
             if hasattr(self, 'dialog_history') and len(self.dialog_history) > 0:
                 #print('[DEBUG] LSTMDecoderEx.extract_features: dialog history length {}'.format(len(self.dialog_history)))
                 #sys.stdout.flush()
- 
-                #bounded_dialog_history = self.dialog_history[:context_limit]    # NOTE: first turns are always the most informative
-                #if context_bound > context_limit:
-                #    bounded_dialog_history = bounded_dialog_history + self.dialog_history[-(context_bound-context_limit):]  # NOTE: plus the last 1 or 2
-                bounded_dialog_history = self.get_dialog_context(context_bound)
+  
+                source_context, target_context = self.get_dialog_context(context_bound)
 
-                #print('[DEBUG] LSTMDecoderEx.extract_features, context_bound = {} ; history size = {}.'.format(context_bound, len(bounded_dialog_history))) 
-                #print('[DEBUG]   =========================')
-                #sys.stdout.flush()
+                if _DSLU_DEBUG_:
+                    print('[DEBUG] LSTMDecoderEx.extract_features, context_bound = {} ; history size = {}.'.format(context_bound, len(target_context))) 
+                    print('[DEBUG]   =========================')
+                    sys.stdout.flush()
 
+                source_att = []
                 context_att = []
-                for h_idx, h in enumerate(bounded_dialog_history):
+                for h_idx, h in enumerate(target_context):
                     #print('[DEBUG] LSTMDecoderEx.extract_features, computing attention on context size {}, turn shape {}'.format(len(bounded_dialog_history), h.size()))
 
                     #print('[DEBUG] LSTMDecoderEx.extract_features, context attention input shapes: out = {}, h = {}'.format(out.size(), h.size()))
                     #sys.stdout.flush()
 
-                    #print('[DEBUG] LSTMDecoderEx.extract_features, computing attention on history turn {}: '.format(h_idx))
-                    #scores = F.log_softmax(self.output_layer(h.transpose(0,1)), -1)
-                    #_, tpreds = torch.max(scores, -1)
-                    #print('[DEBUG] > {}'.format(self.dictionary.string(tpreds[0,:])))
+                    if _DSLU_DEBUG_:
+                        print('[DEBUG] LSTMDecoderEx.extract_features, computing attention on history turn {}: '.format(h_idx))
+                        scores = F.log_softmax(self.output_layer(h.transpose(0,1)), -1)
+                        _, tpreds = torch.max(scores, -1)
+                        print('[DEBUG] > {}'.format(self.dictionary.string(tpreds[0,:])))
+                        sys.stdout.flush()
+
+                    src_att, src_att_scores = self.source_context_attention( out, source_context[h_idx], None )
 
                     h_att, h_att_scores = self.context_attention(out, h, None)  # TODO: consider segmenting h, based on h_att_scores, for keeping only meaningful chunks
                     if self.args.print_history_attn_weights:
-                        self.context_attention_weights[h_idx].append(h_att_scores)
+                        self.target_context_attention_weights[h_idx].append(h_att_scores)
+                        self.source_context_attention_weights[h_idx].append(src_att_scores)
 
                     #print('[DEBUG] LSTMDecoderEx.extract_features, computed context vector of shape: {}'.format(h_att.size()))
                     #sys.stdout.flush()
 
+                    source_att.append( src_att )
                     context_att.append( h_att )
-                #print('[DEBUG] ----------')
-                #sys.stdout.flush()
 
-                bounded_dialog_history = []
+                if _DSLU_DEBUG_:
+                    print('[DEBUG] ==================================================')
+                    sys.stdout.flush()
+
+                source_context = []
+                target_context = []
+                source_att = torch.stack(source_att, 0)
                 context_att = torch.stack(context_att, 0)
-                hal_att, _ = self.hal(out, context_att, None)   # TODO: consider using an LSTM instead of the hal
+                src_hal_att, _ = self.source_hal(out, source_att, None)
+                hal_att, _ = self.hal(out, context_att, None)
                 #hal_att = F.dropout(hal_att, p=self.dropout_out, training=self.training)
                 if self.args.context_fusion == 'sum':
-                    out = out + self.args.context_discount * hal_att
+                    # Solution 1.
+                    out = out + self.args.context_discount * src_hal_att + self.args.context_discount * hal_att
+                    # Solution 2.
+                    #out = self.ffnn( torch.cat([out, self.args.context_discount * src_hal_att, self.args.context_discount * hal_att], dim=-1) )
                 else:
-                    #gate = F.log_softmax( self.context_gate(torch.cat([out, hal_att], dim=-1)), -1 )
-                    gate = F.softmax( self.context_gate_h(out) + self.context_gate_y(hal_att), dim=-1 )
-                    out = gate * out + (1.0 - gate) * hal_att 
+                    source_gate = F.softmax( self.src_gate_h(out) + self.src_gate_x(src_hal_att), dim=-1)
+                    target_gate = F.softmax( self.tgt_gate_h(out) + self.tgt_gate_y(hal_att), dim=-1 )
+                    out = (source_gate + target_gate) * out + (1.0 - target_gate) * hal_att + (1.0 - source_gate) * src_hal_att 
 
             # input feeding
             if input_feed is not None:
@@ -2245,6 +2709,12 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         print(' -----')
         sys.stdout.flush()'''
 
+        if _DSLU_DEBUG_:
+            print('[DEBUG] ****************************************')
+            print('[DEBUG] ****************************************')
+            print('[DEBUG] ****************************************')
+            sys.stdout.flush()
+
         if train_flag:
             x = scheduled_sampling_out
         else:
@@ -2257,6 +2727,8 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         if not train_flag:
             if hasattr(self, 'additional_fc') and self.adaptive_softmax is None:
                 x = self.additional_fc(x)
+                if self.decoder_norm:
+                    x = self.add_fc_norm(x)
                 x = F.dropout(x, p=self.dropout_out, training=self.training)
 
         # srclen x tgtlen x bsz -> bsz x tgtlen x srclen
@@ -2273,8 +2745,13 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         if self.adaptive_softmax is None:
             if self.share_input_output_embed:
                 x = F.linear(x, self.embed_tokens.weight)
+                if self.decoder_norm:
+                    x = self.embed_norm(x)
             else:
                 x = self.fc_out(x)
+                if self.decoder_norm:
+                    x = self.final_out_norm(x)
+
         return x
 
     def reorder_incremental_state(self, incremental_state, new_order):
@@ -2297,7 +2774,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         new_state = tuple(map(reorder_state, cached_state))
         utils.set_incremental_state(self, incremental_state, 'cached_state', new_state)
 
-        curr_hidden_state = self.dh_hidden_states if hasattr(self, 'dh_hidden_states') else None #utils.get_incremental_state(self, incremental_state, 'curr_hidden_state')
+        '''curr_hidden_state = self.dh_hidden_states if hasattr(self, 'dh_hidden_states') else None #utils.get_incremental_state(self, incremental_state, 'curr_hidden_state')
         if curr_hidden_state is not None:
  
             if len(self.finalized_sequences) > 0:
@@ -2310,9 +2787,11 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
                 assert len(self.finalized_sequences) <= bz
 
             new_state = list(map(reorder_state, curr_hidden_state)) 
-            self.dh_hidden_states = new_state
+            self.dh_hidden_states = new_state'''
 
         if hasattr(self, 'dialog_history'):
+            for i in range(len(self.source_history)):
+                self.source_history[i] = self.source_history[i].index_select(1, new_order)
             for i in range(len(self.dialog_history)):
                 self.dialog_history[i] = self.dialog_history[i].index_select(1, new_order)
 
@@ -2321,7 +2800,7 @@ class LSTMDecoderEx(FairseqIncrementalDecoder):
         return self.max_target_positions
 
     def make_generation_fast_(self, need_attn=False, **kwargs):
-        self.need_attn = need_attn
+            self.need_attn = need_attn
 
 class DraftLSTMDecoder(FairseqIncrementalDecoder):
     """Like LSTM decoder, but it uses an attention on all previous predictions, instead of using only the previous prediction."""
@@ -3270,8 +3749,11 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         args.print_history_attn_weights = task.args.print_history_attn_weights
 
         if task.num_features != args.num_features:
-            sys.stderr.write(' - End2EndSLU build_model: detected and given number of features missmatch ({} VS. {}). Using detected...\n'.format(task.num_features, args.num_features))
-            args.num_features = task.num_features
+            if args.online_feature_extraction:
+                task.num_features = args.num_features
+            else:
+                sys.stderr.write(' - End2EndSLU build_model: detected and given number of features missmatch ({} VS. {}). Using detected...\n'.format(task.num_features, args.num_features))
+                args.num_features = task.num_features
 
         if args.decoder_layers_to_keep:
             args.decoder_layers = len(args.decoder_layers_to_keep.split(","))
@@ -3284,6 +3766,8 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         encoder = End2EndSLUEncoder(
             args=args,
             dictionary=task.label_vocab,
+            RoBERTa=task.roberta,
+            blank=task.blank_idx,
         )
 
         decoder_embeddings = None
@@ -3310,10 +3794,14 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
             decoder = BasicDecoder(tgt_dict, hidden_dim=2*args.decoder_hidden_dim)
         elif args.decoder == 'transformer':
             if decoder_embeddings is None:
-                decoder_embeddings = cls.build_embedding(
-                    args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
-                )
-            decoder = cls.build_decoder(args, tgt_dict, decoder_embeddings)
+                decoder_embeddings = init_functions.TransformerEmbedding( len(tgt_dict), args.decoder_embed_dim, tgt_dict.pad() )
+                #cls.build_embedding(
+                #    args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
+                #)
+            decoder = cls.build_decoder(args, tgt_dict, decoder_embeddings,
+                            roberta=task.roberta is not None, blank=task.blank_idx,
+                            encoder_output_units=encoder.encoder_output_units,
+                        )
         elif args.decoder == 'ctclstm': 
             decoder = LSTMDecoderEx(
                 dictionary=tgt_dict,
@@ -3332,7 +3820,9 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
                     options.eval_str_list(args.adaptive_softmax_cutoff, type=int)
                     if args.criterion == 'adaptive_loss' else None
                 ),
-                max_target_positions=args.max_target_positions
+                max_target_positions=args.max_target_positions,
+                RoBERTa=task.roberta is not None,
+                blank=task.blank_idx,
             )
         elif args.decoder == 'deliberation':
             decoder = DeliberationLSTMDecoder(
@@ -3441,6 +3931,12 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
             sys.stdout.flush()
             model.load_fairseq_decoder( args.load_fairseq_decoder, task )
 
+        if hasattr(task, 'model_start_point') and args.model_start_point:
+            print(' * End2EndSLUModel: loading model weights from {}'.format(args.model_start_point))
+            sys.stdout.flush()
+
+            model.load_state_dict( task.model_start_point['model'] )
+
         return model
 
     @classmethod
@@ -3456,26 +3952,43 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         return emb
 
     @classmethod
-    def build_decoder(cls, args, tgt_dict, embed_tokens):
-        '''return CTCTransformerDecoder(
+    def build_decoder(cls, args, tgt_dict, embed_tokens,
+            roberta=None,
+            blank=0,
+            encoder_output_units=512,
+        ):
+
+        print('[DEBUG] build_decoder, returning a tmp decoder architecture, fix this!')
+        sys.stdout.flush()
+
+        return CTCTransformerDecoder(
             args,
             tgt_dict,
             embed_tokens,
             no_encoder_attn=getattr(args, "no_cross_attention", False),
-        )'''
-        pass
+            RoBERTa=roberta,
+            blank=blank,
+            encoder_output_units=encoder_output_units,
+        ) 
 
     def __init__(self, args, encoder, decoder, tgt_dict):
         super().__init__(encoder, decoder)
 
+        self.curr_epoch = 0
         self.spk_abs_val = 1.0
         self.args = args
         self.dict = tgt_dict
         self.teacher_forcing = True
-        self.scheduled_sampling = args.scheduled_sampling
+        self.scheduled_sampling = args.scheduled_sampling 
 
         #self.user_pad = src_tokens.new_zeros(3,args.num_features).fill_(5.0)
         #self.mach_pad = src_tokens.new_zeros(3,args.num_features).fill_(-5.0)
+
+    def set_curr_epoch(self, value):
+        self.curr_epoch = value
+
+    def get_curr_epoch(self):
+        return self.curr_epoch
 
     def num_masked_tokens(self, val=0):
         num_masked = self.decoder.num_masked_tokens
@@ -3605,33 +4118,39 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
         if src_signals is not None:
             src_tokens = src_signals
 
-        B, T, C = src_tokens.size()
-        user_pad = src_tokens.new_zeros(3,C).fill_(self.spk_abs_val)
-        mach_pad = src_tokens.new_zeros(3,C).fill_(-self.spk_abs_val)
-        bogus_pad = src_tokens.new_zeros(3, C).fill_(-2.0*self.spk_abs_val)
-        #eod_pad = src_tokens.new_zeros(3, C).fill_(EOD_value)
+        if self.args.speech_encoder != 'sb-wav2vec2':
+            B, T, C = src_tokens.size()
+            user_pad = src_tokens.new_zeros(3,C).fill_(self.spk_abs_val)
+            mach_pad = src_tokens.new_zeros(3,C).fill_(-self.spk_abs_val)
+            bogus_pad = src_tokens.new_zeros(3, C).fill_(-2.0*self.spk_abs_val)
+            #eod_pad = src_tokens.new_zeros(3, C).fill_(EOD_value)
  
-        speakers = []
-        for i in range(B):         
-            if torch.sum(src_tokens[i,:3,:] == user_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == user_pad).item() == 3*C:
-                speakers.append(user_ID) 
-            elif torch.sum(src_tokens[i,:3,:] == mach_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == mach_pad).item() == 3*C:
-                speakers.append(machine_ID)
-            elif torch.sum(src_tokens[i,:3,:] == bogus_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == bogus_pad).item() == 3*C:
-                speakers.append(bogus_ID)
-            #elif torch.sum(src_tokens[i,:3,:] == eod_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == eod_pad).item() == 3*C:
-            #    speakers.append(bogus_ID)
-            else: 
-                raise ValueError(' Speaker is expected to be "User", "Machine" or "_BOGUS_", no valid speaker detected ')
-        self.encoder.set_turn_speaker( speakers )
-        if not isinstance(self.decoder, LSTMDecoder):
-            self.decoder.set_turn_speaker( speakers )
+            speakers = []
+            for i in range(B):         
+                if torch.sum(src_tokens[i,:3,:] == user_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == user_pad).item() == 3*C:
+                    speakers.append(user_ID) 
+                elif torch.sum(src_tokens[i,:3,:] == mach_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == mach_pad).item() == 3*C:
+                    speakers.append(machine_ID)
+                elif torch.sum(src_tokens[i,:3,:] == bogus_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == bogus_pad).item() == 3*C:
+                    speakers.append(bogus_ID)
+                #elif torch.sum(src_tokens[i,:3,:] == eod_pad).item() == 3*C or torch.sum(src_tokens[i,-3:,:] == eod_pad).item() == 3*C:
+                #    speakers.append(bogus_ID)
+                else: 
+                    raise ValueError(' Speaker is expected to be "User", "Machine" or "_BOGUS_", no valid speaker detected ')
+            self.encoder.set_turn_speaker( speakers )
+            if not isinstance(self.decoder, LSTMDecoder):
+                self.decoder.set_turn_speaker( speakers )
 
         if src_signals is not None:
             src_tokens = tmp
 
         #if self.args.freeze_encoder: 
         #    self.encoder.eval()
+
+        #if self.decoder.get_use_history_flag():
+        #    # TODO: tell the encoder to use dialog history as well
+        #self.encoder.set_use_history_flag( self.decoder.get_use_history_flag() )
+
         encoder_out = self.encoder(src_signals, src_tokens, src_lengths, src_tok_lengths)
 
         if False: #self.scheduled_sampling:
@@ -3651,6 +4170,10 @@ class End2EndSLUModel(FairseqEncoderDecoderModel):
                 src_lengths=src_lengths,
                 return_all_hiddens = False,
             )
+
+        #if self.decoder.get_eod_flag():
+        #    # TODO: reset encoder dialogue history
+        #    pass
 
         return decoder_out
 

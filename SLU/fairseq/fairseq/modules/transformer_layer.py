@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+__DEBUG__ = False
+
 from typing import Dict, List, Optional
 
 import sys
@@ -13,6 +15,8 @@ from fairseq import utils
 from fairseq.modules import LayerNorm, MultiheadAttention
 from torch import Tensor
 
+if __DEBUG__:
+    from fairseq import init_functions
 
 class TransformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -160,11 +164,6 @@ class TransformerDecoderLayer(nn.Module):
             self.activation_dropout = getattr(args, "relu_dropout", 0)
         self.normalize_before = args.decoder_normalize_before
 
-        print('   * TransformerDecoderLayer, attention_dropout: {}'.format(args.attention_dropout))
-        print('   * TransformerDecoderLayer, dropout: {}'.format(self.dropout))
-        print('   * TransformerDecoderLayer, activation_dropout: {}'.format(self.activation_dropout))
-        sys.stdout.flush()
-
         # use layerNorm rather than FusedLayerNorm for exporting.
         # char_inputs can be used to determint this.
         # TODO  remove this once we update apex with the fix
@@ -185,8 +184,12 @@ class TransformerDecoderLayer(nn.Module):
             )
             self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
 
-        self.fc1 = Linear(self.embed_dim, args.decoder_ffn_embed_dim)
-        self.fc2 = Linear(args.decoder_ffn_embed_dim, self.embed_dim)
+        if __DEBUG__:
+            self.fc1 = init_functions.TransformerLinear(self.embed_dim, args.decoder_ffn_embed_dim)
+            self.fc2 = init_functions.TransformerLinear(args.decoder_ffn_embed_dim, self.embed_dim)
+        else:
+            self.fc1 = Linear(self.embed_dim, args.decoder_ffn_embed_dim)
+            self.fc2 = Linear(args.decoder_ffn_embed_dim, self.embed_dim)
 
         self.final_layer_norm = LayerNorm(self.embed_dim, export=export)
         self.need_attn = True
@@ -227,10 +230,7 @@ class TransformerDecoderLayer(nn.Module):
 
         residual = x
         if self.normalize_before:
-            x = self.self_attn_layer_norm(x)
-
-        print(' * [DEBUG] TransformerDecoderLayer, prev_self_attn_state is None ? {}'.format(prev_self_attn_state is None))
-        sys.stdout.flush()
+            x = self.self_attn_layer_norm(x) 
 
         if prev_self_attn_state is not None:
             prev_key, prev_value = prev_self_attn_state[:2]
@@ -244,18 +244,11 @@ class TransformerDecoderLayer(nn.Module):
             self.self_attn._set_input_buffer(incremental_state, saved_state)
         _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
 
-        print(' * [DEBUG] TransformerDecoderLayer, _self_attn_input_buffer is None ? {}'.format(_self_attn_input_buffer is None))
-        sys.stdout.flush()
-
         if self.cross_self_attention and not (
             incremental_state is not None
             and _self_attn_input_buffer is not None
             and "prev_key" in _self_attn_input_buffer
         ):
-
-            print(' * [DEBUG] TransformerDecoderLayer, setting self attention keys and values...')
-            sys.stdout.flush()
-
             if self_attn_mask is not None:
                 assert encoder_out is not None
                 self_attn_mask = torch.cat(
@@ -292,10 +285,7 @@ class TransformerDecoderLayer(nn.Module):
         if self.encoder_attn is not None:
             residual = x
             if self.normalize_before:
-                x = self.encoder_attn_layer_norm(x)
-
-            print(' * [DEBUG] TransformerDecoderLayer, prev_attn_state is None ? {}'.format(prev_attn_state is None))
-            sys.stdout.flush()
+                x = self.encoder_attn_layer_norm(x) 
 
             if prev_attn_state is not None:
                 prev_key, prev_value = prev_attn_state[:2]
@@ -307,6 +297,10 @@ class TransformerDecoderLayer(nn.Module):
                     saved_state["prev_key_padding_mask"] = prev_attn_state[2]
                 assert incremental_state is not None
                 self.encoder_attn._set_input_buffer(incremental_state, saved_state)
+
+            #print('')
+            #print('[DEBUG] TransformerDecoderLayer, encoder_out shape: {}'.format(encoder_out.size()))
+            #sys.stdout.flush()
 
             x, attn = self.encoder_attn(
                 query=x,
@@ -344,9 +338,6 @@ class TransformerDecoderLayer(nn.Module):
                 ]
             else:
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
-
-            print(' * [DEBUG] TransformerDecoderLayer, set self_attn_state')
-            sys.stdout.flush()
 
             return x, attn, self_attn_state
         return x, attn, None

@@ -3,6 +3,7 @@
 import sys
 import numpy as np
 import math
+import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,7 +52,7 @@ class TarcMultiTaskEncoder(FairseqEncoder):
         
         super().__init__(dictionary)
         self.args = args
-        self.padding_idx = dictionary.pad_index
+        self.padding_idx = dictionary.pad_index if dictionary is not None else None
         self.sequence_separator = dictionary.index( args.sequence_separator )
         if self.sequence_separator == dictionary.unk():
             raise ValueError('Sequence separator symbol {} is expected to be defined in the dictionary'.format(args.sequence_separator))
@@ -84,6 +85,12 @@ class TarcMultiTaskEncoder(FairseqEncoder):
         #        left_to_right=True
         #    ) 
 
+        #print('[DEBUG] Encoder, src_tokens[0] (shape: {}): {}'.format(src_tokens[0].size(), src_tokens[0]))
+        #print('[DEBUG] Encoder, src_lengths[0]: {}'.format(src_lengths[0][0]))
+        #print('[DEBUG] Encoder, src_tokens[1] (shape: {}): {}'.format(src_tokens[1].size(), src_tokens[1]))
+        #print('[DEBUG] Encoder, src_lengths[1]: {}'.format(src_lengths[1][0]))
+        #sys.stdout.flush()
+
         if len(self.encoders) > 1:
             toks_src_tokens = split_on_sep(src_tokens[0], self.sequence_separator)
             char_src_tokens = split_on_sep(src_tokens[1], self.sequence_separator)
@@ -96,6 +103,13 @@ class TarcMultiTaskEncoder(FairseqEncoder):
         for i in range(len(self.encoders)):
             src_tokens_i = [toks_src_tokens[i], char_src_tokens[i]]
             src_lengths_i = [src_lengths[0][i], src_lengths[1][i]]
+
+            #print('[DEBUG] Encoder, toks_src_tokens (shape: {}): {}'.format(toks_src_tokens[i].size(), toks_src_tokens[i]))
+            #print('[DEBUG] Encoder, src_lengths[0]: {}'.format(src_lengths[0][i]))
+            #print('[DEBUG] Encoder, char_src_tokens (shape: {}): {}'.format(char_src_tokens[i].size(), char_src_tokens[i]))
+            #print('[DEBUG] Encoder, src_lengths[1]: {}'.format(src_lengths[1][i]))
+            #sys.stdout.flush()
+
             curr_encoder_out = self.encoders[i](src_tokens_i, src_lengths_i, src_tok_bounds[i], sort_order)
             outputs.append( curr_encoder_out ) 
 
@@ -184,6 +198,10 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
         self.granularity_merging_flags = ()
         self.finalized_hypos = [[] for i in range(len(decoders))]
 
+        if self.args.backward_indices:
+            for i in self.args.backward_indices:
+                assert i < len(self.decoders)
+
     def set_g_merging_flags_(self, g_flags: Tuple):
         assert len(g_flags) == len(self.decoders)
         self.granularity_merging_flags = g_flags
@@ -214,6 +232,36 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
             final_hiddens = torch.stack( [hidden_state[-1].clone() for i in range(self.args.decoder_layers)], 0 )
             final_cells = torch.stack( [hidden_state[-1].clone() for i in range(self.args.decoder_layers)], 0 )
             return (final_hiddens, final_cells)
+
+    def recollate_prev_tokens(self, prev_output_tokens):
+
+        new_prev_toks = prev_output_tokens.clone()
+        for i in range(prev_output_tokens.size(0)):
+            if torch.sum(prev_output_tokens[i,:].eq(self.dictionary.pad())):
+                tmp = prev_output_tokens[i,:prev_output_tokens[i,:].eq(self.dictionary.pad()).nonzero()[0].item()].clone()
+            else:
+                tmp = prev_output_tokens[i,:].clone()
+
+            assert tmp[0] == self.dictionary.eos() and tmp[1] == self.dictionary.bos()
+            tmp[0:-1] = tmp[1:].clone()
+            tmp[-1] = self.dictionary.eos()
+            new_prev_toks[i,:tmp.size(0)] = tmp
+
+        return new_prev_toks
+
+    def clean_predictions(self, predictions):
+
+        # 1. We remove duplicate items
+        tmp_lst = [i.item() for i in predictions]
+        nodouble_lst = [k for k,g in itertools.groupby(tmp_lst)] 
+        clean_preds = torch.LongTensor( nodouble_lst )
+        
+        # 2. We remove blanks
+        nonzero_idx = (clean_preds != self.dictionary.blank()).nonzero()
+        nonzero_idx = nonzero_idx.view(-1)
+        clean_preds = clean_preds[nonzero_idx].to(predictions)
+
+        return clean_preds
 
     def forward(self, prev_output_tokens, shapes=None, tgt_tok_bounds=None, sort_order=None, encoder_out=None, src_lengths=None, incremental_state=None, **kwargs):
         if incremental_state is not None: 
@@ -305,17 +353,30 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
 
                             hidden_state_i[t_idx, batch_idxs, :] = self.decoder_hidden_states[d_idx][t_idx]
                         #hidden_state_i = torch.cat(self.decoder_hidden_states[d_idx], 0)
+                        # TODO: Code to reverse hidden_state_i  at inference phase in case of backward-forward processing. TODO: test it!
+                        if self.args.backward_indices and d_idx in self.args.backward_indices:
+                            hidden_state_i = hidden_state_i.flip(0)
+
+                            print('[DEBUG] flipping hidden state @decoder{} on dimension zero, shape: {}'.format(d_idx, hidden_state_i.size()))
+                            sys.stdout.flush()
                         self.working_decoder_hidden_states[d_idx] = hidden_state_i
+
+                    # NOTE: create mask for hidden_state_i by making predictions from hidden_state_i and masking padding and possibly blanks
+                    #scores = self.decoders[d_idx].output_layer(hidden_state_i)
+                    #scores = F.log_softmax(scores, -1)
+                    #_, preds = torch.max(scores, -1)
+                    #padding_mask_dec_i = preds.eq(self.dictionary.pad())
+                    padding_mask_dec_i = None #[padding_mask_dec_i == self.dictionary.blank()] = True
                     if self.args.model_type == 'lstm':
                         new_decoder_input = {
                             'encoder_out' : (hidden_state_i, None, None),
-                            'encoder_padding_mask' : toks_prev_output_tokens[d_idx].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[d_idx].eq(self.dictionary.pad())
+                            'encoder_padding_mask' : padding_mask_dec_i if not char_flag else char_prev_output_tokens[d_idx].eq(self.dictionary.pad())
                         }
                         decoder_input.append( new_decoder_input )
                     else:
                         new_decoder_input = EncoderOut(
                                 encoder_out=hidden_state_i, # NOTE: pay attention to this, Transformers may provide hidden states in one shot also at inference phase
-                            encoder_padding_mask=toks_prev_output_tokens[d_idx].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[d_idx].eq(self.dictionary.pad()),
+                            encoder_padding_mask=padding_mask_dec_i if not char_flag else char_prev_output_tokens[d_idx].eq(self.dictionary.pad()),
                             encoder_embedding=None,
                             encoder_states=None
                         )
@@ -339,7 +400,19 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
             )
             outputs.append( decoder_out )
 
-            hidden_state = decoder_out[1]['hidden'].transpose(0,1) 
+            hidden_state = decoder_out[1]['hidden'].transpose(0,1)
+            # TODO: reverse hidden_state in training phase when backward-forward processing is used; TODO: test it!
+            if self.args.backward_indices and i in self.args.backward_indices: 
+                hidden_state = hidden_state.flip(0)
+
+            # NOTE: creates the mask for hidden_state at training phase by making predictions from hidden_state
+            #scores = self.decoders[i].output_layer(hidden_state)
+            #scores = F.log_softmax(scores, -1)
+            #_, preds = torch.max(scores, -1) 
+
+            #new_prev_toks = self.recollate_prev_tokens(toks_prev_output_tokens[i])
+            #padding_mask_dec_i = new_prev_toks.transpose(0, 1).eq(self.dictionary.pad())
+            padding_mask_dec_i = None #[padding_mask_dec_i == self.dictionary.blank()] = True
             if not self.training:
                 self.decoder_hidden_states[i].append( hidden_state ) 
 
@@ -350,7 +423,7 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
             if self.args.model_type == 'transformer': 
                 new_decoder_input = EncoderOut(
                     encoder_out = hidden_state, 
-                    encoder_padding_mask = toks_prev_output_tokens[i].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[i].eq(self.dictionary.pad()),
+                    encoder_padding_mask = padding_mask_dec_i if not char_flag else char_prev_output_tokens[i].eq(self.dictionary.pad()),
                     encoder_embedding = None,
                     encoder_states = None,
                 )
@@ -358,7 +431,7 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
             else:
                 new_decoder_input = {
                     'encoder_out' : (hidden_state, None, None),
-                    'encoder_padding_mask' : toks_prev_output_tokens[i].eq(self.dictionary.pad()) if not char_flag else char_prev_output_tokens[i].eq(self.dictionary.pad())
+                    'encoder_padding_mask' : padding_mask_dec_i if not char_flag else char_prev_output_tokens[i].eq(self.dictionary.pad())
                 }
                 decoder_input.append( new_decoder_input ) 
 
@@ -376,6 +449,10 @@ class TarcMultiTaskDecoder(FairseqIncrementalDecoder):
         for o in outputs:
             x.append( o[0] )
             attn_scores.append( o[1] )
+
+        #print('[DEBUG] #############################################################################')
+        #print('[DEBUG] #############################################################################')
+        #sys.stdout.flush()
 
         #print(' TarcMultiTaskDecoder, forward passed.')
         #sys.stdout.flush() 
@@ -462,14 +539,20 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
         TransformerModel.add_args(parser)
     
     @classmethod
-    def build_encoder(cls, args, src_dict, embed_tokens, token2components_map):
+    def build_encoder(cls, args, src_dict, embed_tokens, token2components_map, ssl_encoder):
+
+        if ssl_encoder is not None:
+            print('[DEBUG] build_encoder: encoding input data with {} ssl encoder'.format(args.ssl_type))
+            sys.stdout.flush()
+
         if args.model_type == 'transformer':
             return TarcTransformerEncoder(
                                         args,
                                         src_dict,
                                         embed_tokens,
                                         token_map=token2components_map,
-                                        granularity_flags=(args.token_sequences, args.char_sequences)
+                                        granularity_flags=(args.token_sequences, args.char_sequences),
+                                        ssl_encoder=ssl_encoder,
             )
         elif args.model_type == 'lstm':
             return TarcLSTMEncoder(
@@ -484,7 +567,8 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
                                pretrained_embed=embed_tokens,
                                max_source_positions=args.max_source_positions,
                                token_map=token2components_map,
-                               granularity_flags=(args.token_sequences, args.char_sequences)
+                               granularity_flags=(args.token_sequences, args.char_sequences),
+                               ssl_encoder=ssl_encoder,
             )
         else:
             raise NotImplementedError
@@ -505,6 +589,8 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             )
         elif args.model_type == 'lstm':
             encoder_output_units = args.num_of_inputs * args.encoder_hidden_dim * 2
+            if args.tune_ssl:
+                encoder_output_units = 768 if 'base' in args.ssl_encoder else 1024
             hid_size = args.decoder_hidden_dim
             out_embed_dim = args.decoder_out_embed_dim
 
@@ -556,9 +642,15 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
 
         args.num_of_inputs = task.num_of_inputs 
         src_dict, tgt_dict = task.source_dictionary, task.target_dictionary
-        
+        if args.speech_input:
+            src_dict = tgt_dict
+
         def build_embedding(args, dictionary, embed_dim, path=None):
-            num_embeddings = len(dictionary)
+            if dictionary is None:
+                assert args.speech_input
+                num_embeddings = 1
+            else:
+                num_embeddings = len(dictionary)
             padding_idx = dictionary.pad()
             if args.model_type == 'lstm':
                 emb = init_functions.LSTMEmbedding(num_embeddings, embed_dim, padding_idx)
@@ -571,7 +663,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             return emb
 
         if args.share_all_embeddings:
-            if src_dict != tgt_dict:
+            if not args.speech_input and src_dict != tgt_dict:
                 raise ValueError("--share-all-embeddings requires a joined dictionary")
             if args.encoder_embed_dim != args.decoder_embed_dim:
                 raise ValueError(
@@ -588,7 +680,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             sys.stdout.flush()
  
             encoder_embed_tokens = build_embedding(
-                args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
+                args, tgt_dict, args.encoder_embed_dim, args.encoder_embed_path
             )
             if hasattr(args, 'load_embeddings') and args.load_embeddings:
                 if hasattr(args, 'load_dictionary') and not args.load_dictionary:
@@ -647,7 +739,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
         dec_count = 0
 
         for i in range( min(num_encoders, num_decoders) ):
-            encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens, task.token2components_tsr[enc_count])
+            encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens, task.token2components_tsr[enc_count], task.ssl_encoder)
             input_dict = task.input_dict if i == num_decoders-1 else None
             output_dict = task.output_dict if i == num_decoders-1 else None
             punct_dict = task.punct_dict if i == num_decoders-1 else None
@@ -659,7 +751,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
             enc_count += 1
             dec_count += 1
         while enc_count < num_encoders:
-            encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens, task.token2components_tsr[enc_count])
+            encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens, task.token2components_tsr[enc_count], task.ssl_encoder)
             encoders.append( encoder )
             enc_count += 1
         while dec_count < num_decoders:
@@ -713,6 +805,7 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
     def __init__(self, args, encoder, decoder, tgt_dict, input_dict=None):
         super().__init__(encoder, decoder)
 
+        self.curr_epoch = 0
         self.args = args
         self.dict = tgt_dict
         self.tmp_dict = {}
@@ -724,8 +817,12 @@ class TarcMultiTaskModel(FairseqEncoderDecoderModel):
         # Kept for possible future use
         self.teacher_forcing = True
         self.scheduled_sampling = False
-    
-    
+
+    def set_curr_epoch(self, value):
+        self.curr_epoch = value
+
+    def get_curr_epoch(self):
+        return self.curr_epoch
 
     def set_scheduled_sampling(self, ss_val=False):
         self.scheduled_sampling = ss_val

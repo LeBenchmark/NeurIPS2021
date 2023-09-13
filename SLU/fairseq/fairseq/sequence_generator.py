@@ -112,6 +112,10 @@ class SequenceGenerator(object):
             if k != 'prev_output_tokens'
         }
 
+        #print('[DEBUG] sequence_generator, target: {}'.format(sample['target']))
+        #print('[DEBUG] sequence_generator, decoding sequence: {}'.format(sample['net_input']['prev_output_tokens']))
+        #sys.stdout.flush()
+
         src_tokens = encoder_input['src_tokens']
         #if isinstance(src_tokens, tuple):
         #    src_tokens = src_tokens[0]
@@ -380,19 +384,21 @@ class SequenceGenerator(object):
             eos_mask[:, :beam_size][blacklist] = 0
 
             # only consider eos when it's among the top beam_size indices
-            torch.masked_select(
+            eos_bbsz_idx = torch.masked_select(
                 cand_bbsz_idx[:, :beam_size],
                 mask=eos_mask[:, :beam_size],
-                out=eos_bbsz_idx,
             )
+            #    out=eos_bbsz_idx,
+            #)
 
             finalized_sents = set()
             if eos_bbsz_idx.numel() > 0:
-                torch.masked_select(
+                eos_scores = torch.masked_select(
                     cand_scores[:, :beam_size],
                     mask=eos_mask[:, :beam_size],
-                    out=eos_scores,
                 )
+                #    out=eos_scores,
+                #)
                 finalized_sents = finalize_hypos(step, eos_bbsz_idx, eos_scores)
                 num_remaining_sent -= len(finalized_sents)
 
@@ -445,29 +451,32 @@ class SequenceGenerator(object):
             # candidate active hypos.
             active_mask = buffer('active_mask')
             eos_mask[:, :beam_size] |= blacklist
-            torch.add(
+            active_mask = torch.add(
                 eos_mask.type_as(cand_offsets) * cand_size,
                 cand_offsets[:eos_mask.size(1)],
-                out=active_mask,
             )
+            #    out=active_mask,
+            #)
 
             # get the top beam_size active hypotheses, which are just the hypos
             # with the smallest values in active_mask
             active_hypos, new_blacklist = buffer('active_hypos'), buffer('new_blacklist')
-            torch.topk(
+            new_blacklist, active_hypos = torch.topk(
                 active_mask, k=beam_size, dim=1, largest=False,
-                out=(new_blacklist, active_hypos)
             )
+            #    out=(new_blacklist, active_hypos)
+            #)
 
             # update blacklist to ignore any finalized hypos
             blacklist = new_blacklist.ge(cand_size)[:, :beam_size]
             assert (~blacklist).any(dim=1).all()
 
             active_bbsz_idx = buffer('active_bbsz_idx')
-            torch.gather(
+            active_bbsz_idx = torch.gather(
                 cand_bbsz_idx, dim=1, index=active_hypos,
-                out=active_bbsz_idx,
             )
+            #    out=active_bbsz_idx,
+            #)
             active_scores = torch.gather(
                 cand_scores, dim=1, index=active_hypos,
                 out=scores[:, step].view(bsz, beam_size),

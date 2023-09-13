@@ -3,8 +3,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+__DEBUG__ = False
+
 from typing import Dict, List, Optional
 
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +15,8 @@ from fairseq import utils
 from fairseq.modules import LayerNorm, MultiheadLinearAttention
 from torch import Tensor
 
+if __DEBUG__:
+    from fairseq import init_functions
 
 class LinformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -28,14 +33,17 @@ class LinformerEncoderLayer(nn.Module):
         args (argparse.Namespace): parsed command-line arguments
     """
 
-    def __init__(self, args):
+    def __init__(self, args, max_seq_len=8192, compressed=64):
         super().__init__()
         self.embed_dim = args.encoder_embed_dim
+
         self.self_attn = MultiheadLinearAttention(
             self.embed_dim,
             args.encoder_attention_heads,
             dropout=args.attention_dropout,
             self_attention=True,
+            compressed=compressed,
+            max_seq_len=max_seq_len,
         )
         self.self_attn_layer_norm = LayerNorm(self.embed_dim)
         self.dropout = args.dropout
@@ -47,8 +55,12 @@ class LinformerEncoderLayer(nn.Module):
             # for backwards compatibility with models that use args.relu_dropout
             self.activation_dropout = getattr(args, "relu_dropout", 0)
         self.normalize_before = args.encoder_normalize_before
-        self.fc1 = Linear(self.embed_dim, args.encoder_ffn_embed_dim)
-        self.fc2 = Linear(args.encoder_ffn_embed_dim, self.embed_dim)
+        if __DEBUG__:
+            self.fc1 = init_functions.TransformerLinear(self.embed_dim, args.encoder_ffn_embed_dim)
+            self.fc2 = init_functions.TransformerLinear(args.encoder_ffn_embed_dim, self.embed_dim)
+        else:
+            self.fc1 = Linear(self.embed_dim, args.encoder_ffn_embed_dim)
+            self.fc2 = Linear(args.encoder_ffn_embed_dim, self.embed_dim)
         self.final_layer_norm = LayerNorm(self.embed_dim)
 
     def upgrade_state_dict_named(self, state_dict, name):
@@ -179,8 +191,12 @@ class LinformerDecoderLayer(nn.Module):
             )
             self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
 
-        self.fc1 = Linear(self.embed_dim, args.decoder_ffn_embed_dim)
-        self.fc2 = Linear(args.decoder_ffn_embed_dim, self.embed_dim)
+        if __DEBUG__:
+            self.fc1 = init_functions.TransformerLinear(self.embed_dim, args.decoder_ffn_embed_dim)
+            self.fc2 = init_functions.TransformerLinear(args.decoder_ffn_embed_dim, self.embed_dim)
+        else:
+            self.fc1 = Linear(self.embed_dim, args.decoder_ffn_embed_dim)
+            self.fc2 = Linear(args.decoder_ffn_embed_dim, self.embed_dim)
 
         self.final_layer_norm = LayerNorm(self.embed_dim, export=export)
         self.need_attn = True

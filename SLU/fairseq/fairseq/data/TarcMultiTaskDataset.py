@@ -8,6 +8,7 @@ import torch
 
 from . import data_utils, FairseqDataset
 from fairseq.tarc_utils import *
+from fairseq.data.End2EndSLUDataset import collate_features
 
 # Use this to show warnings (anything else ?) at the command line
 logger = logging.getLogger(__name__)
@@ -24,16 +25,37 @@ def collate_tokens_ex(values, pad_idx, bos_idx=None, eos_idx=None, left_pad=Fals
     res = values[0].new(len(values), size).fill_(pad_idx)
 
     for i, v in enumerate(values):
+
+        #print('[DEBUG] v size: {}'.format(v.size()))
+        #print('[DEBUG] res size: {}'.format(res.size()))
+        #print('[DEBUG] size: {}'.format(size))
+        #print('[DEBUG] v len: {}'.format(len(v)))
+        #print('[DEBUG] left_pad: {}'.format(left_pad))
+        #print('[DEBUG] res[i] shape: {}'.format(res[i].size()))
+        #print('[DEBUG] dst size: {}'.format( res[i][size - len(v):] if left_pad else res[i][:len(v)] ))
+        #sys.stdout.flush()
+
         copy_tensor_for_collate(v, res[i][size - len(v):] if left_pad else res[i][:len(v)], bos_idx, eos_idx, move_trail)
     return res
 
 def collate(
             samples, pad_idx, bos_idx, eos_idx, sequence_separator, left_pad_source=False, left_pad_target=False,
-            input_feeding=True, granularity_flags=(False, True)
+            input_feeding=True, granularity_flags=(False, True), speech_flag=False,
 ):
 
     if len(samples) == 0:
         return {}
+
+    def merge_features(key, g_idx, left_pad):
+        res = []
+        for idx in range(len(samples[0][key][g_idx])):
+            res.append( collate_features(
+                            [s[key][g_idx][idx] for s in samples],
+                            pad_idx, eos_idx, left_pad
+                        )
+            )
+
+        return res
 
     def merge_tokens(key, g_idx, left_pad, bos=None, eos=None, move_trail=False):
         res = []
@@ -45,9 +67,31 @@ def collate(
             )
         return res 
 
-    id = torch.LongTensor([s['id'] for s in samples]) 
-    toks_src_tokens = merge_tokens('source', g_idx=0, left_pad=left_pad_source)
-    char_src_tokens = merge_tokens('source', g_idx=1, left_pad=left_pad_source) 
+    id = torch.LongTensor([s['id'] for s in samples])
+    if not speech_flag:
+
+        #print('[DEBUG] *** collate ***')
+        #print('[DEBUG] token tensors before merge:')
+        #for idx in range(len(samples[0]['source'][0])):
+        #    print('[DEBUG]   - lens: {}'.format([s['source'][0][idx].size() for s in samples]))
+        #print('[DEBUG] -----')
+        #print('[DEBUG] char tensors before merge:')
+        #for idx in range(len(samples[0]['source'][1])):
+        #    print('[DEBUG]   - lens: {}'.format([s['source'][1][idx].size() for s in samples]))
+        #print('[DEBUG] ***** collate *****')
+        #sys.stdout.flush()
+
+        toks_src_tokens = merge_tokens('source', g_idx=0, left_pad=left_pad_source)
+        char_src_tokens = merge_tokens('source', g_idx=1, left_pad=left_pad_source)
+
+        #print('[DEBUG] *** collate ***')
+        #print('[DEBUG]   - token tensors after merge: {}'.format(toks_src_tokens[0].size()))
+        #print('[DEBUG]   - char tensors after merge: {}'.format(char_src_tokens[0].size()))
+        #print('[DEBUG] ***** collate *****')
+        #sys.stdout.flush() 
+    else:
+        toks_src_tokens = merge_features('source', g_idx=0, left_pad=left_pad_source)
+        char_src_tokens = None
 
     # sort by descending source length
     toks_src_lengths = []
@@ -59,6 +103,12 @@ def collate(
         char_src_lengths.append( torch.LongTensor([s['source'][1][idx].ne(pad_idx).long().sum() for s in samples]) )
         src_tok_bounds.append( [s['src_tok_bounds'][idx] for s in samples] )
 
+    #print('[DEBUG] *** collate ***')
+    #print('[DEBUG]   - toks_src_lengths (len: {}): {}'.format(len(toks_src_lengths), toks_src_lengths))
+    #print('[DEBUG]   - char_src_lengths (len: {}): {}'.format(len(char_src_lengths), char_src_lengths))
+    #print('[DEBUG] ***** collate *****')
+    #sys.stdout.flush()
+
     bogus, sort_order = toks_src_lengths[0].sort(descending=True)
     bogus, char_sort_order = char_src_lengths[0].sort(descending=True) 
 
@@ -68,7 +118,7 @@ def collate(
     char_src_lengths = [t.index_select(0, sort_order) for t in char_src_lengths]
     id = id.index_select(0, sort_order)
     toks_src_tokens = [t.index_select(0, sort_order) for t in toks_src_tokens]
-    char_src_tokens = [t.index_select(0, sort_order) for t in char_src_tokens]
+    char_src_tokens = [t.index_select(0, sort_order) for t in char_src_tokens] if not speech_flag else None
     for li in range(len(src_tok_bounds)):
         src_tok_bounds[li] = [src_tok_bounds[li][i] for i in sort_order]
 
@@ -147,14 +197,15 @@ def collate(
     assert len(toks_target) == len(toks_prev_output_tokens)
     assert len(toks_target) == len(toks_next_output_tokens)
 
-    assert len(char_src_tokens) == len(char_src_lengths)
+    if not speech_flag:
+        assert len(char_src_tokens) == len(char_src_lengths)
     assert len(char_target) == len(char_tgt_lengths)
     assert len(char_target) == len(char_ntokens)
     assert len(char_target) == len(char_prev_output_tokens)
-    assert len(char_target) == len(char_next_output_tokens)
- 
+    assert len(char_target) == len(char_next_output_tokens)  
+
     toks_src_tokens = concat_with_sep(toks_src_tokens, sequence_separator)
-    char_src_tokens = concat_with_sep(char_src_tokens, sequence_separator)
+    char_src_tokens = concat_with_sep(char_src_tokens, sequence_separator) if char_src_tokens is not None else None
     toks_target = concat_with_sep(toks_target, sequence_separator)
     char_target = concat_with_sep(char_target, sequence_separator)
     toks_prev_output_tokens = concat_with_sep(toks_prev_output_tokens, sequence_separator)
@@ -210,7 +261,7 @@ class TarcMultiTaskDataset(FairseqDataset):
         """
 
     def __init__(
-        self, src, src_sizes, src_dict,
+        self, args, src, src_sizes, src_dict,
         tgt, tgt_sizes, tgt_dict,
         sequence_separator,
         left_pad_target=False,
@@ -225,6 +276,7 @@ class TarcMultiTaskDataset(FairseqDataset):
         self.token_sequences = granularity_flags[0] if granularity_flags is not None else False
         self.char_sequences = granularity_flags[1] if granularity_flags is not None else False 
 
+        self.args = args
         self.src = src
         self.tgt = tgt 
         self.src_sizes = []
@@ -234,7 +286,19 @@ class TarcMultiTaskDataset(FairseqDataset):
                 self.src_sizes[g_idx].append( np.array( src_sizes[g_idx][t_idx] ) )
         self.src_sizes.append([])
         assert len(src_sizes[-1]) == 1
-        self.src_sizes[-1].append( src_sizes[-1][0] ) 
+        self.src_sizes[-1].append( src_sizes[-1][0] )
+
+        '''print('[DEBUG] *** Dataset ***')
+        print('[DEBUG] src shape: {}'.format(len(self.src)))
+        print('[DEBUG]   - {}, {}'.format(len(self.src[0][0]), len(self.src[1][0])))
+        print('[DEBUG] src_sizes shape: {}'.format(len(self.src_sizes)))
+        print('[DEBUG]   - {}, {}'.format( len(self.src_sizes[0][0]), len(self.src_sizes[1][0]) ))
+        for i in range(len(self.src[0][0])):
+            assert self.src[0][0][i].size(0) == self.src_sizes[0][0][i]
+            assert self.src[1][0][i].size(0) == self.src_sizes[1][0][i]
+        print('[DEBUG] ***** Dataset *****')
+        sys.stdout.flush()'''
+
         self.tgt_sizes = []
         for g_idx in range( len(tgt_sizes)-1 ):
             self.tgt_sizes.append([])
@@ -276,11 +340,17 @@ class TarcMultiTaskDataset(FairseqDataset):
         if self.append_eos_to_target:
             eos = self.tgt_dict.eos()
             if self.tgt[0][0][index][-1] != eos:
+                print('[DEBUG] WARNING adding eos to tensors')
+                sys.stdout.flush()
+
                 tgt_item = [ [torch.cat(l[index], torch.LongTensor([eos])) for l in self.tgt[0]], [torch.cat(l[index], torch.LongTensor([eos])) for l in self.tgt[1]] ]
 
         if self.append_bos:
             bos = self.tgt_dict.bos()
             if self.tgt[0][0][index][0] != bos:
+                print('[DEBUG] WARNING adding bos to tensors')
+                sys.stdout.flush()
+
                 tgt_item = [ [torch.cat(torch.LongTensor([bos]), l[index]) for l in self.tgt[0]], [torch.cat(torch.LongTensor([bos]), l[index]) for l in self.tgt[1]] ]
 
         example = {
@@ -331,6 +401,7 @@ class TarcMultiTaskDataset(FairseqDataset):
             left_pad_source=False, left_pad_target=self.left_pad_target,
             input_feeding=self.input_feeding,
             granularity_flags=(self.token_sequences, self.char_sequences),
+            speech_flag=self.args.speech_input,
         )
 
     def num_tokens(self, index):

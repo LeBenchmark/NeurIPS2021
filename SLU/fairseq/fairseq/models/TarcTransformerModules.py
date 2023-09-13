@@ -37,6 +37,8 @@ from fairseq.modules import (
     TransformerEncoderLayer,
 )
 
+from fairseq.data.TarcMultiTaskDataset import collate_tokens_ex
+
 _DEBUG_ = False
 
 class TarcTransformerEncoderLayer(nn.Module):
@@ -159,10 +161,11 @@ class TarcTransformerEncoder(FairseqEncoder):
         embed_tokens (torch.nn.Embedding): input embedding
     """
 
-    def __init__(self, args, dictionary, embed_tokens, token_map=None, granularity_flags=None):
+    def __init__(self, args, dictionary, embed_tokens, token_map=None, granularity_flags=None, ssl_encoder=None):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
 
+        self.args = args
         self.token2components_map = token_map
         self.token_sequences = granularity_flags[0] if granularity_flags is not None else False
         self.char_sequences = granularity_flags[1] if granularity_flags is not None else False
@@ -178,22 +181,43 @@ class TarcTransformerEncoder(FairseqEncoder):
         #    #args.encoder_embed_dim = 2*args.encoder_embed_dim
         #    embed_dim = args.encoder_embed_dim if embed_dim != args.encoder_embed_dim else embed_dim
         self.padding_idx = dictionary.pad() #embed_tokens.padding_idx
+        if ssl_encoder is not None:
+            if self.args.ssl_type in ['camembert-base', 'camembert-large']:
+                self.padding_idx = ssl_encoder.task.source_dictionary.pad()
+            elif self.args.ssl_type in ['flaubert1-base', 'flaubert1-large']:
+                self.padding_idx = ssl_encoder['model'].embeddings.padding_idx
+            elif self.args.ssl_type == 'flauberto1-base':
+                self.padding_idx = ssl_encoder['model'].embeddings.padding_idx # NOTE: this becomes .transformer.embeddings.padding_idx for model tuned on MEDIA from vpelloin
+            elif self.args.ssl_type == 'jargon-base' or self.args.ssl_type == 'jargon-large':
+                self.padding_idx = ssl_encoder['model'].roberta.embeddings.padding_idx
         self.max_source_positions = args.max_source_positions
 
-        self.embed_tokens = embed_tokens
-
-        self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
-
-        self.embed_positions = (
-            PositionalEmbedding(
-                args.max_source_positions,
-                embed_dim,
-                self.padding_idx,
-                learned=args.encoder_learned_pos,
+        self.ssl_encoder = ssl_encoder
+        if ssl_encoder is None:
+            self.embed_tokens = embed_tokens
+            self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
+            self.embed_positions = (
+                PositionalEmbedding(
+                    args.max_source_positions,
+                    embed_dim,
+                    self.padding_idx,
+                    learned=args.encoder_learned_pos,
+                )
+                if not args.no_token_positional_embeddings
+                else None
             )
-            if not args.no_token_positional_embeddings
-            else None
-        )
+        else:
+            self.embed_tokens = self.embed_positions = None
+            self.embed_scale = 1.0
+
+            ssl_embed_dim = 768 if 'base' in args.ssl_type else 1024
+            if 'flaubert' in self.args.ssl_type or 'jargon' in self.args.ssl_type:
+                self.ssl_model = self.ssl_encoder['model']
+            if ssl_embed_dim != embed_dim:
+                self.normalize_before = args.encoder_normalize_before
+                self.embed_to_dmodel = init_functions.TransformerLinear(ssl_embed_dim, embed_dim, bias=False) 
+                self.hid_to_dmodel = init_functions.TransformerLinear(ssl_embed_dim, embed_dim, bias=False)
+                self.hid_to_dmodel_norm = LayerNorm(ssl_embed_dim) if args.encoder_normalize_before else LayerNorm(embed_dim)
 
         self.layer_wise_attention = getattr(args, "layer_wise_attention", False) 
         self.layers = nn.ModuleList([])
@@ -223,6 +247,72 @@ class TarcTransformerEncoder(FairseqEncoder):
             x = self.layernorm_embedding(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         return x, embed
+
+    def encode_with_ssl(self, src_tokens):
+
+        if self.args.ssl_type in ['camembert-base', 'camembert-large']:
+            #src_tokens[src_tokens == self.dictionary.pad()] = self.ssl_encoder.task.source_dictionary.pad()
+            #x = self.ssl_encoder.extract_features(src_tokens, return_all_hiddens=True)
+            #embeddings = x[0]
+            #x = torch.stack( x[-4:], dim=-1 )
+            #x = torch.mean( x, dim=3 )
+
+            samples = [self.ssl_encoder.encode( self.dictionary.string(t) ) for t in src_tokens]
+            lengths = torch.LongTensor( [len(s) for s in samples] ).to(src_tokens)
+            new_tokens = collate_tokens_ex(samples, self.ssl_encoder.task.source_dictionary.pad())
+            #_, sort_order = lengths.sort(descending=True)
+            #new_tokens = new_tokens.index_select(0, sort_order)
+            new_tokens = new_tokens.to(src_tokens)
+            x = self.ssl_encoder.extract_features(new_tokens, return_all_hiddens=True)
+            embeddings = x[0]
+            x = torch.stack( x[-4:], dim=-1 )
+            x = torch.mean( x, dim=3 )
+
+            return x, embeddings, new_tokens
+
+        elif self.args.ssl_type in ['flaubert1-base','flaubert1-large']:
+            #src_tokens[src_tokens == self.dictionary.pad()] = self.ssl_encoder['model'].embeddings.padding_idx 
+            #outputs = self.ssl_encoder['model'](src_tokens, output_hidden_states=True)
+            #x = torch.stack( outputs.hidden_states[-4:], dim=-1 )
+            #x = torch.mean( x, dim=3 )
+
+            samples = [torch.tensor( [self.ssl_encoder['tokenizer'].encode( self.dictionary.string(t) )] ).squeeze() for t in src_tokens]
+            lengths = torch.LongTensor( [len(s) for s in samples] ).to(src_tokens)
+            new_tokens = collate_tokens_ex( samples, self.ssl_encoder['model'].embeddings.padding_idx )
+            new_tokens = new_tokens.to( src_tokens )
+            outputs = self.ssl_encoder['model'](new_tokens, output_hidden_states=True)
+            embeddings = outputs.hidden_states[0]
+            x = torch.stack( outputs.hidden_states[-4:], dim=-1 )
+            x = torch.mean(x, dim=3)
+
+            return x, embeddings, new_tokens
+
+        elif self.args.ssl_type == 'flauberto1-base':
+
+            samples = [self.dictionary.string(t) for t in src_tokens]
+            new_tokens = self.ssl_encoder['tokenizer']( samples, padding=True, return_tensors='pt') 
+            new_tokens = new_tokens.to( src_tokens.device )
+            outputs = self.ssl_encoder['model'](**new_tokens, output_hidden_states=True)
+            embeddings = outputs.hidden_states[0]
+            x = torch.stack( outputs.hidden_states[-4:], dim=-1 )
+            x = torch.mean(x, dim=3)
+
+            return x, embeddings, new_tokens.input_ids
+
+        elif self.args.ssl_type == 'jargon-base':
+
+            samples = [self.dictionary.string(t) for t in src_tokens]
+            new_tokens = self.ssl_encoder['tokenizer']( samples, padding=True, return_tensors='pt') 
+            new_tokens = new_tokens.to( src_tokens.device )
+            outputs = self.ssl_encoder['model'](**new_tokens, output_hidden_states=True)
+            embeddings = outputs.hidden_states[0]
+            x = torch.stack( outputs.hidden_states[-4:], dim=-1 )
+            x = torch.mean(x, dim=3)
+
+            return x, embeddings, new_tokens.input_ids
+
+        else:
+            raise ValueError('Unrecognized ssl encoder type {}'.format(self.args.ssl_type))
 
     def _forward_transformer(
         self,
@@ -263,7 +353,28 @@ class TarcTransformerEncoder(FairseqEncoder):
 
         bsz, seqlen = toks_src_tokens.size()
 
-        x, encoder_embedding = self.forward_embedding(toks_src_tokens)
+        if self.ssl_encoder is None:
+            x, encoder_embedding, toks_src_tokens = self.forward_embedding(toks_src_tokens)
+            bsz, seqlen = toks_src_tokens.size()
+        else:
+            x, encoder_embedding, toks_src_tokens = self.encode_with_ssl(toks_src_tokens)
+
+            #print('[DEBUG] x shape: {}'.format(x.size()))
+            #print('[DEBUG] encoder_embedding shape: {}'.format(encoder_embedding.size()))
+            #print('[DEBUG] toks_src_tokens shape: {}'.format(toks_src_tokens.size()))
+            #sys.stdout.flush()
+            #sys.exit(0)
+
+            if hasattr(self, 'hid_to_dmodel'):
+                #residual = x
+                if self.normalize_before:
+                    x = self.hid_to_dmodel_norm(x)
+                x = self.hid_to_dmodel(x)
+                encoder_embedding = self.embed_to_dmodel(encoder_embedding)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+                #x = residual + x
+                if not self.normalize_before:
+                    x = self.hid_to_dmodel_norm(x)
 
         '''print(' - TarcTransformerEncoder:')
         print('   * x shape: {}'.format(x.size()))
@@ -295,7 +406,8 @@ class TarcTransformerEncoder(FairseqEncoder):
 
         # compute padding mask
         encoder_padding_mask = toks_src_tokens.eq(self.padding_idx)
-
+        if 'jargon' in self.args.ssl_type:
+            encoder_padding_mask = encoder_padding_mask.transpose(0, 1)
         encoder_states = [] if return_all_hiddens else None
 
         # encoder layers
@@ -312,6 +424,14 @@ class TarcTransformerEncoder(FairseqEncoder):
             x = self.layer_norm(x)
             if return_all_hiddens:
                 encoder_states[-1] = x
+
+        if 'jargon' in self.args.ssl_type:
+            encoder_padding_mask = encoder_padding_mask.transpose(0, 1)
+
+        #print('[DEBUG] $$$$$$$$$$$$$$$$$$$$$')
+        #print('[DEBUG] Encoder output shape: {}'.format(x.size()))
+        #print('[DEBUG] $$$$$$$$$$$$$$$$$$$$$')
+        #sys.stdout.flush()
 
         return EncoderOut(
             encoder_out=x,  # T x B x C
@@ -660,6 +780,10 @@ class TarcTransformerDecoderLayer(nn.Module):
         #sys.stdout.flush()
 
         cross_attn_x = x
+
+        #print('[DEBUG] cross_attn_x shape: {}'.format(cross_attn_x.size()))
+        #sys.stdout.flush()
+
         if self.encoder_attn is not None:
             residual = x
             if self.normalize_before:
@@ -678,6 +802,15 @@ class TarcTransformerDecoderLayer(nn.Module):
                     saved_state["prev_key_padding_mask"] = prev_attn_state[2]
                 assert incremental_state is not None
                 self.encoder_attn._set_input_buffer(incremental_state, saved_state)
+
+
+            #print('[DEBUG] -')
+            #print('[DEBUG] encoder attn:')
+            #print('[DEBUG] query shape: {}'.format(x.size()))
+            #print('[DEBUG] key shape: {}'.format(encoder_out[0].size()))
+            #print('[DEBUG] key_padding_mask shape: {}'.format(encoder_padding_mask[0].size() if encoder_padding_mask is not None else None))
+            #print('[DEBUG] -')
+            #sys.stdout.flush()
 
             x, attn = self.encoder_attn(
                 query=x,
@@ -718,6 +851,13 @@ class TarcTransformerDecoderLayer(nn.Module):
                     assert incremental_state is not None
                     self.cross_attentions[i]._set_input_buffer(incremental_state, cross_saved_state)
 
+                #print('[DEBUG] cross_attention {} input shape:'.format(i))
+                #print('[DEBUG] * query: {}'.format(cross_attn_x.size()))
+                #print('[DEBUG] * key: {}'.format(encoder_out[i+1].size()))
+                #print('[DEBUG] * padding mask: {}'.format(encoder_padding_mask[i+1].size() if encoder_padding_mask[i+1] is not None else None))
+                #print('[DEBUG] ----------')
+                #sys.stdout.flush()
+
                 att_output, attn = self.cross_attentions[i](
                     query=cross_attn_x,
                     key=encoder_out[i+1],
@@ -728,6 +868,10 @@ class TarcTransformerDecoderLayer(nn.Module):
                     need_weights=need_attn or (not self.training and self.need_attn),
                     need_head_weights=need_head_weights,
                 )
+
+                #print('[DEBUG] att_output shape: {}'.format(att_output.size()))
+                #sys.stdout.flush()
+
                 att_output = F.dropout(att_output, p=self.dropout, training=self.training)
                 #att_output = cross_attn_x + att_output # Residual add also here ???
                 if not self.normalize_before:
@@ -740,6 +884,9 @@ class TarcTransformerDecoderLayer(nn.Module):
             # TODO: for new architecture (xattn concatenation) ...
             all_att_output.append(x)
             all_att_output = torch.cat(all_att_output, -1)
+
+            #print('[DEBUG] all_att_output shape: {}'.format(all_att_output.size()))
+
             if self.normalize_before:
                 all_att_output = self.xattn_norm(all_att_output)
             all_att_output = self.activation_fn( self.xattn_fc1(all_att_output) )
@@ -747,6 +894,9 @@ class TarcTransformerDecoderLayer(nn.Module):
             all_att_output = self.xattn_fc2( all_att_output )
             all_att_output = F.dropout(all_att_output, p=float(self.activation_dropout), training=self.training)
             # END TODO: for new architecture
+
+            #print('[DEBUG] final all_att_output shape: {}'.format(all_att_output.size()))
+            #sys.stdout.flush()
 
             x = x + all_att_output
             if not self.normalize_before:
@@ -779,6 +929,9 @@ class TarcTransformerDecoderLayer(nn.Module):
             return x, attn, self_attn_state
 
         #print(' TarcTransformerDecoderLayer passed, output shape: {}'.format(x.size()))
+        #sys.stdout.flush()
+
+        #print('[DEBUG] ##########')
         #sys.stdout.flush()
 
         return x, attn, None

@@ -8,10 +8,14 @@ Translate pre-processed data with a trained model.
 """
 
 import torch
+import sys
+import os
 
 from fairseq import bleu, checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
 
+from fairseq.models.TarcMultiTaskModels import TarcMultiTaskModel
+from fairseq.tasks.End2EndSLU import End2EndSLU
 
 def main(args):
     assert args.path is not None, '--path required for generation!'
@@ -20,11 +24,18 @@ def main(args):
     assert args.replace_unk is None or args.raw_text, \
         '--replace-unk requires a raw text dataset (--raw-text)'
 
+    if args.results_path is not None:
+        os.makedirs(args.results_path, exist_ok=True)
+        output_path = os.path.join(args.results_path, 'generate-{}.txt'.format(args.gen_subset))
+        output_file = open(output_path, 'w', buffering=1, encoding='utf-8') 
+    else:
+        output_file = sys.stdout
+
     utils.import_user_module(args)
 
     if args.max_tokens is None and args.max_sentences is None:
         args.max_tokens = 12000
-    print(args)
+    print(args, file=output_file)
 
     use_cuda = torch.cuda.is_available() and not args.cpu
 
@@ -38,14 +49,22 @@ def main(args):
     except NotImplementedError:
         src_dict = None
     tgt_dict = task.target_dictionary
+    if hasattr(task, 'ssl_encoder') and task.ssl_encoder:
+        if task.args.ssl_type in ['camembert-base', 'camembert-large']:
+            src_dict = task.ssl_encoder.task.source_dictionary
+        else:
+            src_dict = None
 
     # Load ensemble
-    print('| loading model(s) from {}'.format(args.path))
+    print('| loading model(s) from {}'.format(args.path), file=output_file)
     models, _model_args = checkpoint_utils.load_model_ensemble(
         args.path.split(':'),
         arg_overrides=eval(args.model_overrides),
         task=task,
     )
+    tarc_flag = isinstance(models[0],TarcMultiTaskModel)    # if tarc_flag is False, this script should work as the original...
+    char_flag = (not _model_args.token_sequences) and _model_args.char_sequences if hasattr(_model_args, 'token_sequences') and hasattr(_model_args, 'char_sequences') else False
+    ref_tok_idx = 1 if char_flag else 0
 
     # Optimize ensemble for generation
     for model in models:
@@ -89,6 +108,7 @@ def main(args):
         scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
     num_sentences = 0
     has_target = True
+    is_slu = isinstance(task, End2EndSLU)
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
@@ -98,7 +118,10 @@ def main(args):
 
             prefix_tokens = None
             if args.prefix_size > 0:
-                prefix_tokens = sample['target'][:, :args.prefix_size]
+                if tarc_flag:
+                    prefix_tokens = sample['target'][ref_tok_idx][:, :args.prefix_size]
+                else:
+                    prefix_tokens = sample['target'][:, :args.prefix_size]
 
             gen_timer.start()
             hypos = task.inference_step(generator, models, sample, prefix_tokens)
@@ -106,16 +129,28 @@ def main(args):
             gen_timer.stop(num_generated_tokens)
 
             for i, sample_id in enumerate(sample['id'].tolist()):
+                if is_slu and isinstance(sample['strid'][i], str):
+                    sample_id_str = sample['strid'][i].strip()
+                else:
+                    sample_id_str = sample_id
+                
                 has_target = sample['target'] is not None
 
                 # Remove padding
-                src_tokens = utils.strip_pad(sample['net_input']['src_tokens'][i, :], tgt_dict.pad())
+                if tarc_flag:
+                    src_tokens = utils.strip_pad(sample['net_input']['src_tokens'][ref_tok_idx][i, :], tgt_dict.pad())
+                else:
+                    src_tokens = utils.strip_pad(sample['net_input']['src_tokens'][i,:], tgt_dict.pad())
                 target_tokens = None
                 if has_target:
-                    target_tokens = utils.strip_pad(sample['target'][i, :], tgt_dict.pad()).int().cpu()
+                    if tarc_flag:
+                        target_tokens = utils.strip_pad(sample['target'][ref_tok_idx][i, :], tgt_dict.pad()).int().cpu()
+                    else:
+                        target_tokens = utils.strip_pad(sample['target'][i,:], tgt_dict.pad()).int().cpu()
 
                 # Either retrieve the original sentences or regenerate them from tokens.
                 if align_dict is not None:
+                    # NOTE: the following 2 statements will crash if the model is a TarcMultiTaskModel
                     src_str = task.dataset(args.gen_subset).src.get_original_text(sample_id)
                     target_str = task.dataset(args.gen_subset).tgt.get_original_text(sample_id)
                 else:
@@ -128,9 +163,9 @@ def main(args):
 
                 if not args.quiet:
                     if src_dict is not None:
-                        print('S-{}\t{}'.format(sample_id, src_str))
+                        print('S-{}\t{}'.format(sample_id_str, src_str), file=output_file)
                     if has_target:
-                        print('T-{}\t{}'.format(sample_id, target_str))
+                        print('T-{}\t{}'.format(sample_id_str, target_str), file=output_file)
 
                 # Process top predictions
                 for j, hypo in enumerate(hypos[i][:args.nbest]):
@@ -144,32 +179,32 @@ def main(args):
                     )
 
                     if not args.quiet:
-                        print('H-{}\t{}\t{}'.format(sample_id, hypo['score'], hypo_str))
+                        print('H-{}\t{}\t{}'.format(sample_id_str, hypo['score'], hypo_str), file=output_file)
                         print('P-{}\t{}'.format(
-                            sample_id,
+                            sample_id_str,
                             ' '.join(map(
                                 lambda x: '{:.4f}'.format(x),
                                 hypo['positional_scores'].tolist(),
                             ))
-                        ))
+                        ), file=output_file)
 
                         if args.print_alignment:
                             print('A-{}\t{}'.format(
-                                sample_id,
+                                sample_id_str,
                                 ' '.join(['{}-{}'.format(src_idx, tgt_idx) for src_idx, tgt_idx in alignment])
-                            ))
+                            ), file=output_file)
 
                         if args.print_step:
-                            print('I-{}\t{}'.format(sample_id, hypo['steps']))
+                            print('I-{}\t{}'.format(sample_id_str, hypo['steps']), file=output_file)
 
                         if getattr(args, 'retain_iter_history', False):
                             print("\n".join([
                                     'E-{}_{}\t{}'.format(
-                                        sample_id, step,
+                                        sample_id_str, step,
                                         utils.post_process_prediction(
                                             h['tokens'].int().cpu(),
                                             src_str, None, None, tgt_dict, None)[1])
-                                        for step, h in enumerate(hypo['history'])]))
+                                        for step, h in enumerate(hypo['history'])]), file=output_file)
 
                     # Score only the top hypothesis
                     if has_target and j == 0:
@@ -186,9 +221,9 @@ def main(args):
             num_sentences += sample['nsentences']
 
     print('| Translated {} sentences ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(
-        num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
+        num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg), file=output_file)
     if has_target:
-        print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.result_string()))
+        print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.result_string()), file=output_file)
 
     return scorer
 

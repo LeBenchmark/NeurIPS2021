@@ -128,48 +128,54 @@ sym_pattern = re.compile('[½\%\-°/\\\"\*\&\$\#\+\@]+')
 
 def split_on_sep(tensor, sep, dim=-1, shapes=None):
 
-    if len(tensor.size()) != 2:
+    num_of_sep = torch.sum(tensor == sep)
+
+    if num_of_sep > 0 and len(tensor.size()) != 2:
         raise NotImplementedError(' split_on_sep: only split on 2-D tensors is supported for now. Thank you for your understanding :-)')
-  
-    if dim == 0:
-        tensor = tensor.t()
-    (bsz, t_len) = tensor.size() 
-    sep_idx = (tensor == sep).nonzero()
-    num_of_idx = int(sep_idx[:,-1].size(0) / bsz)
-    assert torch.sum(tensor == sep) == bsz * num_of_idx
-    # Make a strong check
-    tmplist = sep_idx[:,-1].tolist()
-    idx_dict = {}
-    for idx in tmplist:
-        idx_dict[idx] = 1
-    idxlist = list(idx_dict.keys())
-    assert len(tmplist) == len(idxlist) * bsz
+ 
+    if num_of_sep > 0:
+        if dim == 0:
+            tensor = tensor.t()
+        dims = tensor.size()
+        bsz, t_len = dims[0], dims[1]
+        sep_idx = (tensor == sep).nonzero()
+        num_of_idx = int(sep_idx[:,-1].size(0) / bsz)
+        assert torch.sum(tensor == sep) == bsz * num_of_idx
+        # Make a strong check
+        tmplist = sep_idx[:,-1].tolist()
+        idx_dict = {}
+        for idx in tmplist:
+            idx_dict[idx] = 1
+        idxlist = list(idx_dict.keys())
+        assert len(tmplist) == len(idxlist) * bsz
 
-    split_idx = sep_idx[:,-1][:num_of_idx].tolist()
-    split_idx.append(t_len)
+        split_idx = sep_idx[:,-1][:num_of_idx].tolist()
+        split_idx.append(t_len)
 
-    if sep_idx.numel() > 0:
-        res = []
-        sh_flag = False
-        if shapes is not None:
-            sh_flag = True
-            assert len(split_idx) == shapes.size(0)
-        for i in range(len(split_idx)):
-            start=0 if i == 0 else split_idx[i-1]+1
-            split_tsr = torch.index_select( tensor, 1, torch.LongTensor(range(start,split_idx[i])).to(tensor.device) )
-            if dim == 0:
-                split_tsr = split_tsr.t()
-            if sh_flag: 
-                split_tsr = split_tsr[:shapes[i,0],:shapes[i,1]]
-            res.append( split_tsr )
-        return res
+        if sep_idx.numel() > 0:
+            res = []
+            sh_flag = False
+            if shapes is not None:
+                sh_flag = True
+                assert len(split_idx) == shapes.size(0)
+            for i in range(len(split_idx)):
+                start=0 if i == 0 else split_idx[i-1]+1
+                split_tsr = torch.index_select( tensor, 1, torch.LongTensor(range(start,split_idx[i])).to(tensor.device) )
+                if dim == 0:
+                    split_tsr = split_tsr.t()
+                if sh_flag: 
+                    split_tsr = split_tsr[:shapes[i,0],:shapes[i,1]]
+                res.append( split_tsr )
+            return res
+        else:
+            return [tensor]
     else:
         return [tensor]
 
 def concat_with_sep(tensors, sep, dim=-1, shapes=None):
 
-    if dim > len(tensors[0].size())-1 or len(tensors[0].size()) > 2 or (not isinstance(tensors, list)): 
-        raise ValueError
+    if len(tensors) > 1 and (dim > len(tensors[0].size())-1 or len(tensors[0].size()) > 2 or (not isinstance(tensors, list))):
+        raise ValueError('dim vs. size-1: {} vs. {}; tensors[0].size() == {}; isinstance(tensors, list) ? {}'.format(dim, len(tensors[0].size())-1, tensors[0].size(), isinstance(tensors, list)))
 
     if _DEBUG_:
         print('[DEBUG] tarc_utils, input tensor list length: {}'.format(len(tensors)))

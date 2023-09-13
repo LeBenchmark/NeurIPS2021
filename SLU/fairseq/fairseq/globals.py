@@ -3,11 +3,11 @@ import sys
 import torch
 
 # Make these symbols global
-SOS_tag = 'SOS'
-blank_token = "__"
-pad_token = '_'
-pad_char = pad_token
-EOS_tag = 'EOS'
+SOS_tag = 'SOS' #'<SOS>'
+blank_token = "__" #"<blank>"
+pad_token = '_' #'<pad>'
+pad_char = '_'
+EOS_tag = 'EOS' #'<EOS>'
 unk_token = '<unk>'
 
 start_token = '<SOT>'
@@ -20,9 +20,9 @@ slu_end_concept_mark = '_EOC_'
 tok_separator = '|'
 user_ID = 'User'
 machine_ID = 'Machine'
-bogus_ID = '_Bogus_'
+bogus_ID = 'XXX'    # TODO: defined this way so that it is unlikely it appears in the text, but it is defined in the RoBERTa dictionary as a token
 bogus_token = bogus_ID
-EOD_tag = '_EOD_'
+EOD_tag = 'XXXX'    # TODO: same as above.
 EOD_value = -3.141592
 
 slu_special_symbols = ['ã', ' ', machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, user_ID, machine_ID, bogus_ID, EOD_tag, start_token, end_token, seq_separator]  # The first is in MEDIA files not correctly encoded in utf-8. The second (space) is to keep MEDIA character-level encoding.

@@ -6,10 +6,36 @@ import logging
 import numpy as np
 import torch
 
+import whisper
+from whisper.audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram
+from fairseq.globals import user_ID, machine_ID, bogus_ID
+
 from . import data_utils, FairseqDataset
 
 # Use this to show warnings (anything else ?) at the command line
 logger = logging.getLogger(__name__)
+
+def add_speaker_marker(feats, spk, spk_abs_val):
+    """
+        Add leading and trailing vectors as speaker marker for distinguishing input features from different speakers.
+        When using the MEDIA corpus it is important to distinguish between the Machine, which is much easier to recognize, and a User.
+    """
+
+    #spk_abs_val = 2.0
+    channel_per_speaker = 2
+    (src_len, dim) = feats.size() 
+    spk_val = 0.0
+    if spk == user_ID:
+        spk_val = +spk_abs_val  
+    elif spk == machine_ID:
+        spk_val = -spk_abs_val 
+    elif spk == bogus_ID: 
+        spk_val = -2.0*spk_abs_val 
+    else:
+        raise NotImplementedError
+
+    padder = torch.zeros(3, dim).fill_(spk_val).to(feats)
+    return torch.cat( [padder, feats, padder], 0 )
 
 def collate_features(values, pad_idx, eos_idx=None, left_pad=False):
     """
@@ -18,16 +44,26 @@ def collate_features(values, pad_idx, eos_idx=None, left_pad=False):
     It thus does not make sense to pad or to add bos or eos symbols.
     """
     size = max(v.size(0) for v in values)
-    dim = values[0].size(1)
-    res = torch.zeros(len(values), size, dim).to(values[0])
+    dims = values[0].size()
+    if len(dims) > 1:
+        dim = values[0].size(1)
+        res = torch.zeros(len(values), size, dim).to(values[0])
+    else:
+        dim = 1
+        res = torch.zeros(len(values), size).to(values[0])
     
     def copy_tensor(src, dst):
         assert dst.size(0) == src.size(0)
-        assert dst.size(1) == src.size(1)
+        if len(dst.size()) > 1:
+            assert dst.size(1) == src.size(1)
         dst.copy_(src)
 
-    for i, v in enumerate(values):
-        copy_tensor(v, res[i, size - v.size(0):,:] if left_pad else res[i, :v.size(0),:])
+    if len(dims) > 1:
+        for i, v in enumerate(values):
+            copy_tensor(v, res[i, size - v.size(0):,:] if left_pad else res[i, :v.size(0),:])
+    else:
+        for i, v in enumerate(values):
+            copy_tensor(v, res[i, size - v.size(0):] if left_pad else res[i, :v.size(0)])
     return res
 
 def collate_tokens_ex(values, pad_idx, bos_idx=None, eos_idx=None, left_pad=False, move_trail=False):
@@ -43,6 +79,13 @@ def collate_tokens_ex(values, pad_idx, bos_idx=None, eos_idx=None, left_pad=Fals
 
     def copy_tensor(src, dst):
         assert dst.numel() == src.numel()
+
+        #print('[DEBUG] copy_tensor:')
+        #print('[DEBUG]  * src: {}'.format(src))
+        #print('[DEBUG]  * bos_idx, eos_idx, move_trail: {}, {}, {}'.format(bos_idx, eos_idx, move_trail))
+        #print(' ----------')
+        #sys.stdout.flush()
+
         if move_trail:
             if bos_idx is not None:
                 assert src[0] == bos_idx
@@ -61,7 +104,7 @@ def collate_tokens_ex(values, pad_idx, bos_idx=None, eos_idx=None, left_pad=Fals
 
 def collate(
             samples, pad_idx, bos_idx, eos_idx, left_pad_source=False, left_pad_target=False,
-            input_feeding=True,
+            input_feeding=True, tgt_dict=None,
 ):
 
     if len(samples) == 0:
@@ -73,9 +116,9 @@ def collate(
             pad_idx, eos_idx, left_pad,
         )
 
-    def merge_features_ex(key, left_pad, bos=None, eos=None, move_trail=False):
-        src_sig = collate_features([s[key][0] for s in samples], pad_idx, eos_idx, left_pad)
-        src_trs = collate_tokens_ex([s[key][1] for s in samples], pad_idx, bos_idx=bos, eos_idx=eos, left_pad=left_pad, move_trail=move_trail)
+    def merge_features_ex(key, left_pad, bos=None, eos=None, move_trail=False, tgt_dict=None):
+        src_sig = collate_features([s[key][0] for s in samples], pad_idx, eos_idx, left_pad) 
+        src_trs = collate_tokens_ex([s[key][1] for s in samples], pad_idx, bos_idx=bos, eos_idx=eos, left_pad=left_pad, move_trail=move_trail) 
         return (src_sig, src_trs)
 
     def merge_tokens(key, left_pad, bos=None, eos=None, move_trail=False):
@@ -95,11 +138,21 @@ def collate(
     use_trs_flag = isinstance(samples[0]['source'], tuple)
 
     id = torch.LongTensor([s['id'] for s in samples])
+    strid = [s['strid'] for s in samples]
     src_signals, src_tokens = None, None
     if use_trs_flag:
-        src_signals, src_tokens = merge_features_ex('source', left_pad=left_pad_source)
+
+        #print(' * collate, merging features and transcriptions')
+        
+        src_signals, src_tokens = merge_features_ex('source', left_pad=left_pad_source, tgt_dict=tgt_dict) 
     else:
+        #print(' * collate, merging features')
+
         src_tokens = merge_features('source', left_pad=left_pad_source)
+
+    #print(' * collate, merged features: {}'.format(src_tokens.size()))
+    #sys.stdout.flush()
+
     # sort by descending source length
     src_lengths, src_tok_lengths = None, None
     if use_trs_flag:
@@ -144,6 +197,7 @@ def collate(
 
     batch = {
         'id': id,
+        'strid': strid,
         'nsentences': len(samples),
         'ntokens': ntokens,
         'net_input': {
@@ -206,20 +260,38 @@ class End2EndSLUDataset(FairseqDataset):
         tgt, tgt_sizes, tgt_dict,
         idx_structure,
         left_pad_target=False,
-        max_source_positions=10000, max_target_positions=10000,
+        max_source_positions=15000000, max_target_positions=10000,
         shuffle=True, input_feeding=True,
         append_eos_to_target=False,
-        append_bos=False, eos=None
+        append_bos=False, eos=None,
+        RoBERTa=None,
+        feature_extractor=None,
+        turn_ids=None,
+        turn_spk=None,
+        spk_abs_val=1.0,
     ):
 
         self.data_split_id = split
         self.args = args
+        self.ids = turn_ids
+        self.spk = turn_spk
+        self.spk_abs_val = spk_abs_val
         self.src = src
         self.tgt = tgt
         self.src_sizes = np.array(src_sizes)
         self.tgt_sizes = np.array(tgt_sizes) if tgt_sizes is not None else None
-        self.tgt_dict = tgt_dict 
-
+        if RoBERTa is not None:
+            self.tgt_dict = RoBERTa.task.source_dictionary
+        else:
+            self.tgt_dict = tgt_dict 
+        if self.args.online_feature_extraction:
+            assert feature_extractor is not None
+            assert turn_spk is not None
+            if self.args.feature_extractor == 'whisper':
+                self.model = feature_extractor #whisper.load_model( self.args.fe_size )
+                self.model = self.model.cuda()
+            else:
+                raise NotImplementedError()
         #self.idx_batches = idx_structure
 
         self.idx_spk_batches = idx_structure
@@ -310,8 +382,8 @@ class End2EndSLUDataset(FairseqDataset):
         self.input_feeding = input_feeding
         self.append_eos_to_target = append_eos_to_target
         self.append_bos = append_bos
-        self.bos = tgt_dict.bos()
-        self.eos = tgt_dict.eos() #(eos if eos is not None else tgt_dict.eos())
+        self.bos = self.tgt_dict.bos()
+        self.eos = self.tgt_dict.eos() #(eos if eos is not None else tgt_dict.eos()) 
 
         # For DEBUGGING
         '''self.epochs_id_order = []
@@ -333,6 +405,33 @@ class End2EndSLUDataset(FairseqDataset):
     def __getitem__(self, index):
         tgt_item = self.tgt[index]
         src_item = self.src[index]
+
+        if self.args.online_feature_extraction:
+
+            if self.args.feature_extractor == 'whisper':
+                mel = log_mel_spectrogram(src_item.squeeze()) 
+                dtype = torch.float32 
+                decode_options = {"fp16": False}
+                segment = pad_or_trim(mel, N_FRAMES).to(self.model.device).to(dtype)
+                single = segment.ndim == 2
+                if single:
+                    segment = segment.unsqueeze(0) 
+
+                if segment.shape[-2:] != (self.model.dims.n_audio_ctx, self.model.dims.n_audio_state):
+                    with torch.no_grad():
+                        src_item = self.model.encoder(segment)
+                        src_item = src_item.squeeze()
+                        if len(src_item.size()) < 2:
+                            src_item = src_item.unsqueeze(0)
+                else:
+                    raise ValueError('encoder is expected to be always called here!')
+            else:
+                raise NotImplementedError()
+
+            src_item = add_speaker_marker(src_item, self.spk[index], self.spk_abs_val)
+
+        #print('[DEBUG] __getitem__, sending input sequence of shape: {}'.format(src_item.size()))
+        #sys.exit(0)
 
         #print('[DEBUG] End2EndSLUDataset.getitem: demanded index {}'.format(index))
         #sys.stdout.flush()
@@ -368,11 +467,15 @@ class End2EndSLUDataset(FairseqDataset):
             self.epochs_id_order.append( [el for el in self.id_order] )
             self.id_order = []
         self.id_order.append(index)'''
+ 
+        #print(' * __getitem__: src_item sizes: {}, {}'.format(src_item[0].size(), src_item[1].size()))
+        #sys.stdout.flush()
 
         example = {
             'id': index,
             'source': src_item,
             'target': tgt_item,
+            'strid': self.ids[index],
         }
 
         return example
@@ -413,7 +516,7 @@ class End2EndSLUDataset(FairseqDataset):
         return collate(
             samples, pad_idx=self.tgt_dict.pad(), bos_idx=self.bos, eos_idx=self.eos,
             left_pad_source=False, left_pad_target=self.left_pad_target,
-            input_feeding=self.input_feeding,
+            input_feeding=self.input_feeding, tgt_dict=self.tgt_dict,
         )
 
     def num_tokens(self, index):

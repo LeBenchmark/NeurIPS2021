@@ -28,9 +28,10 @@ from fairseq.models.lstm import (
     LSTMDecoder,
 )
 
+from fairseq.data.TarcMultiTaskDataset import collate_tokens_ex
 from fairseq.models.TarcTransformerModules import TarcTransformerEncoder
-
 from fairseq.modules import AdaptiveSoftmax
+from fairseq.models.End2EndSLUModels import PyramidalRNNEncoder
 
 _DEBUG_ = False
 
@@ -118,7 +119,8 @@ class TarcLSTMEncoder(FairseqEncoder):
         left_pad=False, pretrained_embed=None, padding_idx=None,
         max_source_positions=DEFAULT_MAX_SOURCE_POSITIONS,
         token_map=None,
-        granularity_flags=None
+        granularity_flags=None,
+        ssl_encoder=None,
     ):
         super().__init__(dictionary)
         self.args = args
@@ -132,78 +134,108 @@ class TarcLSTMEncoder(FairseqEncoder):
         self.token_sequences = granularity_flags[0] if granularity_flags is not None else False
         self.char_sequences = granularity_flags[1] if granularity_flags is not None else False
         self.merge_flag = False
-        self.padding_idx = padding_idx if padding_idx is not None else dictionary.pad()
-
-        self.embedder = None
-        if hasattr(args, 'use_transformer_layers') and args.use_transformer_layers:
-            tmp = args.encoder_layers
-            args.encoder_layers = args.transformer_layers
-            trans_embed = init_functions.TransformerEmbedding(len(dictionary), embed_dim, self.padding_idx)
-            self.embedder = TarcTransformerEncoder(args,
-                    dictionary,
-                    trans_embed,
-                    token_map=token_map,
-                    granularity_flags=granularity_flags
-            )
-
-            if args.load_transformer_layers:
-                self.load_transformer_layers( args.load_transformer_layers )
-
-            args.encoder_layers = tmp
-
-        num_embeddings = len(dictionary) 
-        if pretrained_embed is None:
-            self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+        self.padding_idx = padding_idx #if padding_idx is not None else dictionary.pad()
+        if padding_idx is None and dictionary is not None:
+            self.padding_idx = dictionary.pad()
+        if ssl_encoder is not None:
+            if self.args.ssl_type in ['camembert-base', 'camembert-large']:
+                self.padding_idx = ssl_encoder.task.source_dictionary.pad()
+            elif self.args.ssl_type in ['flaubert1-base', 'flaubert1-large', 'flauberto1-base']:
+                self.padding_idx = ssl_encoder['model'].embeddings.padding_idx
+ 
+        if args.speech_input:
+            self.speech_encoder = PyramidalRNNEncoder(args, dictionary)
+            self.output_units = self.speech_encoder.encoder_output_units
         else:
-            self.embed_tokens = pretrained_embed
+            self.embedder = None
+            if hasattr(args, 'use_transformer_layers') and args.use_transformer_layers:
+                tmp = args.encoder_layers
+                args.encoder_layers = args.transformer_layers
+                trans_embed = init_functions.TransformerEmbedding(len(dictionary), embed_dim, self.padding_idx)
+                self.embedder = TarcTransformerEncoder(args,
+                        dictionary,
+                        trans_embed,
+                        token_map=token_map,
+                        granularity_flags=granularity_flags
+                )
 
-        self.lm = None
-        if args.input_lm:
-            from fairseq import tasks
-            print('   *** TarcLSTMEncoder: loading language model from {}'.format(args.input_lm))
-            sys.stdout.flush()
+                if args.load_transformer_layers:
+                    self.load_transformer_layers( args.load_transformer_layers )
 
-            lm_state = checkpoint_utils.load_checkpoint_to_cpu(args.input_lm)
-            lm_args = lm_state["args"] 
-            lm_task = tasks.setup_task(lm_args)
-            lm_data = {}
-            lm_data['dev'] = torch.load(args.lm_data + '.dev')
-            lm_data['vocab'] = torch.load(args.lm_data + '.vocab')
-            lm_data['token2components'] = torch.load(args.lm_data + '.token2components')
-            lm_task.input_vocab = lm_data['vocab']
-            lm_task.output_vocab = lm_data['vocab']
-            lm_task.token2components_tsr = lm_data['token2components']
-            lm_tensors, lm_lengths = lm_data['dev']
+                args.encoder_layers = tmp
 
-            assert lm_args.sub_task == 'base'
-            _, gflags = tasks.TArCMultiTask.choose_column_processing(len(lm_tensors[0]), lm_args)
-            assert gflags is not None
-            lm_task.granularity_merging_flags = gflags[lm_args.sub_task]
+            self.ssl_encoder = ssl_encoder
+            if ssl_encoder is None:
+                num_embeddings = len(dictionary) 
+                if pretrained_embed is None:
+                    self.embed_tokens = init_functions.LSTMEmbedding(num_embeddings, embed_dim, self.padding_idx)
+                else:
+                    self.embed_tokens = pretrained_embed
 
-            # build model for ensemble
-            lm_model = lm_task.build_model(lm_args)
-            lm_model.load_state_dict(lm_state["model"], strict=True, args=lm_args)
-            self.lm = lm_model.eval()
-            for param in self.lm.parameters():
-                param.requires_grad = False
+            self.lm = None
+            if args.input_lm:
+                from fairseq import tasks
+                print('   *** TarcLSTMEncoder: loading language model from {}'.format(args.input_lm))
+                sys.stdout.flush()
 
-            print(' * Language model archtecture:')
-            print(lm_model)
-            print(' -----')
-            sys.stdout.flush()
+                lm_state = checkpoint_utils.load_checkpoint_to_cpu(args.input_lm)
+                lm_args = lm_state["args"] 
+                lm_task = tasks.setup_task(lm_args)
+                lm_data = {}
+                lm_data['dev'] = torch.load(args.lm_data + '.dev')
+                lm_data['vocab'] = torch.load(args.lm_data + '.vocab')
+                lm_data['token2components'] = torch.load(args.lm_data + '.token2components')
+                lm_task.input_vocab = lm_data['vocab']
+                lm_task.output_vocab = lm_data['vocab']
+                lm_task.token2components_tsr = lm_data['token2components']
+                lm_tensors, lm_lengths = lm_data['dev']
 
-        self.lstm = init_functions.LSTM(
-            input_size=2*embed_dim if self.token_sequences and self.char_sequences else embed_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=self.dropout_out if num_layers > 1 else 0.,
-            bidirectional=bidirectional,
-        )
-        self.left_pad = left_pad
+                assert lm_args.sub_task == 'base'
+                _, gflags = tasks.TArCMultiTask.choose_column_processing(len(lm_tensors[0]), lm_args)
+                assert gflags is not None
+                lm_task.granularity_merging_flags = gflags[lm_args.sub_task]
 
-        self.output_units = hidden_size
-        if bidirectional:
-            self.output_units *= 2
+                # build model for ensemble
+                lm_model = lm_task.build_model(lm_args)
+                lm_model.load_state_dict(lm_state["model"], strict=True, args=lm_args)
+                self.lm = lm_model.eval()
+                for param in self.lm.parameters():
+                    param.requires_grad = False
+
+                print(' * Language model archtecture:')
+                print(lm_model)
+                print(' -----')
+                sys.stdout.flush()
+
+            enc_input_dim=2*embed_dim if self.token_sequences and self.char_sequences else embed_dim
+            if self.ssl_encoder:
+                if 'flaubert' in self.args.ssl_type:
+                    self.ssl_model = self.ssl_encoder['model']
+                if 'base' in self.args.ssl_type:
+                    enc_input_dim = 768
+                elif 'large' in self.args.ssl_type:
+                    enc_input_dim = 1024    # TODO: parameterize this!
+                else:
+                    raise ValueError('Only base and large model size are supported')
+ 
+            if not args.tune_ssl:
+                self.lstm = init_functions.LSTM(
+                    input_size=enc_input_dim,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    dropout=self.dropout_out if num_layers > 1 else 0.,
+                    bidirectional=bidirectional,
+                )
+            else:
+                self.lstm = None
+
+            self.left_pad = left_pad
+
+            self.output_units = hidden_size
+            if bidirectional:
+                self.output_units *= 2
+            if args.tune_ssl:
+                self.output_units = enc_input_dim
 
     def set_merge_flag(self, val): 
         self.merge_flag = val
@@ -214,6 +246,52 @@ class TarcLSTMEncoder(FairseqEncoder):
         if self.args.freeze_transformer_layers:
             for param in self.embedder.parameters():
                 param.requires_grad = False
+
+    def encode_with_ssl(self, src_tokens):
+
+        #print('[DEBUG] encoding source with SSL model {}'.format(self.args.ssl_type))
+        #sys.stdout.flush()
+
+        if self.args.ssl_type in ['camembert-base', 'camembert-large']:
+            #src_tokens[src_tokens == self.dictionary.pad()] = self.ssl_encoder.task.source_dictionary.pad() # NOTE: this is actually not correct, pad in the dictionary can be something else for the ssl encoder, so here we are turning somthing not-padding into padding. But then why this works better ?
+            #x = self.ssl_encoder.extract_features(src_tokens, return_all_hiddens=True)
+            #x = torch.stack( x[-4:], dim=-1 )
+            #x = torch.mean( x, dim=3 )
+
+            samples = [self.ssl_encoder.encode( self.dictionary.string(t) ) for t in src_tokens]
+            lengths = torch.LongTensor( [len(s) for s in samples] ).to(src_tokens)
+            new_tokens = collate_tokens_ex(samples, self.ssl_encoder.task.source_dictionary.pad())
+            #_, sort_order = lengths.sort(descending=True)
+            #new_tokens = new_tokens.index_select(0, sort_order)
+            new_tokens = new_tokens.to(src_tokens)
+            x = self.ssl_encoder.extract_features(new_tokens, return_all_hiddens=True)
+            x = torch.stack( x[-4:], dim=-1 )
+            x = torch.mean( x, dim=3 )
+
+            return new_tokens, None, x
+
+        elif self.args.ssl_type in ['flaubert1-base','flaubert1-large']:
+            #src_tokens[src_tokens == self.dictionary.pad()] = self.ssl_encoder['model'].embeddings.padding_idx 
+            #outputs = self.ssl_encoder['model'](src_tokens, output_hidden_states=True)
+            #x = torch.stack( outputs.hidden_states[-4:], dim=-1 )
+            #x = torch.mean( x, dim=3 )
+
+            samples = [torch.tensor( [self.ssl_encoder['tokenizer'].encode( self.dictionary.string(t) )] ).squeeze() for t in src_tokens]
+            lengths = torch.LongTensor( [len(s) for s in samples] ).to(src_tokens)
+            new_tokens = collate_tokens_ex( samples, self.ssl_encoder['model'].embeddings.padding_idx )
+            new_tokens = new_tokens.to( src_tokens )
+            outputs = self.ssl_encoder['model'](new_tokens, output_hidden_states=True)
+            x = torch.stack( outputs.hidden_states[-4:], dim=-1 )
+            x = torch.mean(x, dim=3)
+
+            return new_tokens, None, x
+
+        elif self.args.ssl_type == 'flauberto1-base':
+            raise NotImplementedError()
+        elif self.args.ssl_type == 'flaubert2':
+            raise NotImplementedError()
+        else:
+            raise ValueError('Unrecognized ssl encoder type {}'.format(self.args.ssl_type))
 
     def _forward_lstm(self, src_tokens, src_lengths, src_tok_bounds, sort_order, lstm):
 
@@ -239,6 +317,9 @@ class TarcLSTMEncoder(FairseqEncoder):
             #print('[DEBUG] TarcLSTMEncoder, input encoded with lm: {}, device: {}'.format(x.size(), x.device))
             #sys.stdout.flush()
             #sys.exit(0)
+        elif self.ssl_encoder:
+            toks_src_tokens, bogus_lens, x = self.encode_with_ssl( toks_src_tokens )
+            bsz, seqlen = toks_src_tokens.size()
         else:
             if self.embedder is None:
                 x = self.embed_tokens(toks_src_tokens)
@@ -251,9 +332,6 @@ class TarcLSTMEncoder(FairseqEncoder):
             #sys.exit(0)
 
         x = F.dropout(x, p=self.dropout_in, training=self.training)
-
-        #print('[DEBUG] x shape after embedding: {}'.format(x.size()))
-        #sys.stdout.flush()
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -275,58 +353,42 @@ class TarcLSTMEncoder(FairseqEncoder):
  
             x = torch.cat( [x, xx], -1 )
 
-            #print('   * Encoder: concatenating char level representations')
-            #sys.stdout.flush()
         elif self.token_sequences and self.char_sequences:
             x = torch.cat( [x, torch.zeros_like(x)], -1)
 
-            #print('   * Encoder: concatenating zeros')
-            #sys.stdout.flush()
+        if not self.args.tune_ssl:
+            # pack embedded source tokens into a PackedSequence
+            packed_x = nn.utils.rnn.pack_padded_sequence(x, toks_src_lengths.data.tolist()) # TODO: solve the length missmatch problem and use packed sequences again !
 
-        #print('[DEBUG] x shape before packing: {}'.format(x.size()))
-        #print('[DEBUG] toks_src_lengths: {}'.format(toks_src_lengths.data.tolist()))
-        #sys.stdout.flush()
+            # apply LSTM
+            if self.bidirectional:
+                state_size = 2 * self.num_layers, bsz, self.hidden_size
+            else:
+                state_size = self.num_layers, bsz, self.hidden_size
+            h0 = x.new_zeros(*state_size)
+            c0 = x.new_zeros(*state_size)
+            #x, (final_hiddens, final_cells) = lstm(x, (h0, c0)) # TODO: see TODO above and use packed_x instead of input x and packed_outs instead of output x
+            packed_outs, (final_hiddens, final_cells) = lstm(packed_x, (h0, c0))
 
-        # pack embedded source tokens into a PackedSequence
-        #packed_x = nn.utils.rnn.pack_padded_sequence(x, toks_src_lengths.data.tolist()) # TODO: solve the length missmatch problem and use packed sequences again !
+            # unpack outputs and apply dropout
+            x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=self.padding_idx)
+            x = F.dropout(x, p=self.dropout_out, training=self.training)
+            #assert list(x.size()) == [seqlen, bsz, self.output_units], 'Expected encoder output shape: {} x {} x {}; got {}. IS THERE ANY FORBIDDEN CHARACTER IN YOUR INPUT DATA (e.g. ~, see in globals.py) ???'.format(seqlen, bsz, self.output_units, list(x.size()))
 
-        #print('[DEBUG] packed_x shape: {}'.format(packed_x))
-        #sys.stdout.flush()
+            if self.bidirectional:
 
-        # apply LSTM
-        if self.bidirectional:
-            state_size = 2 * self.num_layers, bsz, self.hidden_size
+                def combine_bidir(outs):
+                    out = outs.view(self.num_layers, 2, bsz, -1).transpose(1, 2).contiguous()
+                    return out.view(self.num_layers, bsz, -1)
+
+                final_hiddens = combine_bidir(final_hiddens)
+                final_cells = combine_bidir(final_cells)
         else:
-            state_size = self.num_layers, bsz, self.hidden_size
-        h0 = x.new_zeros(*state_size)
-        c0 = x.new_zeros(*state_size)
-        x, (final_hiddens, final_cells) = lstm(x, (h0, c0)) # TODO: see TODO above and use packed_x instead of input x and packed_outs instead of output x
-
-        #print('[DEBUG] packed_out shape: {}'.format(packed_outs))
-        #sys.stdout.flush()
-
-        # unpack outputs and apply dropout
-        #x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=self.padding_idx)
-
-        #print('[DEBUG] final x shape: {}'.format(x.size()))
-        #sys.stdout.flush()
-
-        x = F.dropout(x, p=self.dropout_out, training=self.training)
-        assert list(x.size()) == [seqlen, bsz, self.output_units], 'Expected encoder output shape: {} x {} x {}; got {}'.format(seqlen, bsz, self.output_units, list(x.size()))
-
-        if self.bidirectional:
-
-            def combine_bidir(outs):
-                out = outs.view(self.num_layers, 2, bsz, -1).transpose(1, 2).contiguous()
-                return out.view(self.num_layers, bsz, -1)
-
-            final_hiddens = combine_bidir(final_hiddens)
-            final_cells = combine_bidir(final_cells)
+            B, C = x[-1].size()
+            final_hiddens = x[-1].expand(self.num_layers, B, C)
+            final_cells = x[-1].expand(self.num_layers, B, C)
 
         encoder_padding_mask = toks_src_tokens.eq(self.padding_idx).t()
-
-        #print('[DEBUG] TarcLSTMEncoder _forward_lstm passed.')
-        #sys.stdout.flush()
 
         return x, final_hiddens, final_cells, encoder_padding_mask
 
@@ -336,53 +398,63 @@ class TarcLSTMEncoder(FairseqEncoder):
         toks_src_lengths, char_src_lengths = src_lengths
         toks_sort_order, char_sort_order = sort_order
 
-        if self.left_pad:
-            # nn.utils.rnn.pack_padded_sequence requires right-padding;
-            # convert left-padding to right-padding
-            toks_src_tokens = utils.convert_padding_direction(
-                toks_src_tokens,
-                self.padding_idx,
-                left_to_right=True,
-            )
+        if self.args.speech_input: 
+ 
+            x = self.speech_encoder(toks_src_tokens.transpose(0, 1))
+            T, B, C = x.size()
+            final_hiddens = x[0,:,:].view(1, B, C)
+            final_cells = x[0,:,:].view(1, B, C)
+            encoder_padding_mask = None
+ 
+        else:
 
-            char_src_tokens = utils.convert_padding_direction(
-                char_src_tokens,
-                self.padding_idx,
-                left_to_right=True,
-            )
+            if self.left_pad:
+                # nn.utils.rnn.pack_padded_sequence requires right-padding;
+                # convert left-padding to right-padding
+                toks_src_tokens = utils.convert_padding_direction(
+                    toks_src_tokens,
+                    self.padding_idx,
+                    left_to_right=True,
+                )
 
-        if self.token_sequences and self.char_sequences:
-            #print(' ### ENCODER: using both sequences')
+                char_src_tokens = utils.convert_padding_direction(
+                    char_src_tokens,
+                    self.padding_idx,
+                    left_to_right=True,
+                )
+
+            if self.token_sequences and self.char_sequences:
+                #print(' ### ENCODER: using both sequences')
+                #sys.stdout.flush()
+
+                x, final_hiddens, final_cells, encoder_padding_mask = self._forward_lstm([toks_src_tokens, char_src_tokens], [toks_src_lengths, char_src_lengths], src_tok_bounds, sort_order, self.lstm)
+            elif self.token_sequences:
+                #print(' ### ENCODER: using token sequences')
+                #sys.stdout.flush()
+
+                x, final_hiddens, final_cells, encoder_padding_mask = self._forward_lstm([toks_src_tokens, toks_src_tokens], [toks_src_lengths, toks_src_lengths], src_tok_bounds, sort_order, self.lstm)
+            elif self.char_sequences:
+                #print(' ### ENCODER: using char sequences')
+                #sys.stdout.flush()
+
+                x, final_hiddens, final_cells, encoder_padding_mask = self._forward_lstm([char_src_tokens, char_src_tokens], [char_src_lengths, char_src_lengths], src_tok_bounds, sort_order, self.lstm) 
+
+            '''print(' - TarcLSTMEncoder, output shapes:')
+            print('   * x: {}'.format(x.size()))
+            print('   * final_hiddens: {}'.format(final_hiddens.size()))
+            print('   * final_cells: {}'.format(final_cells.size()))
+            print('   * encoder_padding_mak: {}'.format(encoder_padding_mask.size()))
+            print(' -----')
+            sys.stdout.flush()
+            sys.exit(0)''' 
+
+            #print('[DEBUG] TarcLSTMEncoder forward passed.')
             #sys.stdout.flush()
-
-            x, final_hiddens, final_cells, encoder_padding_mask = self._forward_lstm([toks_src_tokens, char_src_tokens], [toks_src_lengths, char_src_lengths], src_tok_bounds, sort_order, self.lstm)
-        elif self.token_sequences:
-            #print(' ### ENCODER: using token sequences')
-            #sys.stdout.flush()
-
-            x, final_hiddens, final_cells, encoder_padding_mask = self._forward_lstm([toks_src_tokens, toks_src_tokens], [toks_src_lengths, toks_src_lengths], src_tok_bounds, sort_order, self.lstm)
-        elif self.char_sequences:
-            #print(' ### ENCODER: using char sequences')
-            #sys.stdout.flush()
-
-            x, final_hiddens, final_cells, encoder_padding_mask = self._forward_lstm([char_src_tokens, char_src_tokens], [char_src_lengths, char_src_lengths], src_tok_bounds, sort_order, self.lstm) 
-
-        '''print(' - TarcLSTMEncoder, output shapes:')
-        print('   * x: {}'.format(x.size()))
-        print('   * final_hiddens: {}'.format(final_hiddens.size()))
-        print('   * final_cells: {}'.format(final_cells.size()))
-        print('   * encoder_padding_mak: {}'.format(encoder_padding_mask.size()))
-        print(' -----')
-        sys.stdout.flush()
-        sys.exit(0)''' 
-
-        #print('[DEBUG] TarcLSTMEncoder forward passed.')
-        #sys.stdout.flush()
 
         return {
             'encoder_out': (x, final_hiddens, final_cells),
             'sources': toks_src_tokens,
-            'encoder_padding_mask': encoder_padding_mask if encoder_padding_mask.any() else None
+            'encoder_padding_mask': encoder_padding_mask if encoder_padding_mask is not None and encoder_padding_mask.any() else None
         }
 
     def reorder_encoder_out(self, encoder_out, new_order):
@@ -664,7 +736,8 @@ class TarcLSTMDecoder(FairseqIncrementalDecoder):
             #sys.stdout.flush()
             #sys.exit(0)
 
-        attn_scores['hidden'] = hidden_states
+        attn_scores['hidden'] = hidden_states 
+
         return (x_tk, x_ch), attn_scores
 
     def extract_features_layers(
@@ -672,7 +745,7 @@ class TarcLSTMDecoder(FairseqIncrementalDecoder):
     ):
         """
         Similar to *forward* but only return features.
-        """ 
+        """
 
         toks_prev_output, char_prev_output = prev_output_tokens
         toks_sort_order, char_sort_order = sort_order
@@ -849,10 +922,7 @@ class TarcLSTMDecoder(FairseqIncrementalDecoder):
                         sys.stdout.flush()
 
                     decoder_padding_mask = None
-                    #if incremental_state is None:
-                    #    decoder_padding_mask = encoder_out[i]['encoder_padding_mask'].transpose(0, 1) 
-                    #else:
-                    #    decoder_padding_mask = encoder_out[i]['encoder_out'][0].sum(-1) == 0.0
+                    #decoder_padding_mask = encoder_out[i]['encoder_padding_mask']
                     out, _ = atts[i](hidden, encoder_out[i]['encoder_out'][0], decoder_padding_mask) 
 
                 #print('[DEBUG] attention {} computed'.format(i))
@@ -968,6 +1038,14 @@ class TarcLSTMDecoder(FairseqIncrementalDecoder):
             attn_scores = attn_scores.transpose(0, 2)
         else:
             attn_scores = None
+
+        # NOTE: for debugging
+        #scores = self.output_layer(x)       # B x L x D
+        #scores = F.log_softmax(scores, -1)  # B x L x D
+        #_, preds = torch.max(scores, -1)    # B x L
+        #print('[DEBUG] TarcLSTMDecoder,  expected output@0: {}'.format(self.dictionary.string(toks_prev_output[0,:])))
+        #print('[DEBUG] TarcLSTMDecoder, predicted output@0: {}'.format(self.dictionary.string(preds[0,:])))
+        #sys.stdout.flush()
 
         #return (x, xx), {'attn': attn_scores, 'final_state': (prev_hiddens, prev_cells, input_feed)}
         return (x, xx), {'attn': attn_scores}

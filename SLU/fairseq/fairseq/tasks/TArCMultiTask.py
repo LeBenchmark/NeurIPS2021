@@ -8,9 +8,13 @@ import glob
 import torch
 
 from fairseq.tarc_utils import *
+from fairseq.globals import user_ID, machine_ID
 from fairseq.data import TarcMultiTaskDataset
 from fairseq.tasks import FairseqTask, register_task
-from fairseq.tasks.End2EndSLU import SLUDictionary, init_slu_dictionary
+from fairseq.tasks.End2EndSLU import SLUDictionary, init_slu_dictionary, feature_wise_mean_std, normalize_data_only
+
+from fairseq.models.roberta import CamembertModel
+from transformers import AutoTokenizer, FlaubertModel, AutoModelForTokenClassification
 
 from nltk.tree import Tree
 from typing import Dict, List
@@ -249,6 +253,30 @@ def tiger_label_processing(label, args, pad_flag=True, rep_flag=False):
 def no_processing(token, args, pad_flag=True, rep_flag=False):
     return [token]
 
+def add_speaker_marker(feats, spk):
+    """
+        Add leading and trailing vectors as speaker marker for distinguishing input features from different speakers.
+        When using the MEDIA corpus it is important to distinguish between the Machine, which is much easier to recognize, and a User.
+    """
+
+    spk_abs_val = 2.0
+    marker_length = 8
+    channel_per_speaker = 2 
+    (src_len, dim) = feats.size()
+   
+    spk_val = 0.0
+    if spk == user_ID:
+        spk_val = +spk_abs_val 
+    elif spk == machine_ID:
+        spk_val = -spk_abs_val 
+        #elif spk == bogus_ID: 
+        #    spk_val = -2.0*spk_abs_val 
+    else:
+        raise NotImplementedError 
+     
+    padder = torch.zeros(marker_length, dim).fill_(spk_val).to(feats)
+    return torch.cat( [padder, feats, padder], 0 ) 
+
 opmap = {}
 opmap['nop'] = no_processing
 opmap['char'] = create_character_list
@@ -303,7 +331,7 @@ def choose_column_processing(num_columns, args):
         column_processing = []
         gflags[args.sub_task] = []
         for ti in range(num_columns):
-            if hasattr(args, 'class_index') and args.class_index != -1 and args.class_index == ti:
+            if hasattr(args, 'class_index') and args.class_index and ti in args.class_index:
                 column_processing.append( opmap['nop'])
                 if args.token_sequences and args.char_sequences:
                     gflags[args.sub_task].append(True)
@@ -617,14 +645,19 @@ def read_tarc_tabular_data(filename, args):
             for i in range(num_columns):
                 curr_sequences[i].append(tokens[i])
         else:
-            for i in range(num_columns):
-                curr_seq = apply_global_filling(args, curr_sequences[i], curr_sequences[CLS_COL_IDX], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], i) 
-                all_sequences[i].append( curr_seq )
-                #all_sequences[i].append( curr_sequences[i] )
+            if len(curr_sequences[0]) > 0:
+                for i in range(num_columns):
+                    curr_seq = apply_global_filling(args, curr_sequences[i], curr_sequences[CLS_COL_IDX], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], i) 
+                    all_sequences[i].append( curr_seq )
+                    #all_sequences[i].append( curr_sequences[i] )
+            else:
+                print(' ##### TarcMultiTask WARNING: skipping empty sequence {} (possibly you just have consecutive empty lines in your input file!)'.format(len(all_sequences[0])))
+                sys.stdout.flush()
 
             curr_sequences = [[] for i in range(num_columns)] 
 
-    print(' *** TarcMultiTask, read {} sequences'.format(len(all_sequences)))
+    print(' *** TarcMultiTask, read {} sequences per column'.format(len(all_sequences[0])))
+    print(' *** TarcMultiTask, read {} columns'.format(len(all_sequences)))
     print(' *** TarcMultiTask, detected {} tasks in data'.format(num_columns-1))
     sys.stdout.flush()
 
@@ -689,7 +722,7 @@ def read_tarc_tabular_data(filename, args):
                 char_seqs[idx].extend( process_res )
                 char_seq_lens[idx].append( (token_offsets[idx], token_offsets[idx]+len(process_res)) )
                 token_offsets[idx] += len(process_res)
-                tok_seqs[idx].append( tokens[idx] )
+                tok_seqs[idx].append( tokens[idx] ) 
 
         total_tokens += len(char_seqs[0])
         for idx in range(len(char_sequences)):
@@ -701,8 +734,6 @@ def read_tarc_tabular_data(filename, args):
         token_offsets = []
         tok_seqs = []
 
-    print(' - Size of char_sequences: {}'.format(len(char_sequences)))
-    sys.stdout.flush()
     for ci in range(len(char_sequences)):
         print('   - Size of dim {}: {}'.format(ci, len(char_sequences[ci])))
         sys.stdout.flush()
@@ -712,10 +743,20 @@ def read_tarc_tabular_data(filename, args):
 
     return (tok_sequences, char_sequences, char_seq_lengths, token2components)
 
-def read_tarc_parallel_data( file_prefix, args ):
+def read_tarc_parallel_data( file_prefix, args, user_flag=False ):
 
     input_file = file_prefix + '.input'
-    output_files = glob.glob(file_prefix + '.output*')
+    output_files = []
+    done = False
+    output_idx = 1
+    while not done: 
+        tmp = glob.glob(file_prefix + '.output' + str(output_idx) + '.*')
+        if len(tmp) > 0:
+            output_files.extend(tmp)
+        else:
+            done = True
+
+        output_idx += 1
  
     POS_COL_IDX = set_pos_col_idx(args)
     test_flag = False
@@ -724,14 +765,48 @@ def read_tarc_parallel_data( file_prefix, args ):
 
     # 1. Read input sequences
     input_data = []
-    f = open(input_file, encoding='utf-8')
-    data = f.readlines()
-    f.close()
     total_tokens = 0
-    for s in data:
-        tokens = s.rstrip(' \r\n').split()
-        total_tokens += len(tokens)
-        input_data.append(tokens)
+    skip_idx = []
+    speaker_ids = []
+    if not args.speech_input:
+        # 1.1 normal text input 
+        f = open(input_file, encoding='utf-8')
+        data = f.readlines()
+        f.close() 
+        for s in data:
+            tokens = s.rstrip(' \r\n').split()
+            total_tokens += len(tokens)
+            input_data.append(tokens)
+    else:
+        # 1.2 speech input, the input file is interpreted as the list of file prefixes (no extension) to read, the file extension is specified with the option --speech-ext
+        f = open(input_file, encoding='utf-8')
+        lines = f.readlines()
+        f.close()
+
+        turn_idx = 0
+        for l in lines:
+            filename = l.strip() + args.speech_ext
+            basename = filename.split('/')[-1]
+            if not user_flag or user_ID in basename:
+                if user_ID in basename:
+                    speaker_ids.append( user_ID )
+                elif machine_ID in basename:
+                    speaker_ids.append( machine_ID )
+
+                i_tsr = torch.load(filename)
+                i_tsr = i_tsr.squeeze()
+                if args.speech_feat_first:
+                    i_tsr = i_tsr.transpose(0, 1)
+                if len(i_tsr.size()) < 2:
+                    i_tsr = i_tsr.unsqueeze(0)
+                assert len(i_tsr.size()) == 2, 'wrong number of dimensions ({}) in tensor read from {}'.format(i_tsr.size(), filename)
+
+                input_data.append(i_tsr)
+            else:
+                skip_idx.append( turn_idx )
+
+            turn_idx += 1
+
     print(' - TArCMultiTask, read {} sequences, {} tokens from input data'.format(len(input_data), total_tokens))
     sys.stdout.flush()
 
@@ -745,13 +820,14 @@ def read_tarc_parallel_data( file_prefix, args ):
         total_tokens = 0
         s_idx = 0
         for s in data:
-            tokens = s.rstrip(' \r\n').split()
-            total_tokens += len(tokens)
-            if i > 0:
-                i_seq = input_data[s_idx]
-                input_data[s_idx] = apply_global_filling(args, i_seq, output_data[CLS_COL_IDX-1][s_idx], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], 0)
-                tokens = apply_global_filling(args, tokens, output_data[CLS_COL_IDX-1][s_idx], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], i+1)
-            output_data[i].append( tokens )
+            if s_idx not in skip_idx:
+                tokens = s.rstrip(' \r\n').split()
+                total_tokens += len(tokens)
+                if i > 0 and not args.speech_input:
+                    i_seq = input_data[s_idx]
+                    input_data[s_idx] = apply_global_filling(args, i_seq, output_data[CLS_COL_IDX-1][s_idx], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], 0)
+                    tokens = apply_global_filling(args, tokens, output_data[CLS_COL_IDX-1][s_idx], [fillerFOR, fillerEMO], [LfillerFOR, LfillerEMO], [CLS_COL_IDX, POS_COL_IDX], i+1)
+                output_data[i].append( tokens )
             s_idx += 1
         print(' - TArCMultiTask, read {} sequences, {} tokens from output data {}'.format(len(output_data[i]), total_tokens, output_files[i]))
         sys.stdout.flush()
@@ -784,24 +860,30 @@ def read_tarc_parallel_data( file_prefix, args ):
     token2components = [{} for t_idx in range(num_columns)]
     for i in range( len(input_data) ):
         c_idx = 0
-        for t in input_data[i]:
-            rep_flag = True
-            # NOTE: see note above concerning apply_filling flag
-            if (hasattr(args, 'apply_filling') and args.apply_filling) or (c_idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos' or args.sub_task == 'tarc-lemma' or args.sub_task == 'tarc-lemma-full')) or (c_idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and c_idx == 3) or (args.sub_task == 'madar-trs-full' and c_idx == 4) or (args.sub_task == 'madar-trs-full-ex' and c_idx == 2):
-                rep_flag = False
-            #process_res = column_processing[idx]( tokens[idx], args, rep_flag=rep_flag )
-            tok_res = column_processing[c_idx](t, args, rep_flag=rep_flag)
-            total_tokens += len(tok_res)
-            char_seqs[c_idx].extend( tok_res )
-            char_seq_lens[c_idx].append( (token_offsets[c_idx], token_offsets[c_idx]+len(tok_res)) )
-            token_offsets[c_idx] += len(tok_res) 
-            tok_seqs[c_idx].append( t )
+        if not args.speech_input:
+            for t in input_data[i]:
+                rep_flag = True
+                # NOTE: see note above concerning apply_filling flag
+                if (hasattr(args, 'apply_filling') and args.apply_filling) or (c_idx == 0 and (args.sub_task == 'tarc-full' or args.sub_task == 'tarc-full-npos' or args.sub_task == 'tarc-lemma' or args.sub_task == 'tarc-lemma-full')) or (c_idx == 2 and args.sub_task == 'madar-trs') or (args.sub_task == 'madar-trs-ex' and c_idx == 3) or (args.sub_task == 'madar-trs-full' and c_idx == 4) or (args.sub_task == 'madar-trs-full-ex' and c_idx == 2):
+                    rep_flag = False
+                #process_res = column_processing[idx]( tokens[idx], args, rep_flag=rep_flag )
+                tok_res = column_processing[c_idx](t, args, rep_flag=rep_flag)
+                total_tokens += len(tok_res)
+                char_seqs[c_idx].extend( tok_res )
+                char_seq_lens[c_idx].append( (token_offsets[c_idx], token_offsets[c_idx]+len(tok_res)) )
+                token_offsets[c_idx] += len(tok_res) 
+                tok_seqs[c_idx].append( t )
 
-            token2components[c_idx] = _add_t2c_entry_safe(token2components[c_idx], t, tok_res) 
+                token2components[c_idx] = _add_t2c_entry_safe(token2components[c_idx], t, tok_res) 
 
-        char_sequences[c_idx].append( char_seqs[c_idx] )
-        char_seq_lengths[c_idx].append( char_seq_lens[c_idx] )
-        tok_sequences[c_idx].append( tok_seqs[c_idx] )
+            char_sequences[c_idx].append( char_seqs[c_idx] )
+            char_seq_lengths[c_idx].append( char_seq_lens[c_idx] )
+            tok_sequences[c_idx].append( tok_seqs[c_idx] )
+        else:
+            char_sequences[c_idx].append( char_seqs[c_idx] )
+            char_seq_lens[c_idx].append( (0, 0) )
+            char_seq_lengths[c_idx].append( char_seq_lens[c_idx] )
+            tok_sequences[c_idx].append( input_data[i] )
         c_idx += 1
         for j in range(len(output_data)):
             for t in output_data[j][i]: 
@@ -832,21 +914,40 @@ def read_tarc_parallel_data( file_prefix, args ):
     print(' - TArCMultiTask, read {} sequences, {} tokens'.format(len(char_sequences[0]), total_tokens))
     sys.stdout.flush()
 
-    return (tok_sequences, char_sequences, char_seq_lengths, token2components)
+    return (tok_sequences, char_sequences, char_seq_lengths, token2components, speaker_ids)
 
-def map_tokens(args, data, dict, pad_flag, split):
+def map_tokens(args, data, dict, pad_flag, split, ssl_encoder=None):
 
     tensors = []
     for s in data:
-        tok_lst = []
-        for t in s:
-            if args.freeze_dictionary or (args.freeze_train_dictionary and split != 'train'):
-                tok_lst.append( dict.index(t) )
+        if ssl_encoder is None:
+            #print('[DEBUG] encoding data with scratch dictionary')
+            #sys.stdout.flush()
+
+            tok_lst = []
+            for t in s:
+                if args.freeze_dictionary or (args.freeze_train_dictionary and split != 'train'):
+                    tok_lst.append( dict.index(t) )
+                else:
+                    tok_lst.append( dict.add_symbol(t) )
+            if pad_flag:
+                tok_lst = [dict.bos()] + tok_lst + [dict.eos()] 
+            tensors.append( torch.LongTensor( tok_lst ) )
+        else:
+            #print('[DEBUG] encoding >>{}<<'.format(' '.join(s)))
+            #sys.stdout.flush()
+
+            if args.ssl_type in ['camembert-base', 'camembert-large']:
+                tensors.append( ssl_encoder.encode(' '.join(s)) )
+            elif args.ssl_type in ['flaubert1-base', 'flaubert1-large']:
+                '''tok_lst = [dict.add_symbol(t) for t in s]
+                if pad_flag:
+                    tok_lst = [dict.bos()] + tok_lst + [dict.eos()]
+                tensors.append( torch.LongTensor( tok_lst ) )'''
+               
+                tensors.append( torch.tensor( [ssl_encoder['tokenizer'].encode(' '.join(s)) ]).squeeze() )
             else:
-                tok_lst.append( dict.add_symbol(t) )
-        if pad_flag:
-            tok_lst = [dict.bos()] + tok_lst + [dict.eos()] 
-        tensors.append( torch.LongTensor( tok_lst ) )
+                raise NotImplementedError()
 
     return tensors
 
@@ -943,8 +1044,25 @@ class TarcMultiTask(FairseqTask):
         parser.add_argument('--load-embeddings', type=str, help='Load embeddings from the specified file')
         parser.add_argument('--freeze-dictionary', action='store_true', default=False, help='Don\'t add symbols from additionally read data to the dictionary')
         parser.add_argument('--freeze-train-dictionary', action='store_true', default=False, help='Construct the dictionary only from training data tokens')
-        parser.add_argument('--class-index', type=int, default=-1, help='Specify the index of the column, for data in tabular format, of the class level')
+        parser.add_argument('--class-index', type=int, nargs='+', help='Specify the index of the column, for data in tabular format, of the class level')
         parser.add_argument('--pos-index', type=int, default=-1, help='Specify the index of the column, for data in tabular format, of the POS level')
+        parser.add_argument('--backward-indices', type=int, nargs='+', help='Specifies indices of tasks that are processed backward, so that a decoder can correctly reverse the corresponding outputs')
+        parser.add_argument('--speech-input', action='store_true', default=False, help='Use speech input like for the End2End SLU system (spectrograms, wav2vec features, etc.)')
+        parser.add_argument('--speech-ext', type=str, default='.20.0ms-spg', help='File extension for speech input')
+        parser.add_argument('--speech-feat-first', action='store_true', default=False, help='Specifies that the first dimention of speech tensor is the feature dimention (instead of the time dimension)')
+        parser.add_argument('--pyramid-hidden-layers', type=int, default=2, help='Number of hidden layers in the PyramidalRNNEncoder for speech input')
+        parser.add_argument('--num-lstm-layers', type=int, default=3, help='Number of LSTM layers (actually stages in the Pyramid) in the speech encoder')
+        parser.add_argument('--speech-lstm-size', type=int, default=256, help='LSTM layer size in the speech encoder')
+        parser.add_argument('--num-features', type=int, default=1024, help='Number of features in the speech input')
+        parser.add_argument('--drop-ratio', type=float, default=0.50, help='Dropout ratio in the speech encoder')
+        parser.add_argument('--sub-losses', type=str, default=['nll_loss'], nargs='+', help='Defines the individual losses for each subtask')
+        parser.add_argument('--ssl-encoder', type=str, help='Uses the specified SSL model to encode input sequences')
+        parser.add_argument('--ssl-type', type=str, help='Specifies which ssl model is going to be used: camembert, flaubert1, flaubert2')
+        parser.add_argument('--tune-ssl', action='store_true', default=False, help='Tune the ssl encoder specified with --ssl-encoder (freezed by default)')
+        parser.add_argument('--softmax-temperature', type=float, default=1.0, help='Softmax temperature for the losses (NLL loss)')
+        parser.add_argument('--softmax-start-temperature', type=float, default=1.0, help='Starting softmax temperature when rising temperature with linear strategy')
+        parser.add_argument('--rise-temperature-at-epoch', type=int, default=1, help='Rise softmax temperature at the specified epoch')
+        parser.add_argument('--rise-temperature-strategy', type=str, default='fix', help='Choose the strategy used to rise softmax temperature: fix (default), linear (increase the temperature linearly starting from the specified epoch up to the specified temperature)')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -953,25 +1071,11 @@ class TarcMultiTask(FairseqTask):
         # loading Dictionaries, initializing shared Embedding layers, etc.
         # In this case we'll just initialize the label dictionary
        
-        
-        #blank_token = "__"
-        #pad_char = pad_token 
-        #machine_semantic = 'MachineSemantic'
-        #slu_start_concept_mark = '_SOC_'
-        #slu_end_concept_mark = '_EOC_'
-        #tok_separator = '|'
-        #user_ID = 'User'
-        #machine_ID = 'Machine'
-        #bogus_ID = '_Bogus_'
-        #EOD_tag = '_EOD_'
+        if args.speech_input:
+            args.token_sequences = True
+            args.char_sequences = False
+            args.max_source_positions = 9999
 
-        #input_vocab = Dictionary(
-        #                         pad=pad_token,
-        #                         eos=eos_token,
-        #                         unk=unk_token,
-        #                         bos=bos_token,
-        #                         extra_special_symbols=[start_token, end_token, args.sequence_separator, blank_token, machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, user_ID, machine_ID, bogus_ID, EOD_tag]
-        #)
         input_vocab = init_slu_dictionary(args) # NOTE: defined in fairseq.tasks.End2EndSLU
         if hasattr(args, 'load_dictionary') and args.load_dictionary:
 
@@ -1012,8 +1116,8 @@ class TarcMultiTask(FairseqTask):
             sys.stdout.flush()
         if args.char_sequences:
             print('  - TArCMultiTask, using character-level information in sequences')
-            sys.stdout.flush()
-        
+            sys.stdout.flush() 
+
         return TarcMultiTask(args, input_vocab, output_vocab)
 
     def __init__(self, args, input_vocab, output_vocab):
@@ -1047,6 +1151,50 @@ class TarcMultiTask(FairseqTask):
         #if hasattr(args, 'load_dictionary') and args.load_dictionary:
         #    self.splits['vocab'] = input_vocab
         self.num_of_inputs = 1 
+
+        self.ssl_encoder = None
+        if hasattr(args, 'ssl_encoder') and args.ssl_encoder:
+            assert args.ssl_type is not None, '--ssl-type (possible values: camembert-base, camembert-large, flaubert1, flaubert2) is expected when using --ssl-encoder'
+
+            print(' * TArCMultiTask: loading {} ssl-encoder'.format(args.ssl_type))
+            sys.stdout.flush()
+
+            tune_val = args.tune_ssl and hasattr(args, 'max_epoch') 
+            print(' * TArCMultiTask: tuning ssl encoder ? {} (False => ssl encoder is used in eval mode)'.format(tune_val))
+            sys.stdout.flush()
+
+            if args.ssl_type == 'camembert-base' or args.ssl_type == 'camembert-large':
+                self.ssl_encoder = CamembertModel.from_pretrained(args.ssl_encoder)
+                if not tune_val:
+                    self.ssl_encoder = self.ssl_encoder.eval()
+                for param in self.ssl_encoder.parameters():
+                    param.requires_grad = tune_val
+            elif args.ssl_type == 'flaubert1-base' or args.ssl_type == 'flaubert1-large':
+                self.ssl_encoder = {}
+                self.ssl_encoder['tokenizer'] = AutoTokenizer.from_pretrained( args.ssl_encoder, do_lowercase='uncased' in args.ssl_encoder )
+                self.ssl_encoder['model'] = FlaubertModel.from_pretrained( args.ssl_encoder )
+                if not tune_val:
+                    self.ssl_encoder['model'] = self.ssl_encoder['model'].eval()
+                for param in self.ssl_encoder['model'].parameters():
+                    param.requires_grad = tune_val
+            elif args.ssl_type == 'flauberto1-base':
+                self.ssl_encoder = {}
+                self.ssl_encoder['tokenizer'] = AutoTokenizer.from_pretrained( args.ssl_encoder )
+                self.ssl_encoder['model'] = FlaubertModel.from_pretrained( args.ssl_encoder )
+                if not tune_val:
+                    self.ssl_encoder['model'] = self.ssl_encoder['model'].eval()
+                for param in self.ssl_encoder['model'].parameters():
+                    param.requires_grad = tune_val
+            elif args.ssl_type == 'jargon-base' or args.ssl_type == 'jargon-large':
+                self.ssl_encoder = {}
+                self.ssl_encoder['tokenizer']= AutoTokenizer.from_pretrained(args.ssl_encoder, use_auth_token="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", trust_remote_code=True)
+                self.ssl_encoder['model'] = AutoModelForTokenClassification.from_pretrained(args.ssl_encoder, use_auth_token="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", trust_remote_code=True)
+                if not tune_val:
+                    self.ssl_encoder['model'] = self.ssl_encoder['model'].eval()
+                for param in self.ssl_encoder['model'].parameters():
+                    param.requires_grad = tune_val
+            else:
+                raise ValueError('SSL model {} is not supported'.format(args.ssl_type))
 
     def set_granularity_merging_flags(self, g_flags):
         self.granularity_merging_flags = g_flags
@@ -1088,16 +1236,26 @@ class TarcMultiTask(FairseqTask):
                 self.splits['vocab'] = self.input_vocab
                 self.splits['token2components'] = self.token2components_tsr
         else:
-            print(' - TArCMultiTask, creating dictionaries from whole corpus...')
+            print(' - TArCMultiTask, reading original data ...')
             sys.stdout.flush()
- 
+
+            speaker_ids = {'train': [], 'dev': [], 'test': []}
             token2components = []
             for my_split in ['train', 'dev', 'test']:
+                print('   * reading split {}'.format(my_split))
+                sys.stdout.flush()
+
                 data_sequences = []
                 if self.args.data_format == 'tabular':
                     data_sequences = read_tarc_tabular_data( self.args.data + '.' + my_split, self.args) 
-                elif self.args.data_format == 'parallel': 
-                    data_sequences = read_tarc_parallel_data( self.args.data + '.' + my_split, self.args )
+                elif self.args.data_format == 'parallel':
+                    user_flag = False
+                    if self.args.speech_input:
+                        user_flag = my_split != 'train'
+                    data_sequences = read_tarc_parallel_data( self.args.data + '.' + my_split, self.args, user_flag=user_flag )
+                    if self.args.speech_input:
+                        speaker_ids[my_split] = data_sequences[-1]
+                        data_sequences = data_sequences[:-1]
                 else:
                     raise NotImplementedError(' unsupported data format {}'.format(self.args.data_format))
 
@@ -1118,16 +1276,31 @@ class TarcMultiTask(FairseqTask):
                 lengths = []
                 tok_tensors = []
                 tok_lengths = []
+                # data_sequences == (tok_sequences, char_sequences, char_seq_lengths, token2components) 
                 char_seq_lengths = [[] for i in range(len(data_sequences[2]))]
                 for d_idx in range( len(data_sequences[0]) ):
                     tk_idx = 0
                     #if not self.args.token_sequences:
                     #    tk_idx = 1
-                    tok_tt = map_tokens(self.args, data_sequences[tk_idx][d_idx], self.input_vocab, self.args.pad_reference, my_split)
-                    tok_tensors.append( tok_tt )
+
+                    if self.args.ssl_encoder and d_idx == 0:
+                        tok_tt = map_tokens(self.args, data_sequences[tk_idx][d_idx], self.input_vocab, self.args.pad_reference, my_split, ssl_encoder=None)
+                        tok_tensors.append( tok_tt )
+                    elif not self.args.speech_input or d_idx > 0:
+                        tok_tt = map_tokens(self.args, data_sequences[tk_idx][d_idx], self.input_vocab, self.args.pad_reference, my_split)
+                        tok_tensors.append( tok_tt )
+                    else:
+                        tok_tt = data_sequences[tk_idx][0]
+                        tok_tensors.append( tok_tt )
                     tok_ll = torch.LongTensor( [t.size(0) for t in tok_tt] )
                     tok_lengths.append( tok_ll )
-                       
+
+                    ## BEGIN: TMP FOR DEBUG
+                    #assert len(tok_tt) == len(tok_ll)
+                    #for i in range(len(tok_tt)):
+                    #    assert tok_ll[i] == tok_tt[i].size(0)
+                    ## END: TMP FOR DEBUG
+
                     seq_tt = []
                     for s in data_sequences[2][d_idx]:
                         if self.args.pad_reference:
@@ -1140,11 +1313,84 @@ class TarcMultiTask(FairseqTask):
                     tt = map_tokens(self.args, data_sequences[ch_idx][d_idx], self.input_vocab, self.args.pad_reference, my_split)
                     tensors.append( tt )
                     ll = torch.LongTensor([t.size(0) for t in tt])
-                    lengths.append(ll) 
+                    lengths.append(ll)
+
+                    ## BEGIN: TMP FOR DEBUG
+                    #assert len(tt) == len(ll)
+                    #for i in range(len(tt)):
+                    #    assert ll[i] == tt[i].size(0)
+                    ## END: TMP FOR DEBUG
+
                 self.splits[my_split] = ([tok_tensors, tensors], [tok_lengths, lengths, char_seq_lengths])
- 
+                if self.args.speech_input:
+                    assert len(tok_tensors[0]) == len(speaker_ids[my_split])
+
             for t_idx in range(len(token2components)): 
                 self.token2components_tsr.append( self._t2c_to_tsr(token2components[t_idx], self.input_vocab) ) 
+ 
+            if self.args.speech_input:
+                print(' * TArcMultiTask, pre-processing speech input:')
+                print('   * Normalizing features...')
+                sys.stdout.flush()
+
+                curr_turn = 1
+                curr_did = 1
+                curr_dialog = []
+                bogus_train_data = {}
+                for e_idx, e in enumerate(self.splits['train'][0][0][0]):
+                    curr_dialog.append( ['bogus', e] )
+                    if curr_turn % 20 == 0:
+                        bogus_train_data['did-' + str(curr_did)] = curr_dialog
+                        curr_dialog = []
+                        curr_did += 1
+                    curr_turn += 1
+                if len(curr_dialog) > 0:
+                    bogus_train_data['did-' + str(curr_did)] = curr_dialog
+
+                curr_turn = 1
+                curr_did = 1
+                curr_dialog = []
+                bogus_dev_data = {}
+                for e_idx, e in enumerate(self.splits['dev'][0][0][0]):
+                    curr_dialog.append( ['bogus', e] )
+                    if curr_turn % 20 == 0:
+                        bogus_dev_data['did-' + str(curr_did)] = curr_dialog
+                        curr_dialog = []
+                        curr_did += 1
+                    curr_turn += 1
+                if len(curr_dialog) > 0:
+                    bogus_dev_data['did-' + str(curr_did)] = curr_dialog
+
+                curr_turn = 1
+                curr_did = 1
+                curr_dialog = []
+                bogus_test_data = {}
+                for e_idx, e in enumerate(self.splits['test'][0][0][0]):
+                    curr_dialog.append( ['bogus', e] )
+                    if curr_turn % 20 == 0:
+                        bogus_test_data['did-' + str(curr_did)] = curr_dialog
+                        curr_dialog = []
+                        curr_did += 1
+                    curr_turn += 1
+                if len(curr_dialog) > 0:
+                    bogus_test_data['did-' + str(curr_did)] = curr_dialog
+
+                mu, sigma = feature_wise_mean_std(bogus_train_data)
+                normalize_data_only(bogus_train_data, mu, sigma)
+                normalize_data_only(bogus_dev_data, mu, sigma)
+                normalize_data_only(bogus_test_data, mu, sigma)
+
+                print('   * Adding speaker marker...')
+                sys.stdout.flush()
+
+                for e_idx, e in enumerate(self.splits['train'][0][0][0]):
+                    self.splits['train'][0][0][0][e_idx] = add_speaker_marker(e, speaker_ids['train'][e_idx])
+
+                for e_idx, e in enumerate(self.splits['dev'][0][0][0]):
+                    self.splits['dev'][0][0][0][e_idx] = add_speaker_marker(e, speaker_ids['dev'][e_idx])
+
+                for e_idx, e in enumerate(self.splits['test'][0][0][0]):
+                    self.splits['test'][0][0][0][e_idx] = add_speaker_marker(e, speaker_ids['test'][e_idx])
 
             self.splits['vocab'] = self.input_vocab
             self.splits['token2components'] = self.token2components_tsr 
@@ -1161,7 +1407,24 @@ class TarcMultiTask(FairseqTask):
         sys.stdout.flush() 
 
         tensors, lengths = self.splits[my_split]
-        if hasattr(self.args, 'lm_data') and self.args.lm_data:
+        if self.args.speech_input:
+            assert len(tensors[0]) == 3
+            n_input_sequences = len(tensors[0][0])
+            for t_idx in range(1, len(tensors[0])):
+                assert len(tensors[0][t_idx]) == n_input_sequences, "Num. of output sequences @task {} expected to be {}, found {}".format(t_idx, n_input_sequences, len(tensors[0][t_idx]))
+            if len(tensors[0])-1 > 1:
+                for t_idx in range(2, len(tensors[0])):
+                    for s_idx in range(n_input_sequences):
+                        #assert tensors[0][t_idx-1][s_idx].size(0) == tensors[0][t_idx][s_idx].size(0), "outputs of different length ({} vs. {}) @task {} vs. {}, in split {}\nSequence@{}: {}\nSequence@{}: {}\n----------".format(tensors[0][t_idx-1][s_idx].size(0), tensors[0][t_idx][s_idx].size(0), t_idx-1, t_idx, my_split, t_idx-1, self.input_vocab.string(tensors[0][t_idx-1][s_idx]), t_idx, self.input_vocab.string(tensors[0][t_idx][s_idx]))
+                        if tensors[0][t_idx-1][s_idx].size(0) != tensors[0][t_idx][s_idx].size(0):
+                            # NOTE: TMP SOLUTION TO AVOID RE-GENERATING SERIALIZED DATA (there's only one such case in the whole training set)
+                            tensors[0][t_idx][s_idx] = torch.cat( [tensors[0][t_idx][s_idx], torch.LongTensor([self.input_vocab.index('B-command-tache')])], 0)
+                            tensors[0][t_idx][s_idx][-2] = tensors[0][t_idx][s_idx][-1]
+                            tensors[0][t_idx][s_idx][-1] = self.input_vocab.eos()
+                            print("outputs of different length ({} vs. {}) @task {} vs. {}, in split {}\nSequence@{}: {}\nSequence@{}: {}\n----------".format(tensors[0][t_idx-1][s_idx].size(0), tensors[0][t_idx][s_idx].size(0), t_idx-1, t_idx, my_split, t_idx-1, self.input_vocab.string(tensors[0][t_idx-1][s_idx]), t_idx, self.input_vocab.string(tensors[0][t_idx][s_idx])))
+                            sys.stdout.flush()
+
+        if not self.args.speech_input and hasattr(self.args, 'lm_data') and self.args.lm_data:
             print(' * TArCMultiTask, checking input symbols definiteness (model dict size {}, vs. LM dict size {})...'.format(len(self.input_vocab), len(self.lm_vocab)))
             sys.stdout.flush()
             if self.args.token_sequences:
@@ -1197,7 +1460,7 @@ class TarcMultiTask(FairseqTask):
             check_column_processing(num_of_tasks+1, self.args)
         self.set_granularity_merging_flags(granularity_merging_flags[self.args.sub_task]) 
  
-        if self.input_dict is not None:
+        if not self.args.speech_input and self.input_dict is not None:  # NOTE: this if concerns seq2seq syntactic parsing
             self.inverse_input_dict[self.input_vocab.bos()] = '<bos>'
             self.inverse_input_dict[self.input_vocab.eos()] = '<eos>'
 
@@ -1232,7 +1495,7 @@ class TarcMultiTask(FairseqTask):
                             sys.stdout.flush()
                             self.inverse_input_dict[self.input_vocab.index(tk)] = tk'''
 
-        if self.output_dict is not None:
+        if not self.args.speech_input and self.output_dict is not None:    # NOTE: this if concerns seq2seq syntactic parsing
             self.inverse_output_dict[self.input_vocab.bos()] = '<bos>'
             self.inverse_output_dict[self.input_vocab.eos()] = '<eos>'
 
@@ -1272,6 +1535,24 @@ class TarcMultiTask(FairseqTask):
         print(' - Tarc MultiTask, learning with {} input(s) (lengths: {}), {} different outputs (num. of tasks: {}, lengths: {})'.format(len(sources), len(src_lengths), len(targets), self.args.num_of_tasks, len(tgt_lengths)))
         sys.stdout.flush() 
 
+        '''assert len(sources[0][0]) == len(sources[1][0])
+        assert len(sources[0][0]) == len(src_lengths[0][0])
+        assert len(sources[0][0]) == len(src_lengths[1][0])
+
+        print('[DEBUG] {}'.format(sources[0][0][0].size()))
+        print('[DEBUG] {}'.format(sources[1][0][0].size()))
+        print('[DEBUG] {}'.format(src_lengths[0][0][0]))
+        print('[DEBUG] {}'.format(src_lengths[1][0][0]))
+        print('[DEBUG] checking {} tensors'.format(len(sources[0][0])))
+
+        for i in range(len(sources[0][0])):
+            assert sources[0][0][i].size(0) == src_lengths[0][0][i]
+            assert sources[1][0][i].size(0) == src_lengths[1][0][i]'''
+
+        #if my_split == 'train':
+        #    print('[DEBUG] SO FAR SO GOOD!')
+        #    sys.exit(0)
+
         #print(' -----')
         #print(' * First token sequence: {}'.format(self.input_vocab.string(sources[0][0][0])))
         #print(' -----')
@@ -1280,6 +1561,7 @@ class TarcMultiTask(FairseqTask):
 
         input_feed = True 
         self.datasets[split] = TarcMultiTaskDataset.TarcMultiTaskDataset(
+            args=self.args,
             src=sources,
             src_sizes=src_lengths,
             src_dict=self.input_vocab,
@@ -1293,7 +1575,11 @@ class TarcMultiTask(FairseqTask):
             input_feeding=input_feed,
             keep_data_order=self.args.keep_data_order,
             granularity_flags=(self.args.token_sequences, self.args.char_sequences),
-        ) 
+        )
+
+        #if my_split == 'train':
+        #    print('[DEBUG] SO FAR SO GOOD')
+        #    sys.exit(0)
 
     def max_positions(self):
         """Return the max input length allowed by the task."""
@@ -1304,7 +1590,17 @@ class TarcMultiTask(FairseqTask):
     @property
     def source_dictionary(self):
         """Return the source :class:`~fairseq.data.Dictionary`."""
-        return self.input_vocab
+
+        if self.args.speech_input:
+            return None
+        else:
+            #if self.ssl_encoder is not None:
+            #    if self.args.ssl_type == 'camembert':
+            #        return self.ssl_encoder.task.source_dictionary
+            #    else:
+            #        raise NotImplementedError()
+            #else:
+            return self.input_vocab
 
     @property
     def target_dictionary(self):
@@ -1325,6 +1621,7 @@ class TarcMultiTask(FairseqTask):
     def begin_epoch(self, epoch, model):
         """Hook function called before the start of each epoch."""
 
+        model.set_curr_epoch(epoch)
         if epoch > 1 and hasattr(self.args, 'save_embeddings') and self.args.save_embeddings:
             print('[DEBUG] * TArCMultiTask: saving current model embeddings')
             sys.stdout.flush()

@@ -20,6 +20,8 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+# NOTE: added by me to really keep the n best checkpoints
+best_loss_list = []
 
 def save_checkpoint(args, trainer, epoch_itr, val_loss):
     from fairseq import distributed_utils, meters
@@ -41,7 +43,7 @@ def save_checkpoint(args, trainer, epoch_itr, val_loss):
     epoch = epoch_itr.epoch
     end_of_epoch = epoch_itr.end_of_epoch()
     updates = trainer.get_num_updates()
-
+ 
     checkpoint_conds = collections.OrderedDict()
     checkpoint_conds["checkpoint{}.pt".format(epoch)] = (
         end_of_epoch
@@ -58,11 +60,49 @@ def save_checkpoint(args, trainer, epoch_itr, val_loss):
         or is_better(val_loss, save_checkpoint.best)
     )
     if val_loss is not None and args.keep_best_checkpoints > 0:
-        checkpoint_conds["checkpoint.best_{}_{:.4f}.pt".format(
-            args.best_checkpoint_metric, val_loss)] = (
-            not hasattr(save_checkpoint, "best")
-            or is_better(val_loss, save_checkpoint.best)
-        )
+        chk_key = "checkpoint.best_{}_{:.5f}.pt".format(args.best_checkpoint_metric, val_loss)
+        if len(best_loss_list) < args.keep_best_checkpoints:
+            best_loss_list.append( val_loss )
+            best_loss_list.sort(reverse=args.maximize_best_checkpoint_metric)
+            checkpoint_conds[chk_key] = (True)
+
+            #print('[DEBUG] added new best loss to the list: {}'.format(val_loss))
+            #sys.stdout.flush()
+        else:
+            #print('[DEBUG] looking for local worse loss: {} vs. {}'.format(val_loss, best_loss_list))
+
+            best_hit = False
+            worst_loss = best_loss_list[0]
+
+            #print('[DEBUG] worst loss initialized: {}'.format(worst_loss))
+            #sys.stdout.flush()
+
+            for loss in best_loss_list:
+                if is_better(worst_loss, loss):
+                    worst_loss = loss
+                if is_better(val_loss, loss):
+                    checkpoint_conds[chk_key] = (True)
+                    best_hit = True
+                    
+                    #print('[DEBUG]    * best loss hit: current {} vs. previous {}'.format(val_loss, loss))
+                    #sys.stdout.flush()
+
+            assert worst_loss == best_loss_list[-1], 'worst_loss ({}) should correspond to the last in the list: {}'.format(worst_loss, best_loss_list[-1])
+            if best_hit:
+                #print('[DEBUG] replacing {} in {} entry'.format(val_loss, worst_loss))
+
+                worst_key = "checkpoint.best_{}_{:.5f}.pt".format(args.best_checkpoint_metric, worst_loss)
+                checkpoint_conds[worst_key] = (False)
+                best_loss_list[-1] = val_loss
+                best_loss_list.sort(reverse=args.maximize_best_checkpoint_metric)
+
+        #print('[DEBUG] new best loss set: {}'.format(best_loss_list))
+        #sys.stdout.flush()
+
+        #checkpoint_conds[chk_key] = (
+        #    not hasattr(save_checkpoint, "best")
+        #    or is_better(val_loss, save_checkpoint.best)
+        #)
     checkpoint_conds["checkpoint_last.pt"] = not args.no_last_checkpoints
 
     extra_state = {"train_iterator": epoch_itr.state_dict(), "val_loss": val_loss}
@@ -72,9 +112,22 @@ def save_checkpoint(args, trainer, epoch_itr, val_loss):
     checkpoints = [
         os.path.join(args.save_dir, fn) for fn, cond in checkpoint_conds.items() if cond
     ]
+
+    #print('[DEBUG] current checkpoint set:')
+    #print('\n'.join(checkpoints))
+    #sys.stdout.flush()
+
     if len(checkpoints) > 0:
+
+        #print('[DEBUG] saving checkpoint state into {}'.format(checkpoints[0]))
+        #sys.stdout.flush()
+
         trainer.save_checkpoint(checkpoints[0], extra_state)
         for cp in checkpoints[1:]:
+
+            #print('[DEBUG]    * copying {} into {}'.format(checkpoints[0], cp))
+            #sys.stdout.flush()
+
             PathManager.copy(checkpoints[0], cp, overwrite=True)
 
         write_timer.stop()
@@ -108,6 +161,10 @@ def save_checkpoint(args, trainer, epoch_itr, val_loss):
             checkpoints = checkpoints[::-1]
         for old_chk in checkpoints[args.keep_best_checkpoints:]:
             if os.path.lexists(old_chk):
+
+                #print('[DEBUG] removing checkpoint {}'.format(old_chk))
+                #sys.stdout.flush()
+
                 os.remove(old_chk)
 
 

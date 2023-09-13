@@ -335,11 +335,28 @@ class FairseqTask(object):
                 - logging outputs to display while training
         """
         model.train()
+
+        #print('[DEBUG] train step passed...')
+        #sys.stdout.flush()
+
         model.set_num_updates(update_num)
+
+        #print('[DEBUG] num updates setting passed...')
+        #sys.stdout.flush()
+
         loss, sample_size, logging_output = criterion(model, sample)
+
+        #print('[DEBUG] loss computation passed: {}'.format(loss)) 
+        #sys.stdout.flush() 
+
         if ignore_grad:
             loss *= 0
-        optimizer.backward(loss)
+        optimizer.backward(loss) 
+
+        #print('[DEBUG] backward step passed.')
+        #print(' -----')
+        #sys.stdout.flush()
+
         return loss, sample_size, logging_output
 
     def valid_step(self, sample, model, criterion):

@@ -7,11 +7,13 @@
 Translate pre-processed data with a trained model.
 """
 
+import sys
 import torch
 
 from fairseq import bleu, checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
 
+from fairseq.tasks.End2EndSLU import End2EndSLU
 
 def main(args):
     assert args.path is not None, '--path required for generation!'
@@ -38,6 +40,15 @@ def main(args):
     except NotImplementedError:
         src_dict = None
     tgt_dict = task.target_dictionary
+
+    '''if src_dict is None:
+        print('generate.py: src_dict is None')
+        sys.stdout.flush()
+    else:
+        print('generate.py: SO FAR SO GOOD')
+        sys.stdout.flush()'''
+    #sys.exit(0)
+    
 
     # Load ensemble
     print('| loading model(s) from {}'.format(args.path))
@@ -89,6 +100,7 @@ def main(args):
         scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
     num_sentences = 0
     has_target = True
+    is_slu = isinstance(task, End2EndSLU)
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
@@ -106,9 +118,16 @@ def main(args):
             gen_timer.stop(num_generated_tokens)
 
             for i, sample_id in enumerate(sample['id'].tolist()):
+                if is_slu and isinstance(sample['strid'][i], str):
+                    sample_id_str = sample['strid'][i].strip()
+                else:
+                    sample_id_str = sample_id
                 has_target = sample['target'] is not None
 
                 # Remove padding
+                #if 'src_signals' in sample['net_input'] and 'src_tokens' in sample['net_input']:
+                #    _, src_tokens = utils.strip_pad(sample['net_input']['src_tokens'])
+                #else:
                 src_tokens = utils.strip_pad(sample['net_input']['src_tokens'][i, :], tgt_dict.pad())
                 target_tokens = None
                 if has_target:
@@ -120,17 +139,23 @@ def main(args):
                     target_str = task.dataset(args.gen_subset).tgt.get_original_text(sample_id)
                 else:
                     if src_dict is not None:
+                        #if isinstance(task, End2EndSLU) and task.roberta is not None:
+                        #    src_str = task.roberta.decode( src_tokens.cpu() )
+                        #else:
                         src_str = src_dict.string(src_tokens, args.remove_bpe)
                     else:
                         src_str = ""
                     if has_target:
+                        #if isinstance(task, End2EndSLU) and task.roberta is not None:
+                        #    target_str = task.roberta.decode( target_tokens.cpu() )
+                        #else:
                         target_str = tgt_dict.string(target_tokens, args.remove_bpe, escape_unk=True)
 
                 if not args.quiet:
                     if src_dict is not None:
-                        print('S-{}\t{}'.format(sample_id, src_str))
+                        print('S-{}\t{}'.format(sample_id_str, src_str))
                     if has_target:
-                        print('T-{}\t{}'.format(sample_id, target_str))
+                        print('T-{}\t{}'.format(sample_id_str, target_str))
 
                 # Process top predictions
                 for j, hypo in enumerate(hypos[i][:args.nbest]):
@@ -142,11 +167,13 @@ def main(args):
                         tgt_dict=tgt_dict,
                         remove_bpe=args.remove_bpe,
                     )
+                    #if isinstance(task, End2EndSLU) and task.roberta is not None:
+                    #    hypo_str = task.roberta.decode( hypo['tokens'].int().cpu() )
 
                     if not args.quiet:
-                        print('H-{}\t{}\t{}'.format(sample_id, hypo['score'], hypo_str))
+                        print('H-{}\t{}\t{}'.format(sample_id_str, hypo['score'], hypo_str))
                         print('P-{}\t{}'.format(
-                            sample_id,
+                            sample_id_str,
                             ' '.join(map(
                                 lambda x: '{:.4f}'.format(x),
                                 hypo['positional_scores'].tolist(),
@@ -155,17 +182,17 @@ def main(args):
 
                         if args.print_alignment:
                             print('A-{}\t{}'.format(
-                                sample_id,
+                                sample_id_str,
                                 ' '.join(['{}-{}'.format(src_idx, tgt_idx) for src_idx, tgt_idx in alignment])
                             ))
 
                         if args.print_step:
-                            print('I-{}\t{}'.format(sample_id, hypo['steps']))
+                            print('I-{}\t{}'.format(sample_id_str, hypo['steps']))
 
                         if getattr(args, 'retain_iter_history', False):
                             print("\n".join([
                                     'E-{}_{}\t{}'.format(
-                                        sample_id, step,
+                                        sample_id_str, step,
                                         utils.post_process_prediction(
                                             h['tokens'].int().cpu(),
                                             src_str, None, None, tgt_dict, None)[1])

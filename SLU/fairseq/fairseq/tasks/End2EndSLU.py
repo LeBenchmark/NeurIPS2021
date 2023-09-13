@@ -8,8 +8,11 @@ import sys
 import torch
 import math
 import numpy as np
+from scipy.io import wavfile
+from scipy import signal
 
 from fairseq.globals import *
+from fairseq.dstc_utils import turn_transcripts_and_sem, clean_sem
 from fairseq.data import Dictionary, End2EndSLUDataset, FairseqDataset, data_utils, iterators
 from fairseq.tasks import FairseqTask, register_task
 
@@ -18,8 +21,13 @@ from typing import List
 
 import examples.speech_recognition.criterions.SLU_CTC_loss as slu_ctc
 
+import whisper
+from whisper.audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram
+
 #from carbontracker.tracker import CarbonTracker
 from codecarbon import EmissionsTracker
+
+from fairseq.models.roberta import RobertaModel, CamembertModel
 
 _ADVANCED_SPK_MARK_ = False
 
@@ -458,19 +466,26 @@ def create_batch_(data, curr_batch_ids):
 
     return dialog_batch
 
-def get_bogus_turn(real_turn, dd, turn_id=None, filler=bogus_token):
+def get_bogus_turn(real_turn, dd, roberta, turn_id=None, filler=bogus_token):
     # EOS_tag, User_ID
     T, C = real_turn[1].size()
-    sig = torch.zeros(3, C).to(real_turn[1])
+    sig = torch.zeros(3, C).to(real_turn[1])   # NOTE: 20 as input length, 3 as output length, this is to garantie correct CTC loss output values
     if filler == EOD_tag:
         sig.fill_( EOD_value )
         #print('[DEBUG] get_bogus_turn: filling bogus turn with value {}'.format(EOD_value))
         #sys.stdout.flush()
-    tt = torch.LongTensor( [dd.bos(), dd.index(filler), dd.eos()] ).to(real_turn[1].device)
+    else:
+        sig.fill_( EOD_value / 2.0)
+    if roberta is None:
+        tt = torch.LongTensor( [dd.bos(), dd.index(filler), dd.eos()] ).to(real_turn[1].device)
+    else:
+        tt = roberta.encode( filler ).to(real_turn[1].device)
+
+    assert tt.size(0) == 3 and tt[0].item() == dd.bos() and tt[-1].item() == dd.eos()
     bogus_turn_id = turn_id if turn_id is not None else real_turn[0]
     return (bogus_turn_id, sig, tt, tt, tt, bogus_ID)    # NOTE: bogus_ID is defined in globals.py
 
-def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
+def rearrange_for_dialog_level_slu_(data, bs, dlens, dd, roberta=None):
 
     len_sorted = sorted(dlens.keys())
     batches = []    # Batches of dialog id, not necessarily of the same length
@@ -545,7 +560,7 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
                     if not found:
                         raise ValueError('The input signals for current dialog are all None')
                 for ii in range(did2len[did]+1, max_len+1):
-                    dialog.append( get_bogus_turn(sample_turn, dd, ii) )
+                    dialog.append( get_bogus_turn(sample_turn, dd, roberta, ii) )
                     did2len[did] += 1
                 #data[did] = dialog # needed ???
 
@@ -586,7 +601,7 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
                 for ii in range(did2len[did]+1, max_len+1):
                     #print('[DEBUG] rearrange_dialogs, creating bogus turn from dialog id {}: {}'.format(batches[-1][0], data[batches[-1][0]]))
                     #sys.stdout.flush()
-                    dialog.append( get_bogus_turn(sample_turn, dd, ii) )
+                    dialog.append( get_bogus_turn(sample_turn, dd, roberta, ii) )
                     did2len[did] += 1
                 #data[did] = dialog # needed ???
 
@@ -619,7 +634,7 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
                     break
             if not found:
                 raise ValueError('All input signals of current dialog are None')
-        data[did].append( get_bogus_turn(sample_turn, dd, len(data[did])+1, filler=EOD_tag) )
+        data[did].append( get_bogus_turn(sample_turn, dd, roberta, len(data[did])+1, filler=EOD_tag) )
 
     dialog_lengths = {}
     for dialog_id in data.keys():
@@ -644,6 +659,7 @@ def rearrange_for_dialog_level_slu_(data, bs, dlens, dd):
 def create_dialog_batches_(data, batch_size, infos):
 
     dd = infos['dict']
+    roberta=infos['roberta']
     dlevel_slu = infos['dialog_level_slu']
     normalize_dialogs = infos['normalize_dialogs']
 
@@ -655,7 +671,7 @@ def create_dialog_batches_(data, batch_size, infos):
         dialog_lengths[curr_len].append( dialog_id )
 
     if normalize_dialogs:
-        dialog_lengths = rearrange_for_dialog_level_slu_(data, batch_size, dialog_lengths, dd) 
+        dialog_lengths = rearrange_for_dialog_level_slu_(data, batch_size, dialog_lengths, dd, roberta=roberta) 
 
     dialog_batches = []
     batch_sizes = []
@@ -705,13 +721,29 @@ def read_txt(txtpath):
     f.close()
     return dialog_transcript.strip()
 
-def parse_media_semantic_annotation(filename):
+def build_slu_turn(args, dialog_struct):
+
+    slu_turn = ''
+    for vals in dialog_struct.values():
+        for turn_struct in vals:
+            for c in turn_struct['Concepts']:
+                if len(slu_turn) > 0:
+                    slu_turn = slu_turn + ' '
+                if len(c) == 3:
+                    slu_turn = slu_turn + slu_start_concept_mark + ' ' + c[2] + ' ' + '@' + c[1] + ' ' + slu_end_concept_mark
+                else:
+                    slu_turn = slu_turn + slu_start_concept_mark + ' ' + c[3] + ' ' + '@' + c[1] + ' ' + slu_end_concept_mark
+
+    return slu_turn
+
+def parse_media_semantic_annotation(filename, attval_format=False):
     
     # Example:
     # 364_16 @null{euh} @+rang-temps{la troisième} @+temps-unite{semaine} @+temps-mois{d' août}
     
     clean_re = re.compile('^\s+|\s+$')
     p = re.compile('^(\+|\-)?(\S+)\{([^\}]+)\}')
+    attval_re = re.compile('^(\+|\-)?(\S+)\[([^\]]*)\]\{([^\}]+)\}')
     
     Dialogs = {}
     f = open(filename, encoding='utf-8')
@@ -737,14 +769,24 @@ def parse_media_semantic_annotation(filename):
         concept_list = []
         concepts = concepts_str.split('@')
         for c in concepts:
-            if len(c) > 0 and c != 'null{} ' and c != 'null{}':
-                m = p.match(c)
+            if len(c) > 0 and c != 'null{} ' and c != 'null{}' and c != 'null[void]{} ' and c != 'null[void]{}':
+                m = attval_re.match(c)
                 if m == None:
-                    sys.stderr.write(' - ERROR: parse_media_semantic_annotation parsing error at {} while parsing file {}\n'.format(c, filename))
-                    sys.exit(1)
+                    if attval_format:
+                        raise ValueError('wrong attribute-value format parsing {}'.format(c))
+                    m = p.match(c)
+                    if m == None:
+                        sys.stderr.write(' - ERROR: parse_media_semantic_annotation parsing error at {} while parsing file {}\n'.format(c, filename))
+                        sys.exit(1)
+                    else:
+                        (mode,concept,surface) = (m.group(1),m.group(2),clean_re.sub('',m.group(3)))
+                        concept_list.append( (mode,concept,surface) )
                 else:
-                    (mode,concept,surface) = (m.group(1),m.group(2),clean_re.sub('',m.group(3)))
-                    concept_list.append( (mode,concept,surface) )
+                    (mode, concept, value, surface) = (m.group(1), m.group(2), m.group(3), clean_re.sub('', m.group(4)))
+                    #if attval_format:
+                    #    concept_list.append( (mode, concept, value, surface) )
+                    #else:
+                    concept_list.append( (mode, concept, value, surface) )
         TurnStruct['Concepts'] = concept_list
         Dialogs[dialog_ID].append( TurnStruct )
 
@@ -767,6 +809,7 @@ def parse_fsc_filename( turn ):
     dialog_id = components[-2]
     turn_id = components[-1]'''
 
+    # NOTE: this is actually the parsing of DSTC format filenames, I use this function for lazyness ... :-)
     #print('[DEBUG] reading {}'.format(turn.split('/')[-1]))
     filename = turn.split('/')[-1]
     tokens = filename.split('.')
@@ -791,24 +834,8 @@ def read_dialog_data(TurnList, args):
     lan_flag = args.w2v_language
     feat_ext = args.feature_extension
 
-    if windowtime < 0:
-        srate_str = '16kHz'
-        if windowtime == -2:
-            srate_str = '8kHz'
-        if windowtime > -3:
-            print(' * read_dialog_data: reading {} wave2vec features...'.format(srate_str))
-        elif windowtime == -3:
-            print(' * read_dialog_data: reading FlowBERT features ({} files)...'.format(feat_ext))
-        elif windowtime == -4:
-            print(' * read_dialog_data: reading W2V2 base features ({} files)...'.format(feat_ext))
-        elif windowtime == -5:
-            print(' * read_dialog_data: reading FlowBERT base features ({} files)...'.format(feat_ext))
-        elif windowtime == -6:
-            print(' * read_dialog_data: reading W2V2 large features ({} files)...'.format(feat_ext))
-        elif windowtime == -7:
-            print(' * read_dialog_data: reading XLSR53 large features ({} files)...'.format(feat_ext))
-        else:
-            raise NotImplementedError()
+    if args.online_feature_extraction:
+        print(' * read_dialog_data: extracting features online, reading .wav inputs')
         sys.stdout.flush()
     else:
         print(' * read_dialog_data: reading {} feature files'.format(feat_ext))
@@ -821,122 +848,131 @@ def read_dialog_data(TurnList, args):
 
     n_input_features = -1
     none_tsr_idx = []
+    #check_turn_idx = 0
     for turn in turns:
-        dialog_id, turn_id = parse_filename( args, turn ) 
+        turn = turn.strip()
+        dialog_id, turn_id = parse_filename( args, turn )
+        basename = turn.split('/')[-1]
+        ttd = basename.split('.')
+        ttt = turn_id.split('-')
+        if args.corpus_name == 'media':
+            assert len(ttd) == 3
+            assert len(ttt) == 3
+        elif args.corpus_name == 'fsc':
+            assert len(ttd) == 2
+            assert len(ttt) == 3
 
         if dialog_id not in dialog_data:
-            dialog_data[dialog_id] = [] 
+            dialog_data[dialog_id] = []
+            check_turn_idx = 0
+
+        #if dialog_id != 'mul0645' and dialog_id != 'pmul3937' and dialog_id != 'pmul2638':
+        #    assert check_turn_idx+1 == int(turn_id.split('-')[1]), 'Turn ID clash @turn {}: expected {} vs. parsed {}'.format(turn, check_turn_idx+1, turn_id.split('-')[1])
+        #check_turn_idx += 1
 
         # 1. Turn ID for sorting turns of the same dialog
         turn_data = []
-        turn_data.append( turn_id )
+        turn_data.append( dialog_id.strip() + '@' + turn_id.strip() )
 
         sig_flag = False
         trs_flag = False 
 
         # 2. Spectrogram of the turn audio signal (the input to the network)
-        if windowtime == 20:
-            #file_ext = '.8kHz.20.0ms-spg'
-            #file_ext = '.8kHz.20.0ms-mfcc'
-            #if args.corpus_name == 'fsc':
-            #    file_ext = '.16kHz' + file_ext
-            if hasattr(args, 'use_transcription_as_input') and args.use_transcription_as_input:
-                if os.path.exists(turn.strip() + feat_ext):
+        if args.online_feature_extraction or args.speech_encoder == 'sb-wav2vec2':
+            sample_rate, samples = wavfile.read(turn.strip() + '.wav')
+            if args.upsample:
+                samples = signal.resample(samples, samples.shape[0]*2)
+            spg_tsr = torch.from_numpy(samples).float() 
+            sig_flag = True
+        else:
+            if windowtime == 20: 
+                if args.use_transcription_as_input:
+                    if os.path.exists(turn.strip() + feat_ext):
+                        spg_tsr = torch.load(turn.strip() + feat_ext)
+                        sig_flag = True
+                    else:
+                        spg_tsr = None
+                else:
                     spg_tsr = torch.load(turn.strip() + feat_ext)
-                    sig_flag = True
-                else:
-                    spg_tsr = None
-            else:
-                spg_tsr = torch.load(turn.strip() + feat_ext)
-                sig_flag = True 
-        elif windowtime == 10:
-            raise NotImplementedError
-            #spg_tsr = torch.load(turn.strip() + '.10.0ms-spg')
-        elif windowtime < 0:
-            srate_str = '16kHz'
-            if windowtime == -2:
-                srate_str = '8kHz'
-            lan=''
-            if lan_flag == 'Fr':
-                lan='-Fr'
-            if windowtime > -3:
-                filename = turn.strip() + '.' + srate_str + lan + '.w2v'
-                if hasattr(args, 'use_transcription_as_input') and args.use_transcription_as_input:
-                    if os.path.exists(filename):
+                    sig_flag = True 
+            elif windowtime == 10:
+                raise NotImplementedError 
+            elif windowtime < 0:
+                srate_str = '16kHz'
+                if windowtime == -2:
+                    srate_str = '8kHz'
+                lan=''
+                if lan_flag == 'Fr':
+                    lan='-Fr'
+                if windowtime > -3:
+                    filename = turn.strip() + '.' + srate_str + lan + '.w2v'
+                    if args.use_transcription_as_input:
+                        if os.path.exists(filename):
+                            spg_tsr = torch.load(filename)
+                            sig_flag = True
+                        else:
+                            spg_tsr = None
+                    else:
                         spg_tsr = torch.load(filename)
                         sig_flag = True
-                    else:
-                        spg_tsr = None
                 else:
-                    spg_tsr = torch.load(filename)
-                    sig_flag = True
-            else:
-                filename = turn.strip() + feat_ext
-                if hasattr(args, 'use_transcription_as_input') and args.use_transcription_as_input:
-                    if os.path.exists(filename):
+                    filename = turn.strip() + feat_ext
+                    if args.use_transcription_as_input:
+                        if os.path.exists(filename):
+                            spg_tsr = torch.load(filename)
+                            sig_flag = True
+                        else:
+                            spg_tsr = None
+                    else:
                         spg_tsr = torch.load(filename)
-                        sig_flag = True
-                    else:
-                        spg_tsr = None
-                else:
-                    spg_tsr = torch.load(filename)
-                    sig_flag = True
-            '''elif windowtime == -3:
-                spg_tsr = torch.load(turn.strip() + '.fbert')
-            elif windowtime == -4: 
-                spg_tsr = torch.load(turn.strip() + '.ebert')
-            elif windowtime == -5:
-                spg_tsr = torch.load(turn.strip() + '.bbert')
-            elif windowtime == -6:
-                spg_tsr = torch.load(turn.strip() + '.bebert')
-            elif windowtime == -7:
-                spg_tsr = torch.load(turn.strip() + '.xbert')'''
-            if reduce_flag > 1:
-                raise NotImplementedError
-                #spg_tsr = Sf.reduce( spg_tsr.squeeze(), reduce_flag )
+                        sig_flag = True 
+                if reduce_flag > 1:
+                    raise NotImplementedError 
 
-        if spg_tsr is not None and windowtime > -3:
-            spg_tsr = spg_tsr.squeeze().permute(1,0)
-        elif spg_tsr is not None:
-            spg_tsr = spg_tsr.squeeze() 
-        if spg_tsr is not None and len(spg_tsr.size()) != 2:
-            spg_tsr = spg_tsr.unsqueeze(0)
-
-        #print(' - read_dialog_data, read spectrogram shape: {}'.format(spg_tsr.size()))
-        #sys.stdout.flush()
-        #sys.exit(0)
+            if spg_tsr is not None and windowtime > -3:
+                spg_tsr = spg_tsr.squeeze().permute(1,0)
+            elif spg_tsr is not None:
+                spg_tsr = spg_tsr.squeeze() 
+            if spg_tsr is not None and len(spg_tsr.size()) != 2:
+                spg_tsr = spg_tsr.unsqueeze(0) 
 
         if spg_tsr is not None and spg_tsr.size(0) < 3:
             print(' *** read_dialog_data: got strangely short signal {}...'.format(spg_tsr.size()))
             sys.stdout.flush()
 
-        if spg_tsr is None or (spg_tsr.size(0) > 3 and spg_tsr.size(0) < args.max_source_positions):
+        if spg_tsr is None or args.online_feature_extraction or (spg_tsr.size(0) > 3 and spg_tsr.size(0) < args.max_source_positions):
             if spg_tsr is not None:
-                if n_input_features != -1 and n_input_features != spg_tsr.size(-1):
+                if args.speech_encoder != 'sb-wav2vec2' and n_input_features != -1 and n_input_features != spg_tsr.size(-1):
                     raise ValueError('Found input tensors with different number of features ({} != {})'.format(n_input_features, spg_tsr.size(-1)))
                 elif n_input_features == -1:
-                    n_input_features = spg_tsr.size(-1)
-            else:
-                none_tsr_idx.append( (dialog_id, len(dialog_data[dialog_id])) )
+                    n_input_features = spg_tsr.size(-1) 
             turn_data.append( spg_tsr )  # Spectrogram's shape is (1 x num_features x sequence_length), we make it (sequence_length x num_features) 
 
             # 3. The reference transcription
-            turn_txt = read_txt(turn.strip() + '.txt')
+            turn_txt = read_txt(turn.strip() + '.txt') 
             trs_flag = True
             turn_data.append( turn_txt.strip() ) 
 
-            # 4. The transcription "enriched" with semantic annotation
-            basename = turn.split('/')[-1]
+            # 4. The transcription "enriched" with semantic annotation 
             if args.corpus_name in ['media', 'etape']:
                 if True: #user_ID in basename:
-                    dialog_struct = parse_media_semantic_annotation( turn.strip() + '.sem' )
-                    slu_turn = ''
-                    for vals in dialog_struct.values():
-                        for turn_struct in vals: 
-                            for c in turn_struct['Concepts']:
-                                if len(slu_turn) > 0:
-                                    slu_turn = slu_turn + ' '
-                                slu_turn = slu_turn + slu_start_concept_mark + ' ' + c[2] + ' ' + c[1] + ' ' + slu_end_concept_mark
+                    if args.slu_turn_format == 'media':
+                        dialog_struct = parse_media_semantic_annotation( turn.strip() + '.sem' )
+                        '''slu_turn = ''
+                        for vals in dialog_struct.values():
+                            for turn_struct in vals: 
+                                for c in turn_struct['Concepts']: 
+                                    if len(slu_turn) > 0:
+                                        slu_turn = slu_turn + ' '
+                                    slu_turn = slu_turn + slu_start_concept_mark + ' ' + c[2] + ' ' + c[1] + ' ' + slu_end_concept_mark'''
+                        slu_turn = build_slu_turn(args, dialog_struct)
+                    else:
+                        f = open(turn.strip() + '.sem', encoding='utf-8')
+                        ll = f.readlines()
+                        f.close()
+                        assert len(ll) == 1
+                        slu_turn = ll[0].strip()
+
                     turn_data.append( slu_turn.strip() )
                     if user_ID in basename:
                         turn_data.append( user_ID )
@@ -974,15 +1010,52 @@ def read_dialog_data(TurnList, args):
         else:
             sys.stderr.write(' *** read_dialog_data WARNING: discarding offending length turn (size: {})'.format(spg_tsr.size(0)))
 
+    # NOTE: I don't know why, but order of turns in dialog_data is not always coherent, so here I sort turns of each dialogue so that to respect the natural order
+    print(' *** Sorting dialogue turns...')
+    sys.stdout.flush()
+    n_sorted = 0
+    for did in dialog_data.keys():
+        turn_list = sorted(dialog_data[did], key=lambda list: int(list[0].split('@')[-1].split('-')[1]))
+
+        d_sorted = False
+        for idx, td in enumerate(dialog_data[did]):
+            assert idx+1 == int(turn_list[idx][0].split('@')[-1].split('-')[1]), 'Turn ID clash @dialogue {}: {} expected vs. {} found'.format(did, idx+1, int(turn_list[idx][0].split('@')[-1].split('-')[1]))
+            if int(td[0].split('@')[-1].split('-')[1]) != idx+1:
+                d_sorted = True
+            if turn_list[idx][1] is None:
+                none_tsr_idx.append( (did, idx) )
+        if d_sorted:
+            n_sorted += 1
+        dialog_data[did] = turn_list
+    print('     * {} dialogues needed sorting.'.format(n_sorted))
+    sys.stdout.flush()
+
     if len(none_tsr_idx) > 0:
+        print(' *** Adding {} bogus turns'.format(len(none_tsr_idx)))
+        sys.stdout.flush()
+
         assert n_input_features != -1
         for did, idx in none_tsr_idx:
             #print('[DEBUG] getting tsr length from transcript {}'.format(dialog_data[did][idx][2]))
             #sys.stdout.flush()
-            trs_len = len(dialog_data[did][idx][2].split())
+            #trs_len = max( len(dialog_data[did][idx][2].split()), len(dialog_data[did][idx][3].split()) )
             #bogus_tsr = torch.zeros(trs_len, n_input_features)
-            dialog_data[did][idx][1] = torch.zeros(trs_len, n_input_features)
 
+            trs_len = len(dialog_data[did][idx][2].split()) # NOTE: * 4 assuming a Pyramidal encoder with 3 LSTM blocks (otherwise it doesn't matter). This should garantie correct CTC loss output values.
+            assert trs_len > 0
+            assert dialog_data[did][idx][1] is None
+            assert dialog_data[did][idx][0].split('-')[-1] == 'Machine'
+            dialog_data[did][idx][1] = torch.zeros(trs_len, n_input_features) 
+
+    # TMP DEBUG CHECK
+    n_none = 0
+    for did in dialog_data.keys():
+        for td in dialog_data[did]:
+            if td[1] is None:
+                n_none += 1
+    if n_none > 0:
+        print(' *** WARNING: found {} None input signals in read data'.format(n_none))
+        sys.stdout.flush()
     return dialog_data
 
 def get_character_level_slu_turn(args, slu_turn_tsr, vocab):
@@ -1039,61 +1112,38 @@ def get_character_level_slu_turn(args, slu_turn_tsr, vocab):
 
     return char_slu_turn_str
 
-def references2indexes(args, data, vocab, split):
+def references2indexes(args, data, vocab, split, roberta=None):
 
     for did in data.keys():
         for idx in range(len(data[did])):
             (turn_id, spg, txt_turn, slu_turn, spk_ID) = data[did][idx]
-            if (hasattr(args, 'freeze_dictionary') and args.freeze_dictionary) or (hasattr(args, 'freeze_train_dictionary') and args.freeze_train_dictionary and split != 'train'):
-                '''char_list = []
-                for c in txt_turn:
-                    idx = vocab.index(c)
-                    if idx == vocab.unk():
-                        print(' #### Adding to dictionary symbol {}'.format(c))
-                        sys.stdout.flush()
-                    char_list.append(idx)'''
-                char_list = [vocab.index(c) for c in txt_turn] if txt_turn is not None else []
-                token_list = [vocab.index(t) for t in txt_turn.split()] if txt_turn is not None else []
-                slu_list = [vocab.index(s) for s in slu_turn.split()]
+            if roberta is not None:
+                char_tsr = roberta.encode( ' '.join(list(txt_turn)) )
+                token_tsr = roberta.encode( txt_turn )
+                slu_tsr = roberta.encode( slu_turn )
             else:
-                '''char_list = []
-                for c in txt_turn:
-                    c_idx = vocab.index(c)
-                    if c_idx == vocab.unk():
-                        print(' #### (Char) Adding to dictionary symbol >{}<'.format(c))
-                        sys.stdout.flush()
-                    char_list.append(c_idx)'''
-                char_list = [vocab.add_symbol(c) for c in txt_turn] if txt_turn is not None else []
-                '''token_list = []
-                for t in txt_turn.split():
-                    t_idx = vocab.index(t)
-                    if t_idx == vocab.unk():
-                        print(' #### (Token) Adding to dictionary symbol >{}<'.format(t))
-                        sys.stdout.flush()
-                    token_list.append(t_idx)'''
-                token_list = [vocab.add_symbol(t) for t in txt_turn.split()] if txt_turn is not None else []
-                '''slu_list = []
-                for s in slu_turn.split():
-                    s_idx = vocab.index(s)
-                    if s_idx == vocab.unk():
-                        print(' #### (SLU) Adding to dictionary symbol >{}<'.format(s))
-                        sys.stdout.flush()
-                    slu_list.append(s_idx)'''
-                slu_list = [vocab.add_symbol(s) for s in slu_turn.split()]
+                if (hasattr(args, 'freeze_dictionary') and args.freeze_dictionary) or (hasattr(args, 'freeze_train_dictionary') and args.freeze_train_dictionary and split != 'train'):
+                    char_list = [vocab.index(c) for c in txt_turn] if txt_turn is not None else []
+                    token_list = [vocab.index(t) for t in txt_turn.split()] if txt_turn is not None else []
+                    slu_list = [vocab.index(s) for s in slu_turn.split()]
+                else: 
+                    char_list = [vocab.add_symbol(c) for c in txt_turn] if txt_turn is not None else [] 
+                    token_list = [vocab.add_symbol(t) for t in txt_turn.split()] if txt_turn is not None else [] 
+                    slu_list = [vocab.add_symbol(s) for s in slu_turn.split()]
 
-            if args.padded_reference:
-                char_list = [vocab.bos()] + char_list + [vocab.eos()]
-                token_list = [vocab.bos()] + token_list + [vocab.eos()]
-                slu_list = [vocab.bos()] + slu_list + [vocab.eos()]
+                if args.padded_reference:
+                    char_list = [vocab.bos()] + char_list + [vocab.eos()]
+                    token_list = [vocab.bos()] + token_list + [vocab.eos()]
+                    slu_list = [vocab.bos()] + slu_list + [vocab.eos()]
 
-            char_tsr = torch.LongTensor( char_list )
-            token_tsr = torch.LongTensor( token_list )
-            slu_tsr = torch.LongTensor( slu_list )
+                char_tsr = torch.LongTensor( char_list )
+                token_tsr = torch.LongTensor( token_list )
+                slu_tsr = torch.LongTensor( slu_list )
 
             data[did][idx] = (turn_id, spg, char_tsr, token_tsr, slu_tsr, spk_ID)
 
 
-def feature_wise_mean_std(data):
+def feature_wise_mean_std(data, skip_all_zeros=False, sample_threshold=0.0):
     (sequence_length, num_features) = list(data.values())[0][0][1].size()
     data_mu = torch.zeros( num_features )
     data_sigma = torch.zeros( num_features )
@@ -1101,17 +1151,25 @@ def feature_wise_mean_std(data):
     with torch.no_grad():
         total_features = 0
         for dialog_id in data.keys():
-            for t in data[dialog_id]:
-                if t[1] is not None:
-                    data_mu = data_mu + torch.sum( t[1], 0 )
-                    total_features += t[1].size(0)
+            randn = torch.rand(1).item()
+
+            if randn > sample_threshold:
+                for t in data[dialog_id]:
+                    if t[1] is not None:
+                        if not skip_all_zeros or torch.sum( t[1] ) != 0.0:
+                            data_mu = data_mu + torch.sum( t[1], 0 )
+                            total_features += t[1].size(0)
         data_mu = data_mu / float( total_features ) if total_features != 0 else 0.0
 
         for dialog_id in data.keys():
-            for t in data[dialog_id]:
-                if t[1] is not None:
-                    data_sigma = data_sigma + torch.sum( (t[1] - data_mu)**2, 0 )
-        data_sigma = torch.sqrt( data_sigma / float(total_features-1) ) if total_features != 0 else 0
+            randn = torch.rand(1).item()
+
+            if randn > sample_threshold:
+                for t in data[dialog_id]:
+                    if t[1] is not None:
+                        if not skip_all_zeros or torch.sum( t[1] ) != 0.0:
+                            data_sigma = data_sigma + torch.sum( (t[1] - data_mu)**2, 0 )
+        data_sigma = torch.sqrt( data_sigma / float(total_features-1) ) if total_features != 0 else 1.0
 
     return (data_mu, data_sigma)
 
@@ -1146,13 +1204,13 @@ class End2EndSLU(FairseqTask):
                             help='When performing transfer learning, uses this dictionary as source domain dictionary')
         parser.add_argument('--target-dictionary', type=str,
                             help='When performing transfer learning, uses this dictionary as target domain dictionary')
-        parser.add_argument('--max-source-positions', default=10000, type=int,
+        parser.add_argument('--max-source-positions', default=15000000, type=int,
                             help='max input length')
         parser.add_argument('--max-target-positions', default=1600, type=int,
                             help='max input length')
         parser.add_argument('--slu-subtask', default='char', type=str,
                             help='which subtask has to be modeled (e.g. char, token, concept)')
-        parser.add_argument('--user-only', action='store_true',
+        parser.add_argument('--user-only', action='store_true', default=False,
                             help='use only user turns (specific to SLU for dialog systems, and to the corpus MEDIA in particular)')
         parser.add_argument("--padded-reference", action='store_true', default=False,
                             help="Specify if the gold reference is padded")
@@ -1174,6 +1232,7 @@ class End2EndSLU(FairseqTask):
                             help='Use transformer encoder layers on top of the convolution+recurrent encoder')
         parser.add_argument('--corpus-name', type=str, default='media',
                             help='Specify the corpus name to customize the data reading. 1) media (default), 2) fsc (fluent speech commands)')
+        parser.add_argument('--slu-turn-format', type=str, default='media', help='Format of the slu turn read from .sem files')
         parser.add_argument( '--load-encoder', type=str, help='Load a pre-trained (basic) encoder' )
         parser.add_argument( '--load-fairseq-encoder', type=str, help='Load the encoder from a fairseq checkpoint' )
         parser.add_argument( '--load-fairseq-decoder', type=str, help='Load the decoder from a fairseq checkpoint' )
@@ -1190,6 +1249,7 @@ class End2EndSLU(FairseqTask):
         parser.add_argument('--max-padding-ratio', type=float, default=7.0, help='Factor by which input sequences shorter than max-padding-len are stretched to avoid input/output length missmatch')
         parser.add_argument('--padding-active', action='store_true', default=False, help='Determine if padding should be done or not')
         parser.add_argument('--unfreeze-encoder-at-cer', type=float, default=110.00, help='Unfreeze encoder parameters for training when the dev CER goes below the specified value')
+        parser.add_argument('--attention-type', type=str, default='std', help='Attention type to use: standard (std, default), mha2 (multi-head attention with 2 heads), mha4 (multi-head attention with 4 heads)')
         parser.add_argument('--dialog-level-slu', action='store_true', default=False, help='Re-arrange turns and dialogues to perform dialog-level SLU')
         parser.add_argument('--normalize-dialog-batches', action='store_true', default=False, help='Rearrange dialogues so that to have all batches of the same size')
         parser.add_argument('--parse-rich-semantic', action='store_true', default=False, help='Use enriched/annotated semantic sequences instead of the standard .sem annotation files')
@@ -1197,14 +1257,34 @@ class End2EndSLU(FairseqTask):
         parser.add_argument('--use-dialog-history', action='store_true', default=False, help='If set to True, the model will exploit dialog history')
         parser.add_argument('--context-discount', type=float, default=1.0, help='Context discount when using "sum" as context fusion method')
         parser.add_argument('--context-fusion', type=str, default='gating', help='Method for integrating the context information: sum (default), gating')
+        parser.add_argument('--trs-fusion', action='store_true', default=False, help='If True, use a gate for speech and transcription fusion, otherwise it uses a simple sum')
         parser.add_argument('--context-size', type=int, default=8, help='Number of turns used as context')
         parser.add_argument('--context-first-turns', type=int, default=6, help='Number of turns used in the context and taken at the beginning of the dialog, the remainder are the last previous turns')
         parser.add_argument('--speech-encoder', type=str, default='ziggurat', help='Structure of speech encoder: ziggurat (NeurIPS 2021 paper), deep-speech (ICASSP 2020 paper)')
+        parser.add_argument('--se-size', type=int, default=1024, help='Specifies the size of features extracted with the speech-encoder when using a speechbrain wav2vec2 model')
         parser.add_argument('--model-beam', type=int, default=1, help='At generation phase and when using dialog context, tells to the model the beam size so that the model can manage correctly the dialog history (generate.py does not seem to add the beam argument to the namespace)')
         parser.add_argument('--print-history-attn-weights', action='store_true', default=False, help='Print dialog history attention weights of the current decoded sequence, along with current target and history turn tokens')
         parser.add_argument('--label-dictionary', type=str, help='Load a task specific label dictionary, e.g. to perform discounting on non-label tokens in the decoder')
         parser.add_argument('--non-label-discounting', type=float, default=1.0, help='Discounting factor for non-label tokens in the decoder')
         parser.add_argument('--use-transcription-as-input', action='store_true', default=False, help='Use transcription of input signal as input if it is available, in addition to audio signal if it is available')
+        parser.add_argument('--use-source-context', action='store_true', default=False, help='Use the source-side context. This option must be used together with options for dialog-level SLU.')
+        parser.add_argument('--roberta-model', type=str, help='Specify an absolute path to a Roberta model used to encode transcriptions')
+        parser.add_argument('--asr-slu-loss', action='store_true', default=False, help='Optimize the model with respect to both ASR (encoder) and SLU (decoder). Transcription must be provided!')
+        parser.add_argument('--dec-loss', type=str, default='ctc', help='Specifies the loss for the decoder: ctc (default), nllloss (cross entropy)')
+        parser.add_argument('--online-feature-extraction', action='store_true', default=False, help='Perform feature extraction online for each wav')
+        parser.add_argument('--feature-extractor', type=str, help='Feature extractor (e.g. Wav2Vec model) for online feature extraction')
+        parser.add_argument('--fe-size', type=str, default='small', help='Argument for feature extractor (e.g. for whisper it can be "small", "medium", or "large")')
+        parser.add_argument('--upsample', action='store_true', default=False, help='Upsample signals when performing online feature extraction')
+        parser.add_argument('--freeze-fe', action='store_true', default=False, help='If set to True freeze the speech-encoder when using a speechbrain wav2vec2 model')
+        parser.add_argument('--sb-model-path', type=str, help='Path to the directory (hub) containing the speechbrain wav2vec2 model')
+        parser.add_argument('--softmax-temperature', type=float, default=1.0, help="Use the specified temperature when computing the output (log-)probabilities with the SLU CTC loss")
+        parser.add_argument('--softmax-start-temperature', type=float, default=1.0, help='Starting softmax temperature when rising temperature with linear strategy')
+        parser.add_argument('--rise-temperature-at-epoch', type=int, default=1, help='Rise softmax temperature at the specified epoch')
+        parser.add_argument('--rise-temperature-strategy', type=str, default='fix', help='Choose the strategy used to rise softmax temperature: fix (default), linear (increase the temperature linearly starting from the specified epoch up to the specified temperature)')
+        parser.add_argument('--model-start-point', type=str, help='Load a pretrained model from the specified file')
+        parser.add_argument('--decoder-norm-layers', action='store_true', default=False, help='If set, apply normalisation layers in the decoder')
+
+        parser.add_argument('--load-dstc-ex-data', type=str, help='Ad-hoc argument to load the extra 100xtraining data for the DSTC challenge')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -1212,31 +1292,6 @@ class End2EndSLU(FairseqTask):
         # Here we can perform any setup required for the task. This may include
         # loading Dictionaries, initializing shared Embedding layers, etc.
         # In this case we'll just initialize the label dictionary
-        
-        #label_vocab = SLUDictionary(
-        #    pad=pad_token,
-        #    eos=EOS_tag,
-        #    unk=unk_token,
-        #    bos=SOS_tag,
-        #    extra_special_symbols=[blank_token, machine_semantic, slu_start_concept_mark, slu_end_concept_mark, tok_separator, 'ã', EOD_tag]
-        #)
-        # NOTE: we are ogliged to initialize the Dictionary as it is requested in Fairseq,
-        #       but then we reset it and re-add symbols so that to have index 0 for the blank token, as needed by the CTC loss.
-        #       (Added later: the index of the blank token to be passed to the CTC loss can be actually customized)
-        #label_vocab.reset() 
-        #label_vocab.set_blank(blank_token)
-        #label_vocab.set_pad_(pad_token)
-        #label_vocab.set_eos_(EOS_tag)
-        #label_vocab.set_unk_(unk_token)
-        #label_vocab.set_bos_(SOS_tag)
- 
-        #label_vocab.add_symbol(machine_semantic)
-        #label_vocab.add_symbol(slu_start_concept_mark)
-        #label_vocab.add_symbol(slu_end_concept_mark)
-        #label_vocab.add_symbol(tok_separator)
-        #label_vocab.add_symbol('ã')
-        #label_vocab.add_symbol( EOD_tag )
-        #label_vocab.set_nspecial_()  # We set the tokens added so far as being special tokens.
 
         label_vocab = init_slu_dictionary(args)
         if args.load_dictionary:
@@ -1253,6 +1308,7 @@ class End2EndSLU(FairseqTask):
         
         super().__init__(args)
 
+        self.tmp_corpus = {}
         self.spk_abs_val = 1.0
         self.num_speakers = 2
         if args.dialog_level_slu:
@@ -1275,16 +1331,43 @@ class End2EndSLU(FairseqTask):
         self.sos_tag_idx = label_vocab.index( SOS_tag )
         self.eos_tag_idx = label_vocab.index( EOS_tag )
         self.slu_start_concept_idx = label_vocab.index( slu_start_concept_mark )
-        self.slu_end_concept_idx = label_vocab.index( slu_end_concept_mark )
+        self.slu_end_concept_idx = label_vocab.index( slu_end_concept_mark ) 
 
-        '''print(' ***** End2EndSLU task initialization...')
-        print(' *** SLU task: blank-idx {}'.format(self.blank_idx))
-        print(' *** SLU task: sos_tag_idx {}'.format(self.sos_tag_idx))
-        print(' *** SLU task: eos_tag_idx {}'.format(self.eos_tag_idx))
-        print(' *** SLU task: slu_start_concept_idx {}'.format(self.slu_start_concept_idx))
-        print(' *** SLU task: slu_end_concept_idx {}'.format(self.slu_end_concept_idx))
-        print(' *** SLU task: pad index {}'.format(self.label_vocab.index(pad_token)))
-        sys.stdout.flush()'''
+        if self.args.roberta_model:
+            print(' * End2EndSLU, loading RoBERTa model from: {}'.format(self.args.roberta_model))
+            sys.stdout.flush()
+
+            if 'camembert' in self.args.roberta_model:
+                self.roberta = CamembertModel.from_pretrained( self.args.roberta_model ) 
+            else:
+                tokens = self.args.roberta_model.split('/')
+                mpath = '/'.join(tokens[:-1]) + '/'
+                mmodel = tokens[-1]
+                self.roberta = RobertaModel.from_pretrained(mpath, checkpoint_file=mmodel)
+            self.roberta = self.roberta.eval()
+            for param in self.roberta.parameters():
+                param.requires_grad = False
+ 
+            #self.blank_idx = self.get_roberta_token_index(blank_token)
+        else:
+            self.roberta = None
+
+        if self.args.model_start_point:
+            print(' * End2EndSLU, loading model starting point from {}'.format(self.args.model_start_point))
+            sys.stdout.flush()
+
+            self.model_start_point = torch.load(self.args.model_start_point)
+
+        if self.args.online_feature_extraction:
+            if self.args.feature_extractor == 'whisper':
+                self.fe = whisper.load_model( self.args.fe_size )
+            else:
+                raise NotImplementedError()
+        else:
+            self.fe = None
+
+        if self.args.speech_encoder == 'sb-wav2vec2':
+            self.args.feature_extension = '.wav'
 
         # Scheduled sampling state and needed values
         self.criterion = args.criterion
@@ -1371,6 +1454,7 @@ class End2EndSLU(FairseqTask):
     def begin_epoch(self, epoch, model):
         """Hook function called before the start of each epoch."""
 
+        model.set_curr_epoch( epoch )
         if self.tracker_epoch == -1:
             print('[DEBUG] CO2 emission tracker epoch started')
             sys.stdout.flush()
@@ -1468,7 +1552,13 @@ class End2EndSLU(FairseqTask):
         #num_speakers = 2
         channel_per_speaker = 2
         #spk_abs_val = 1.0
-        (src_len, dim) = feats.size()
+
+        dims = feats.size()
+        if len(dims) > 1:
+            (src_len, dim) = feats.size()
+        else:
+            return feats
+
         #eod_mark = torch.sum( feats == EOD_value ).item()
         if _ADVANCED_SPK_MARK_:
             speaker_mark = torch.zeros(src_len, channel_per_speaker*self.num_speakers).to(feats)
@@ -1515,7 +1605,7 @@ class End2EndSLU(FairseqTask):
             comp_t_idx = 3
         elif self.args.slu_subtask == 'concept':
             comp_t_idx = 4 
-        in_red_factor = (self.args.num_lstm_layers-1)*2 if hasattr(self.args, 'num_lstm_layers') else 2
+        in_red_factor = (self.args.num_lstm_layers-1)*2 if hasattr(self.args, 'num_lstm_layers') else 4 
 
         # 1. First scan, detect sequences shorter than the expected output, once reduced by the LSTM pyramidal architecture
         for did in corpus[split]:
@@ -1541,11 +1631,11 @@ class End2EndSLU(FairseqTask):
                     corpus[split][did][t_idx] = turn_tuple
                 else:
                     if t[comp_t_idx].size(0) > max_turn_length:
-                        max_turn_length = t[comp_t_idx].size(0)
+                        max_turn_length = t[comp_t_idx].size(0) 
 
                     if not all_zeros(t[1]) and t[1].size(0)//in_red_factor < t[comp_t_idx].size(0):
                         length_missmatch += 1
-                        missmatches.append( (t[1].size(0)//in_red_factor, t[comp_t_idx].size(0)) )
+                        missmatches.append( (t[1].size(0)//in_red_factor, t[comp_t_idx].size(0)) ) 
 
         if split == 'train': # Ignore input/output length missmatch statistics if this is the test set
             max_len = 0
@@ -1558,12 +1648,7 @@ class End2EndSLU(FairseqTask):
             if max_len > self.args.max_padding_len:
                 self.args.max_padding_len = max_len
             if max_ratio > self.args.max_padding_ratio:
-                self.args.max_padding_ratio = max_ratio
-
-        '''if split == 'train' and len(missmatches) > 0:
-            print(' * End2EndSLU: padding sequences shorter than {}, stretching by a factor {}'.format(self.args.max_padding_len, self.args.max_padding_ratio))
-            sys.stdout.flush()
-            self.args.padding_active = True'''
+                self.args.max_padding_ratio = max_ratio 
 
         # 2. Second scan, pad short input sequences.
         padded_sequences = 0
@@ -1597,6 +1682,8 @@ class End2EndSLU(FairseqTask):
 
     def create_batches_as_dialogs(self, data, batch_info, batch_sizes, split, slu_mode_info):
 
+        ids = []
+        speakers = []
         ratios = []
         sources = []
         src_lengths = []
@@ -1605,7 +1692,7 @@ class End2EndSLU(FairseqTask):
         global_turn_idx = 0
         idx_batches = []
 
-        if slu_mode_info['use_transcription']:
+        if slu_mode_info['use_transcription'] or slu_mode_info['asr_slu_loss']:
             assert self.args.slu_subtask == 'concept', 'transcriptions are allowed as additional input only for SLU'
 
         for did in data.keys():
@@ -1614,15 +1701,17 @@ class End2EndSLU(FairseqTask):
             for tid in range( len(data[did]) ):
 
                 turn = data[did][tid]
+                ids.append(turn[0])
+                speakers.append(turn[-1])
                 feats = turn[1]
                 if feats is not None:
                     feats = self.add_speaker_marker(feats, turn[-1])
-                if slu_mode_info['use_transcription']:
+                if slu_mode_info['use_transcription'] or slu_mode_info['asr_slu_loss']:
                     sources.append( (feats, turn[3]) )
                 else:
                     sources.append( feats )
                 sig_len = feats.size(0) if feats is not None else 0
-                if slu_mode_info['use_transcription']:
+                if slu_mode_info['use_transcription'] or slu_mode_info['asr_slu_loss']:
                     src_lengths.append( (sig_len, turn[3].size(0)) )
                 else:
                     src_lengths.append( sig_len )
@@ -1652,11 +1741,13 @@ class End2EndSLU(FairseqTask):
                     raise NotImplementedError
 
             idx_batches.append( batched_turns_idx )
-        return idx_batches, (sources, src_lengths, targets, tgt_lengths), (ratios, global_turn_idx)
+        return idx_batches, (ids, speakers, sources, src_lengths, targets, tgt_lengths), (ratios, global_turn_idx)
 
     def rearrange_dialog_batches(self, data, batch_info, batch_sizes, split, slu_mode_info):
 
         ratios = []
+        ids = []
+        speakers = []
         sources = []
         src_lengths = []
         targets = []
@@ -1664,7 +1755,7 @@ class End2EndSLU(FairseqTask):
         global_turn_idx = 0
         idx_batches = []
 
-        if slu_mode_info['use_transcription']:
+        if slu_mode_info['use_transcription'] or slu_mode_info['asr_slu_loss']:
             assert self.args.slu_subtask == 'concept', 'Transcriptions are allowed as additional input only for SLU'
 
         #num_zeros = []
@@ -1682,21 +1773,24 @@ class End2EndSLU(FairseqTask):
             #sys.stdout.flush()
             for (did, idx) in batch:
                 turn = data[did][idx]
-                if (split == 'train') or (turn[-1] == user_ID) or slu_mode_info['dialog_level_slu']:
+                #if (split == 'train') or (turn[-1] == user_ID) or slu_mode_info['dialog_level_slu'] or self.args.corpus_name != 'media':
+                if not self.args.user_only or (self.args.user_only and turn[-1] == user_ID) or slu_mode_info['dialog_level_slu']:
                     #if turn[-1] == user_ID:
                     # if (not self.args.user_only and (split == 'train' or turn[-1] == user_ID)) or (self.args.user_only and turn[-1] == user_ID)
+                    ids.append(turn[0])
+                    speakers.append(turn[-1])
                     feats = turn[1]
                     if feats is not None:
                         feats = self.add_speaker_marker(feats, turn[-1])
                     #tmp = int((feats == 0.0).sum())
                     #if tmp > 0:
                     #    num_zeros.append( tmp )
-                    if slu_mode_info['use_transcription']:
+                    if slu_mode_info['use_transcription'] or slu_mode_info['asr_slu_loss']:
                         sources.append( (feats, turn[3]) )
                     else:
                         sources.append( feats )
                     sig_len = feats.size(0) if feats is not None else 0
-                    if slu_mode_info['use_transcription']:
+                    if slu_mode_info['use_transcription'] or slu_mode_info['asr_slu_loss']:
                         src_lengths.append( (sig_len, turn[3].size(0)) )
                     else:
                         src_lengths.append( sig_len )
@@ -1762,7 +1856,105 @@ class End2EndSLU(FairseqTask):
             else:
                 idx_batches.append( batched_turns_idx )
 
-        return idx_batches, (sources, src_lengths, targets, tgt_lengths), (ratios, global_turn_idx)
+        return idx_batches, (ids, speakers, sources, src_lengths, targets, tgt_lengths), (ratios, global_turn_idx)
+
+    def _tmp_count_corpus_split(self, data):
+
+        n_turns = 0
+        n_tgt_tokens = 0
+        for did in data.keys():
+            n_turns += len(data[did])
+            for tt in data[did]:
+                n_tgt_tokens += tt[4].size(0)
+
+        print('[TMP DEBUG] _tmp_count_corpus_split: {} turns, {} tokens'.format(n_turns, n_tgt_tokens))
+        sys.stdout.flush()
+
+    def get_roberta_token_index(self, token):
+
+        assert self.roberta is not None
+        tt = self.roberta.encode(token)
+        assert tt.size(0) == 3 and tt[0].item() == self.roberta.task.source_dictionary.bos() and tt[-1].item() == self.roberta.task.source_dictionary.eos()
+        return tt[1].item()
+
+    def load_dstc_extra_data(self, data_file, original_data, vocab):
+
+        # Format example:
+        # line_nr: 1 dialog_id: 0-tpa-sng01856.json turn_id: 3 text: user: no i just need to make sure it's cheap and i need parking state: hotel-parking=yes; hotel-pricerange=cheap; hotel-type=hotel
+
+        dialog_data = turn_transcripts_and_sem(data_file, mode='train', save_turns=False)
+
+        first_key = list(dialog_data.keys())[0]
+        print('[DEBUG] read {} extra dialogs'.format(len(dialog_data)))
+        #print('[DEBUG] first dialog data (key: {}):'.format( first_key ))
+        #print(dialog_data[first_key])
+        print('[DEBUG] -----')
+        sys.stdout.flush()
+
+        ok = list(original_data.keys())[0]
+        num_features = original_data[ok][0][1].size(1)
+
+        extra_data = {}
+        for did in dialog_data.keys():
+
+            if did in original_data:
+                raise ValueError('DID {} is already defined (and should not!)'.format(did))
+            orig_did = did.split('-')[-1]
+            assert orig_did in original_data
+
+            #orig_tidxs = [int(original_data[orig_did][i][0].split('@')[-1].split('-')[1]) for i in range(len(original_data[orig_did]))]
+            #original_data[orig_did] = sorted(original_data[orig_did], key=lambda list: int(list[0].split('@')[-1].split('-')[1]))
+            #print('[DEBUG] ********************')
+            #print('[DEBUG] Comparing dialogues {} (lengths: original {} vs. extra-data {})'.format(orig_did, len(original_data[orig_did]), len(dialog_data[did])))
+            #print('[DEBUG]  * original data tid sequence: {}'.format([original_data[orig_did][i][0].split('@')[-1].split('-')[1] for i in range(len(original_data[orig_did]))]))
+            #print('[DEBUG] -----')
+            #print('[DEBUG]  * extra data tid sequence: {}'.format([td['turn_id'] for td in dialog_data[did]]))
+            #print('[DEBUG] -----')
+            #sys.stdout.flush()
+
+            turn_list = []
+            are_identical = True
+            for tidx, td in enumerate(dialog_data[did]):
+
+                orig_tidx = original_data[orig_did][tidx][0].split('@')[-1].split('-')[1]
+                assert int(orig_tidx) == tidx+1, 'Turn ID missmatch, original {} vs. extra-data {} @ {}'.format(orig_tidx, tidx+1, did)
+                spk = 'User' if td['spk'] == 'user:' else 'Machine'
+                TID = did.strip() + '@Turn-' + str(td['turn_id']).strip() + '-' + spk
+                sem = clean_sem( td['sem'] )
+                if original_data[orig_did][tidx][3] == sem:
+                    spg = original_data[orig_did][tidx][1]
+                    if spg is None:
+                        print(' *** WARNING: detected None input signal coming from original data @{}'.format(TID))
+                        sys.stdout.flush()
+                else:
+                    #spg_len = len(sem.split()) * 4 + 1
+                    spg = torch.zeros(4, num_features)
+                assert spg is not None, 'Found None input signal @{}'.format(TID)
+
+                #print('[DEBUG] *****')
+                #print('[DEBUG] original {} vs. extra-data {} turn {} comparison'.format(orig_did, did, tidx))
+                #print('[DEBUG]    * ID: {} vs. {}'.format(original_data[orig_did][tidx][0], TID))
+                #print('[DEBUG]    * Txt: {} vs. {}'.format(original_data[orig_did][tidx][2], td['txt']))
+                #print('[DEBUG]    * Sem >!{}!<: {} vs. {}'.format('MATCH' if original_data[orig_did][tidx][3] == sem else 'MISSMATCH', original_data[orig_did][tidx][3], sem))
+                #print('[DEBUG]    * Spk: {} vs. {}'.format(original_data[orig_did][tidx][4], spk))
+                #print('[DEBUG]')
+                #print('[DEBUG] --------------------')
+                #sys.stdout.flush()
+
+                #if did not in original_data:
+                #    original_data[did] = []
+                #original_data[did].append( [TID, spg, td['txt'], sem, td['spk']] )
+                are_identical = are_identical and (original_data[orig_did][tidx][2].strip() == td['txt'].strip())
+                turn_list.append( [TID, spg, td['txt'], sem, spk] )
+            if not are_identical and len(turn_list) > 0:
+                extra_data[did] = turn_list
+            elif len(turn_list) == 0:
+                raise ValueError('Dailogue {} looks empty'.format(did))
+            else:
+                print(' *** dialogue {} in DSTC extra data is redundant, skipping...'.format(did))
+                sys.stdout.flush()
+
+        return extra_data
 
     def load_dataset(self, split, **kwargs):
     
@@ -1773,69 +1965,106 @@ class End2EndSLU(FairseqTask):
         if my_split == 'valid':
             my_split = 'dev'    # For compatibility with the old End2End SLU system (ICASSP 2020) 
 
-        if os.path.exists(self.args.serialized_data + '.' + my_split) and os.path.isfile(self.args.serialized_data + '.' + my_split): 
+        if (not self.args.load_dstc_ex_data or split != 'train') and os.path.exists(self.args.serialized_data + '.' + my_split) and os.path.isfile(self.args.serialized_data + '.' + my_split): 
 
             print(' - Loading serialized {} split...'.format(my_split))
             sys.stdout.flush()
 
             corpus[my_split] = torch.load(self.args.serialized_data + '.' + my_split)
-
-            '''if task.args.target_dictionary:
-                        tgt_dict = torch.load(task.args.target_dictionary)
-                        for sym in tgt_dict.symbols:
-                            tgt_idx = self.dict.index(sym)
-                            if sym != unk_token and tgt_idx == self.dict.unk():'''
-
-            '''if self.args.load_dictionary and my_split == 'dev':
-                tgt_dict = torch.load(self.args.target_dictionary)
-                new_symbols = 0
-                for sym in tgt_dict.symbols:
-                    tgt_idx = self.label_vocab.index(sym)
-                    if tgt_idx == self.label_vocab.unk() and sym != unk_token:
-                        print(' * End2EndSLU, adding token {} to the dictionary'.format(sym))
-                        sys.stdout.flush()
-
-                        new_symbols += 1
-                        self.label_vocab.add_symbol(sym)
-
-                if new_symbols > 0:
-                    torch.save(self.label_vocab, self.args.load_dictionary)
-                else:
-                    print(' * End2EndSLU, no new symbol added to the dictionary')
-                    sys.stdout.flush()
-                corpus['dictionary'] = self.label_vocab
-
-                print(' * End2EndSLU, new dictionary size: {}'.format(len(self.label_vocab)))
-                sys.stdout.flush()'''
         else:
             print(' - Reading dialog data')
-            print('   - reading train data...')
-            sys.stdout.flush()
-            train_data = read_dialog_data( self.args.data + '/train_prefixes.lst', self.args )
+            print('   * NOTE: reading SLU turn in {} format'.format(self.args.slu_turn_format))
 
-            print('   - read {} train dialogues'.format(len(train_data)))
-            print('   - reading dev data...')
-            sys.stdout.flush()
-            dev_data = read_dialog_data( self.args.data + '/dev_prefixes.lst', self.args )
+            extra_data = None
+            if 'train' not in self.tmp_corpus:
+                print('   - reading train data...')
+                sys.stdout.flush()
+                train_data = read_dialog_data( self.args.data + '/train_prefixes.lst', self.args )
+                print('   - read {} train dialogues'.format(len(train_data)))
 
-            print('   - read {} dev dialogues'.format(len(dev_data)))
-            print('   - reading test data...')
-            sys.stdout.flush()
-            test_data = read_dialog_data( self.args.data + '/test_prefixes.lst', self.args )
+                if self.args.load_dstc_ex_data:
+                    print('    * reading DSTC extra data...')
+                    sys.stdout.flush()
 
-            print('   - read {} test dialogs'.format(len(test_data)))
-            print(' - Normalizing input data...' )
-            sys.stdout.flush()
-            (train_mu, train_sigma) = feature_wise_mean_std( train_data )
-            normalize_data_only(train_data, train_mu, train_sigma)
-            normalize_data_only(dev_data, train_mu, train_sigma)
-            normalize_data_only(test_data, train_mu, train_sigma)
+                    extra_data = self.load_dstc_extra_data( self.args.load_dstc_ex_data, train_data, self.label_vocab )
+                self.tmp_corpus['train'] = train_data
+            else:
+                train_data = self.tmp_corpus['train']
+
+            if 'valid' not in self.tmp_corpus:
+                print('   - reading dev data...')
+                sys.stdout.flush()
+                dev_data = read_dialog_data( self.args.data + '/dev_prefixes.lst', self.args )
+                self.tmp_corpus['valid'] = dev_data
+                print('   - read {} dev dialogues'.format(len(dev_data)))
+            else:
+                dev_data = self.tmp_corpus['valid']
+
+            if 'test' not in self.tmp_corpus:
+                print('   - reading test data...')
+                sys.stdout.flush()
+                test_data = read_dialog_data( self.args.data + '/test_prefixes.lst', self.args )
+                self.tmp_corpus['test'] = test_data
+                print('   - read {} test dialogs'.format(len(test_data)))
+            else:
+                test_data = self.tmp_corpus['test']
+
+            preprocess_data = False
+            if not self.args.online_feature_extraction and self.args.speech_encoder != 'sb-wav2vec2':
+                print(' - Normalizing input data...' )
+                sys.stdout.flush() 
+                if not self.args.load_dstc_ex_data and 'norm_var' not in self.tmp_corpus:
+                    print('  - computing mean and std of training data...')
+                    sys.stdout.flush()
+
+                    threshold=0.0
+                    #if self.args.load_dstc_ex_data:
+                    #    threshold = 0.9
+                    (train_mu, train_sigma) = feature_wise_mean_std( train_data, sample_threshold=threshold )
+                    self.tmp_corpus['norm_var'] = (train_mu, train_sigma)
+                    preprocess_data = True
+
+                    print('   * mean: max={}, min={}, mean={}'.format(torch.max(train_mu), torch.min(train_mu), torch.mean(train_mu)))
+                    print('   * std : max={}, min={}, mean={}'.format(torch.max(train_sigma), torch.min(train_sigma), torch.mean(train_sigma)))
+                    sys.stdout.flush()
+                elif 'norm_var' in self.tmp_corpus:
+                    (train_mu, train_sigma) = self.tmp_corpus['norm_var']
+
+                if preprocess_data:
+                    print('  - z-scaling data feature-wise...')
+                    sys.stdout.flush()
+
+                    normalize_data_only(train_data, train_mu, train_sigma)
+                    print('    * train done.')
+                    sys.stdout.flush()
+                    if extra_data is not None:
+                        normalize_data_only(extra_data, train_mu, train_sigma)
+                        # NOTE: merges train_data and extra_data
+                        for did in extra_data.keys():
+                            assert did not in train_data
+                            train_data[did] = extra_data[did]
+                        print('     * extra data done.')
+                        sys.stdout.flush()
+
+                    normalize_data_only(dev_data, train_mu, train_sigma)
+                    print('    * dev done.')
+                    sys.stdout.flush()
+
+                    normalize_data_only(test_data, train_mu, train_sigma)
+                    print('    * test done.')
+                    sys.stdout.flush()
+
+            if 'norm_var' not in self.tmp_corpus and extra_data is not None:
+                for did in extra_data.keys():
+                    assert did not in train_data
+                    train_data[did] = extra_data[did]
 
             print(' - Mapping tokens to indexes...')
             sys.stdout.flush()
-            references2indexes(self.args, train_data, self.label_vocab, 'train')
-            references2indexes(self.args, dev_data, self.label_vocab, 'dev')
-            references2indexes(self.args, test_data, self.label_vocab, 'test')
+            if preprocess_data or 'norm_var' not in self.tmp_corpus:
+                references2indexes(self.args, train_data, self.label_vocab, 'train', roberta=None) 
+                references2indexes(self.args, dev_data, self.label_vocab, 'dev', roberta=None)
+                references2indexes(self.args, test_data, self.label_vocab, 'test', roberta=None)
             print('   - Dictionary size: {}'.format(len(self.label_vocab)))
             sys.stdout.flush()
 
@@ -1847,7 +2076,12 @@ class End2EndSLU(FairseqTask):
 
             print(' - Saving serialized corpus...')
             sys.stdout.flush()
-            torch.save(train_data, self.args.serialized_data + '.train' )
+            if not self.args.load_dstc_ex_data:
+                torch.save(train_data, self.args.serialized_data + '.train' )
+            else:
+                print('   * Loaded extra DSTC data, skipping train data serialization (too big!)')
+                sys.stdout.flush()
+
             torch.save(dev_data, self.args.serialized_data + '.dev' )
             torch.save(test_data, self.args.serialized_data + '.test' )
             if self.args.load_dictionary:
@@ -1866,14 +2100,16 @@ class End2EndSLU(FairseqTask):
 
         if my_split == 'train' and 'test' in corpus:
             corpus['test'] = None
-        self.blank_idx = self.label_vocab.blank()
-        self.sos_tag_idx = self.label_vocab.index( SOS_tag )
-        self.eos_tag_idx = self.label_vocab.index( EOS_tag )
-        self.slu_start_concept_idx = self.label_vocab.index( slu_start_concept_mark )
-        self.slu_end_concept_idx = self.label_vocab.index( slu_end_concept_mark )
+        if 'train' in self.tmp_corpus:
+            self.tmp_corpus['test'] = None
+        assert self.blank_idx == self.label_vocab.blank() or self.blank_idx == self.get_roberta_token_index(blank_token)
+        assert self.sos_tag_idx == self.label_vocab.index( SOS_tag )
+        assert self.eos_tag_idx == self.label_vocab.index( EOS_tag )
+        assert self.slu_start_concept_idx == self.label_vocab.index( slu_start_concept_mark )
+        assert self.slu_end_concept_idx == self.label_vocab.index( slu_end_concept_mark )
 
         # data for each turn are: turn-id, signal-tensor, char-sequence (int) tensor, token-sequence (int) tensor, concept-sequence (int) tensor, speaker-id (machine or user)
-        # data are organized as a dict of lists: the dict is indexed with dialog-id, the value is the list of turns for that dialog, each turn structure contains data described above.
+        # data are organized as a dict of lists: the dict is indexed with dialog-id, the value is the list of turns for that dialog, each turn structure contains data described above.  
 
         #debug_idx = 0
         #if hasattr(self.args, 'num_lstm_layers'):
@@ -1884,7 +2120,7 @@ class End2EndSLU(FairseqTask):
 
         cc, infos = self.pad_short_sequences(corpus, my_split)
         corpus[my_split] = cc
-        length_missmatch, missmatches, max_turn_length, total = infos
+        length_missmatch, missmatches, max_turn_length, total = infos 
 
         #print('[DEBUG] dict size after: {}'.format(len(self.label_vocab)))
         #sys.stdout.flush()
@@ -1907,11 +2143,40 @@ class End2EndSLU(FairseqTask):
             print('   Done.')
             sys.stdout.flush() 
 
+        if 'train' in corpus:
+            print(' - Filtering training examples where input sequence is longer than {}'.format(self.args.max_source_positions))
+            sys.stdout.flush()
+
+            filtered = 0
+            new_split = {}
+            for did in corpus['train'].keys():
+                new_dd = []
+                for tt in corpus['train'][did]:
+                    if tt[1].size(0) <= self.args.max_source_positions:
+                        new_dd.append( tt )
+                    else:
+                        filtered += 1
+                if len(new_dd) > 0:
+                    new_split[did] = new_dd
+
+            corpus['train'] = new_split
+            print('    * Filtered {} turns.'.format(filtered))
+            sys.stdout.flush()
+
         print(' - Reorganizing {} dialog data...'.format(my_split))
         if self.args.user_only:
             print('   - Loading user turns only.') 
 
         dialogs = corpus[my_split]
+
+        # TMP for DEBUG
+        #for did in dialogs.keys():
+            #for turn in dialogs[did]:
+                #print(' * tensor size: {}'.format(turn[1].size()))
+                #sys.stdout.flush()
+                #assert turn[1].size(-1) == 1024 and len(turn[1].size()) == 2, 'Found tensor with wrong dimensions: {}'.format(turn[1].size())
+        # End of TMP for DEBUG
+
         bsz = 1
         #if my_split == 'train':
         while( bsz < self.args.max_sentences ):
@@ -1924,11 +2189,13 @@ class End2EndSLU(FairseqTask):
         print(' - Approximating batch size to {} from {}'.format(bsz, self.args.max_sentences))
         sys.stdout.flush()
         slu_mode_info = {}
-        slu_mode_info['dict'] = self.label_vocab
+        slu_mode_info['dict'] = self.label_vocab #if self.roberta is None else self.roberta.task.source_dictionary
+        slu_mode_info['roberta'] = None #self.roberta
         slu_mode_info['dialog_level_slu'] = self.args.dialog_level_slu if hasattr(self.args, 'dialog_level_slu') else False
         slu_mode_info['normalize_dialogs'] = self.args.normalize_dialog_batches if hasattr(self.args, 'normalize_dialog_batches') else False
         slu_mode_info['use_transcription'] = self.args.use_transcription_as_input if hasattr(self.args, 'use_transcription_as_input') else False
-        batch_info, batch_sizes = create_dialog_batches_(dialogs, bsz, slu_mode_info)
+        slu_mode_info['asr_slu_loss'] = self.args.asr_slu_loss if hasattr(self.args, 'asr_slu_loss') else False
+        batch_info, batch_sizes = create_dialog_batches_(dialogs, bsz, slu_mode_info) 
 
         #print('[DEBUG] batch_sizes content: {}'.format(batch_sizes))
         #tmp_lst = [len(el) for el in batch_info]
@@ -1948,112 +2215,8 @@ class End2EndSLU(FairseqTask):
             #sys.stdout.flush()
             #sys.exit(0)
 
-        sources, src_lengths, targets, tgt_lengths = split_data
-        ratios, global_turn_idx = info
-
-        '''idx_batches = []
-        ratios = []
-        sources = []
-        src_lengths = []
-        targets = []
-        tgt_lengths = []
-        global_turn_idx = 0
-        num_zeros = []
-        #for dialog_id in dialogs.keys():
-        for batch, batch_size in zip(batch_info, batch_sizes):
-            #for turn in turns:
-            batched_turns_idx = []
-            curr_turn_batch = []
-            dialog_batch_size = batch_size #bsz
-            #while len(batch) % dialog_batch_size != 0:
-            #    dialog_batch_size -= 1
-            #if dialog_batch_size == 0:
-            #    raise ValueError('FATAL ERROR: zero dialog batch size detected')
-            print('[DEBUG] End2EndSLU.load_dataset, current dialog batch size: {}, total length {}'.format(dialog_batch_size, len(batch)))
-            sys.stdout.flush()
-            for (did, idx) in batch:
-                turn = dialogs[did][idx]
-                if (my_split == 'train') or (turn[-1] == user_ID) or slu_mode_info['dialog_level_slu']:
-                    #if turn[-1] == user_ID:
-                    # if (not self.args.user_only and (my_split == 'train' or turn[-1] == user_ID)) or (self.args.user_only and turn[-1] == user_ID)
-                    feats = turn[1]
-                    feats = self.add_speaker_marker(feats, turn[-1])
-                    tmp = int((feats == 0.0).sum())
-                    if tmp > 0:
-                        num_zeros.append( tmp )
-                    sources.append( feats )
-                    src_lengths.append( feats.size(0) ) 
-
-                    print(' - End2EndSLU task data shapes:')
-                    print('   - feats shape: {}'.format(feats.size()))
-                    print('   - char seq shape: {}'.format(turn[2].size()))
-                    print('   - token seq shape: {}'.format(turn[3].size()))
-                    print('   - slu seq shape: {}'.format(turn[4].size()))
-                    print(' -----')
-                    sys.stdout.flush()
-
-                    if self.args.dialog_level_slu:
-                        curr_turn_batch.append( (global_turn_idx, turn[-1]) ) 
-                        if len(curr_turn_batch) >= dialog_batch_size:
-                            batched_turns_idx.append( curr_turn_batch )
-                            curr_turn_batch = []
-                    else:
-                        batched_turns_idx.append( (global_turn_idx, turn[-1]) )
-                    global_turn_idx += 1
-
-                        #print('[DEBUG] End2ENdSLU.load_dataset: stored batch of size {} (batch size reset to {})'.format(len(idx_batches[-1]), len(batched_turns_idx)))
-                        #sys.stdout.flush()
-
-                    if self.args.slu_subtask == 'char':
-                        targets.append( turn[2] )
-                        tgt_lengths.append( turn[2].size(0) )
-
-                        ratios.append( turn[2].size(0) / feats.size(0) )
-                        
-                    elif self.args.slu_subtask == 'token':
-                        targets.append( turn[3] )
-                        tgt_lengths.append( turn[3].size(0) )
-
-                        ratios.append( turn[3].size(0) / feats.size(0) )
-                        
-                    elif self.args.slu_subtask == 'concept':
-                        targets.append( turn[4] )
-                        tgt_lengths.append( turn[4].size(0) )
-
-                        ratios.append( turn[4].size(0) / feats.size(0) )
-
-                    else:
-                        raise NotImplementedError
-                else: 
-                    dialogs[did][idx] = None
-
-            if my_split == 'train':
-                assert len(curr_turn_batch) == 0, 'ERROR, wrong remainder size in current batch: {}. Expected 0 with batch size {} and total dialog length {}'.format(len(batched_turns_idx), dialog_batch_size, len(batch))
-            if self.args.dialog_level_slu:
-                if len(curr_turn_batch) > 0:
-                    assert len(curr_turn_batch) == bsz
-                    batched_turns_idx.append( curr_turn_batch )
-                if len(batched_turns_idx) > 0: 
-                    idx_batches.append( batched_turns_idx )
-
-                print('[DEBUG]### End2EndSLU, storing {} dialog batches of size {}'.format(len(batched_turns_idx), len(batched_turns_idx[0])))
-                print('[DEBUG]###     * type of idx_batches: {}'.format(type(idx_batches))) # Expected List
-                print('[DEBUG]###     * type of elements of idx_batches: {} (size: {})'.format(type(idx_batches[-1]), len(idx_batches[-1])))  # Expected List
-                print('[DEBUG]###     * type of elements of elements of idx_batches: {}, length {}'.format(type(idx_batches[-1][0]), len(idx_batches[-1][0])))   # Expected List
-                print('[DEBUG]###     * type of deepest elements: {}'.format(type(idx_batches[-1][0][0])))  # Expected tuple
-                sys.stdout.flush()
-            else:
-                idx_batches.append( batched_turns_idx )'''
-
-        # TMP FOR DEBUG
-        '''print('[DEBUG] *** Visualizing a sample dialog after normalization:')
-        sample_idx = 0
-        mid_idx = int(len(idx_batches)/2)
-        dialog_batch = idx_batches[mid_idx]
-        for idx, turn_batch in enumerate(dialog_batch):
-            print('[DEBUG]    {}) {}'.format(idx, self.label_vocab.string(targets[turn_batch[0][0]])))
-            sys.stdout.flush()
-        print(' -----')'''
+        ids, speakers, sources, src_lengths, targets, tgt_lengths = split_data
+        ratios, global_turn_idx = info 
 
         print(' * End2EndSLU, reorganized {} turns for split {}'.format(global_turn_idx, my_split))
         #print('   - Detected {} input tensors containing zeros: {}'.format(len(num_zeros), num_zeros))
@@ -2069,12 +2232,13 @@ class End2EndSLU(FairseqTask):
         print('     - Std of source length: {:.2f}'.format(std.item()))
         print('     - Median source length: {}'.format(median.item()))
         print('     - Max. source length: {}'.format(max_len.item()))
-        rmean = sum(ratios)/len(ratios)
-        rstd = math.sqrt( sum([(el - rmean)**2 for el in ratios]) / (len(ratios)-1) )
-        print('   * Mean target/source length ratio: {:.4f} (+/- {:.4f})'.format(rmean, rstd))
-        print('   * Max. target/source length ratio: {:.4f}'.format(max(ratios)))
-        print('   * Min. target/source length ratio: {:.4f}'.format(min(ratios)))
-        sys.stdout.flush() 
+        if len(ratios) > 1:
+            rmean = sum(ratios)/len(ratios)
+            rstd = math.sqrt( sum([(el - rmean)**2 for el in ratios]) / (len(ratios)-1) )
+            print('   * Mean target/source length ratio: {:.4f} (+/- {:.4f})'.format(rmean, rstd))
+            print('   * Max. target/source length ratio: {:.4f}'.format(max(ratios)))
+            print('   * Min. target/source length ratio: {:.4f}'.format(min(ratios)))
+            sys.stdout.flush() 
 
         # Reorganize turns based on increasing source length for curriculum learning 
         '''src_info = [(i, sources[i].size(0)) for i in range(len(sources))]
@@ -2084,7 +2248,7 @@ class End2EndSLU(FairseqTask):
         targets = [targets[t[0]] for t in sorted_structure]
         tgt_lengths = [tgt_lengths[t[0]] for t in sorted_structure]'''
         sample_source = None
-        if hasattr(self.args, 'use_transcription_as_input') and self.args.use_transcription_as_input:
+        if self.args.use_transcription_as_input or self.args.asr_slu_loss:
             found = False
             for tt in sources:
                 if tt[0] is not None:
@@ -2105,22 +2269,28 @@ class End2EndSLU(FairseqTask):
 
         self.num_features = sample_source.size(-1)
 
-        input_feed = True 
-        self.datasets[split] = End2EndSLUDataset.End2EndSLUDataset(
-            args=self.args,
-            split=split,
-            src=sources,
-            src_sizes=src_lengths,
-            tgt=targets,
-            tgt_sizes=tgt_lengths,
-            tgt_dict=self.label_vocab,
-            idx_structure=idx_batches,
-            left_pad_target=False,
-            max_source_positions=self.args.max_source_positions,
-            max_target_positions=self.args.max_target_positions, 
-            input_feeding=input_feed,
-            shuffle=True,
-        )
+        input_feed = True
+        if split != 'test' or 'train' not in self.datasets:
+            self.datasets[split] = End2EndSLUDataset.End2EndSLUDataset(
+                args=self.args,
+                split=split,
+                src=sources,
+                src_sizes=src_lengths,
+                tgt=targets,
+                tgt_sizes=tgt_lengths,
+                tgt_dict=self.label_vocab,
+                idx_structure=idx_batches,
+                left_pad_target=False,
+                max_source_positions=self.args.max_source_positions,
+                max_target_positions=self.args.max_target_positions, 
+                input_feeding=input_feed,
+                shuffle=True,
+                RoBERTa=None,
+                feature_extractor=self.fe,
+                turn_ids=ids,
+                turn_spk=speakers,
+                spk_abs_val=self.spk_abs_val,
+            )
         #self.datasets[split].set_split_id(value=split)
 
         if split == 'train' and self.args.curriculum > 0:
@@ -2135,9 +2305,23 @@ class End2EndSLU(FairseqTask):
         return (self.args.max_source_positions, self.args.max_target_positions)
 
     @property
+    def source_dictionary(self):
+        """Return the source :class:`~fairseq.data.Dictionary`."""
+        if self.args.use_transcription_as_input:
+            #if self.roberta is None:
+            return self.label_vocab
+            #else:
+            #    return self.roberta.task.source_dictionary
+        else:
+            return None
+
+    @property
     def target_dictionary(self):
         """Return the target :class:`~fairseq.data.Dictionary`."""
+        #if self.roberta is None:
         return self.label_vocab
+        #else:
+        #    return self.roberta.task.source_dictionary
 
     # We could override this method if we wanted more control over how batches
     # are constructed, but it's not necessary for this tutorial since we can
@@ -2185,7 +2369,7 @@ class End2EndSLU(FairseqTask):
         # For default fairseq task, return same iterator across epochs
         # as datasets are not dynamic, can be overridden in task specific
         # setting.
-        if dataset in self.dataset_to_epoch_iter and not self.batching_change:
+        if not self.args.model_start_point and dataset in self.dataset_to_epoch_iter and not self.batching_change:
             #print('[DEBUG] End2EndSLU.get_batch_iterator: returning buffered epoch iterator for split {} @epoch {}'.format(dataset.get_split_id(), self.curr_epoch))
             #sys.stdout.flush()
             return self.dataset_to_epoch_iter[dataset]
@@ -2205,13 +2389,15 @@ class End2EndSLU(FairseqTask):
         sys.stdout.flush()'''
 
         # filter examples that are too large
-        if max_positions is not None and not self.args.use_transcription_as_input and not self.args.dialog_level_slu and not self.args.dialog_batches: 
-            indices = data_utils.filter_by_size(
-                indices,
-                dataset,
-                max_positions,
-                raise_exception=(not ignore_invalid_inputs),
-            )
+        if max_positions is not None and not self.args.use_transcription_as_input and not self.args.dialog_level_slu and not self.args.dialog_batches:
+            if hasattr(self, 'training'):
+                #max_positions = 2000000 # NOTE: try not to skeep long sequences at validation phase
+                indices = data_utils.filter_by_size(
+                    indices,
+                    dataset,
+                    max_positions,
+                    raise_exception=(not ignore_invalid_inputs),
+                )
 
         '''print('[DEBUG] 2) End2EndSLU.get_batch_iterator, got {} size indices structure @split {}:'.format(len(indices), dataset.get_split_id()))
         print('[DEBUG]    * type of indices: {}'.format(type(indices)))

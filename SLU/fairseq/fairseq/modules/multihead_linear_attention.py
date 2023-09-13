@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+__DEBUG__ = False
+
 import sys
 
 import math
@@ -16,6 +18,8 @@ from fairseq.modules.quant_noise import quant_noise
 from torch import Tensor, nn
 from torch.nn import Parameter
 
+if __DEBUG__:
+    from fairseq import init_functions
 
 @with_incremental_state
 class MultiheadLinearAttention(nn.Module):
@@ -41,7 +45,7 @@ class MultiheadLinearAttention(nn.Module):
         q_noise=0.0,
         qn_block_size=8,
         compressed=64,
-        max_seq_len=8192,
+        max_seq_len=10000,
         shared_kv_compressed=1,
         shared_compress_layer=None,
         freeze_compress=0,
@@ -67,24 +71,43 @@ class MultiheadLinearAttention(nn.Module):
             "Self-attention requires query, key and " "value to be of the same size"
         )
 
-        self.k_proj = quant_noise(
-            nn.Linear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
-        self.v_proj = quant_noise(
-            nn.Linear(self.vdim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
-        self.q_proj = quant_noise(
-            nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
+        if __DEBUG__:
+            self.k_proj = quant_noise(
+                init_functions.TransformerLinear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+            self.v_proj = quant_noise(
+                init_functions.TransformerLinear(self.vdim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+            self.q_proj = quant_noise(
+                init_functions.TransformerLinear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+        else:
+            self.k_proj = quant_noise(
+                nn.Linear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+            self.v_proj = quant_noise(
+                nn.Linear(self.vdim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+            self.q_proj = quant_noise(
+                nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
 
         # used for compress sequence to subsequence
         if shared_compress_layer is None:
             self.compress_seq_len = max_seq_len // compressed
-            self.compress_k = nn.Linear(max_seq_len, self.compress_seq_len, bias=False)
+            if __DEBUG__:
+                self.compress_k = init_functions.TransformerLinear(max_seq_len, self.compress_seq_len, bias=False)
+            else:
+                self.compress_k = nn.Linear(max_seq_len, self.compress_seq_len, bias=False)
             if shared_kv_compressed == 0:
-                self.compress_v = nn.Linear(
-                    max_seq_len, self.compress_seq_len, bias=False
-                )
+                if __DEBUG__:
+                    self.compress_v = init_functions.TransformerLinear(
+                        max_seq_len, self.compress_seq_len, bias=False
+                    )
+                else:
+                    self.compress_v = nn.Linear(
+                        max_seq_len, self.compress_seq_len, bias=False
+                    )
             self.layerwise_sharing = False
         else:
             self.compress_k = shared_compress_layer
@@ -93,9 +116,14 @@ class MultiheadLinearAttention(nn.Module):
             self.layerwise_sharing = True
         self.shared_kv_compressed = shared_kv_compressed
 
-        self.out_proj = quant_noise(
-            nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
+        if __DEBUG__:
+            self.out_proj = quant_noise(
+                init_functions.TransformerLinear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+        else:
+            self.out_proj = quant_noise(
+                nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
 
         if add_bias_kv:
             self.bias_k = Parameter(torch.Tensor(1, 1, embed_dim))

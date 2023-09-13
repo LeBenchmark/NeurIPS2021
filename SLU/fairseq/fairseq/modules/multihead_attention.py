@@ -3,6 +3,9 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+__DEBUG__ = False
+
+import sys
 import math
 from typing import Dict, Optional, Tuple
 
@@ -13,6 +16,8 @@ from torch import Tensor, nn
 from torch.nn import Parameter
 from fairseq.incremental_decoding_utils import with_incremental_state
 
+if __DEBUG__:
+    from fairseq import init_functions
 
 @with_incremental_state
 class MultiheadAttention(nn.Module):
@@ -55,11 +60,16 @@ class MultiheadAttention(nn.Module):
             "Self-attention requires query, key and " "value to be of the same size"
         )
 
-        self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        if __DEBUG__:
+            self.k_proj = init_functions.TransformerLinear(self.kdim, embed_dim, bias=bias)
+            self.v_proj = init_functions.TransformerLinear(self.vdim, embed_dim, bias=bias)
+            self.q_proj = init_functions.TransformerLinear(embed_dim, embed_dim, bias=bias)
+            self.out_proj = init_functions.TransformerLinear(embed_dim, embed_dim, bias=bias)
+        else:
+            self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias)
+            self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias)
+            self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+            self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
         if add_bias_kv:
             self.bias_k = Parameter(torch.Tensor(1, 1, embed_dim))
@@ -146,6 +156,10 @@ class MultiheadAttention(nn.Module):
             and not static_kv
         ):
             assert key is not None and value is not None
+
+            #print('[DEBUG] * MultiHeadAttention, computing F.mha!')
+            #sys.stdout.flush()
+
             return F.multi_head_attention_forward(
                 query,
                 key,
@@ -170,6 +184,13 @@ class MultiheadAttention(nn.Module):
                 v_proj_weight=self.v_proj.weight,
             )
 
+        #print('[DEBUG]  * MultiheadAttention:')
+        #print('[DEBUG]    - query shape: {}'.format(query.size()))
+        #print('[DEBUG]    - key shape: {}'.format(key.size()))
+        #print('[DEBUG]    - value shape: {}'.format(value.size()))
+        #print('[DEBUG]   ----------')
+        #sys.stdout.flush()
+
         if incremental_state is not None:
             saved_state = self._get_input_buffer(incremental_state)
             if saved_state is not None and "prev_key" in saved_state:
@@ -182,21 +203,37 @@ class MultiheadAttention(nn.Module):
             saved_state = None
 
         if self.self_attention:
+            #print('[DEBUG]  * computing self attention !')
+            #sys.stdout.flush()
+
             q = self.q_proj(query)
             k = self.k_proj(query)
             v = self.v_proj(query)
         elif self.encoder_decoder_attention:
             # encoder-decoder attention
+
+            #print('[DEBUG]  * computing encoder-decoder attention !')
+            #sys.stdout.flush()
+
             q = self.q_proj(query)
             if key is None:
                 assert value is None
                 k = v = None
             else:
+                #print('[DEBUG]  * k_proj shape: {}'.format(self.k_proj.weight.size()))
+                #print('[DEBUG]  * v_proj shape: {}'.format(self.v_proj.weight.size()))
+                #print('[DEBUG]  * key shape: {}'.format(key.size()))
+                #sys.stdout.flush()
+
                 k = self.k_proj(key)
                 v = self.v_proj(key)
 
         else:
             assert key is not None and value is not None
+
+            #print('[DEBUG]  * computing query-key-value attention!')
+            #sys.stdout.flush()
+
             q = self.q_proj(query)
             k = self.k_proj(key)
             v = self.v_proj(value)
@@ -261,6 +298,15 @@ class MultiheadAttention(nn.Module):
             if "prev_key_padding_mask" in saved_state:
                 prev_key_padding_mask = saved_state["prev_key_padding_mask"]
             assert k is not None and v is not None
+
+            #print('[DEBUG] MHA:')
+            #print('[DEBUG] * key_padding_mask shape: {}'.format(key_padding_mask.size() if key_padding_mask is not None else None))
+            #print('[DEBUG] * prev_key_padding_mask shape: {}'.format(prev_key_padding_mask.size() if prev_key_padding_mask is not None else None))
+            #print('[DEBUG] * batch size: {}'.format(bsz))
+            #print('[DEBUG] * src_len: {}'.format(k.size(1)))
+            #print('[DEBUG] ==========')
+            #sys.stdout.flush()
+
             key_padding_mask = MultiheadAttention._append_prev_key_padding_mask(
                 key_padding_mask=key_padding_mask,
                 prev_key_padding_mask=prev_key_padding_mask,

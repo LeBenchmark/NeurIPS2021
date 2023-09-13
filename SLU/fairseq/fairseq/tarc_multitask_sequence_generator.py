@@ -130,7 +130,7 @@ class TarcSequenceGenerator(object):
             char_src_tokens = [char_src_tokens]
 
         toks_src_lengths = (toks_src_tokens[0].ne(self.eos) & toks_src_tokens[0].ne(self.pad)).long().sum(dim=1)
-        char_src_lengths = (char_src_tokens[0].ne(self.eos) & char_src_tokens[0].ne(self.pad)).long().sum(dim=1)
+        char_src_lengths = (char_src_tokens[0].ne(self.eos) & char_src_tokens[0].ne(self.pad)).long().sum(dim=1) if char_flag else None
         src_lengths = char_src_lengths if char_flag else toks_src_lengths
 
         input_size = toks_src_tokens[0].size() if not char_flag else char_src_tokens[0].size()

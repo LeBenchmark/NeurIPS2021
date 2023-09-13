@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fairseq import options, utils
+from fairseq.globals import *
 from fairseq.models import (
     FairseqEncoder,
     FairseqEncoderDecoderModel,
@@ -516,30 +517,37 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
             (default: False).
     """
 
-    def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
+    def __init__(self, args, dictionary, embed_tokens, 
+            no_encoder_attn=False,
+            RoBERTa=False,
+            blank=0,
+            encoder_output_units=512,
+        ):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
 
+        self.args = args
         self.dropout = args.dropout
         self.decoder_layerdrop = args.decoder_layerdrop
         self.share_input_output_embed = args.share_decoder_input_output_embed
-
-        print(' - CTCTransformerDecoder, dropout {}'.format(self.dropout))
-        print(' - CTCTransformerDecoder, decoder_layer_dropout {}'.format(self.decoder_layerdrop))
-        sys.stdout.flush()
 
         input_embed_dim = embed_tokens.embedding_dim
         embed_dim = args.decoder_embed_dim
         self.embed_dim = embed_dim
         self.output_embed_dim = args.decoder_output_dim
 
-        self.padding_idx = embed_tokens.padding_idx
-        self.blank_idx = dictionary.set_blank()     # NOTE: Added specifically for the CTCTransformerDecoder: it masks also blanks in the self-attention
+        self.padding_idx = dictionary.pad()
+        self.blank_idx = blank
+        self.bogus_idx = dictionary.index(bogus_token)
+        self.eod_idx = dictionary.index(EOD_tag)
+        self.eod_flag = False
         self.max_target_positions = args.max_target_positions
+        self.use_dhistory = False
+        self.roberta_flag = RoBERTa
+        self.encoder_output_units = encoder_output_units
 
         self.embed_tokens = embed_tokens
-
         self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
 
         self.project_in_dim = (
@@ -563,6 +571,8 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
         self.layer_wise_attention = getattr(args, "layer_wise_attention", False)
 
         self.layers = nn.ModuleList([])
+        orig_enc_embed_dim = args.encoder_embed_dim
+        args.encoder_embed_dim = encoder_output_units
         self.layers.extend(
             [
                 TransformerDecoderLayer(args, no_encoder_attn)
@@ -570,6 +580,7 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
             ]
         )
         self.num_layers = len(self.layers)
+        args.encoder_embed_dim = orig_enc_embed_dim
 
         self.adaptive_softmax = None
 
@@ -579,10 +590,11 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
             else None
         )
 
-        print(' - CTCTransformerDecoder, adaptive_softmax_dropout {}'.format(args.adaptive_softmax_dropout))
-        sys.stdout.flush()
-
         if args.adaptive_softmax_cutoff is not None:
+
+            #print('[DEBUG] CTCTransformerDecoder, using adaptive softmax')
+            #sys.stdout.flush()
+
             self.adaptive_softmax = AdaptiveSoftmax(
                 len(dictionary),
                 self.output_embed_dim,
@@ -593,6 +605,10 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
                 tie_proj=args.tie_adaptive_proj,
             )
         elif not self.share_input_output_embed:
+
+            #print('[DEBUG] CTCTransformerDecoder, using linear output layer')
+            #sys.stdout.flush()
+
             self.embed_out = nn.Parameter(
                 torch.Tensor(len(dictionary), self.output_embed_dim)
             )
@@ -652,18 +668,20 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
         if not features_only:
             x = self.output_layer(x)
 
-        if not self.training:
-            print(' - CTCTransformer, prev_output_tokens:')
-            print(prev_output_tokens)
-            print(' ----------')
-            scores = F.log_softmax(x, -1)
-            _, pred = torch.max(scores, -1)
-            print(' - CTCTransformer, predictions:')
-            print(pred)
-            print(' ====================')
-            sys.stdout.flush()
+        #scores = F.log_softmax(x, -1)
+        #sc, pred = torch.max(scores, -1)
+        #pred_string = self.dictionary.string( pred[0,:] )
+        #if pred[0,0] == self.dictionary.bos():
+        #    pred_string = '<bos> ' + pred_string
+        #print('[DEBUG] CTCTransformerDecoder, predictions[0]: {}'.format( pred_string ))
+        #sys.stdout.flush()
 
-        return x, extra
+        if self.args.asr_slu_loss:
+            asr_out = encoder_out.encoder_out
+            asr_out = self.output_layer(asr_out)
+            return x, {'extra': extra, 'asr_in': encoder_out.trs_idx, 'asr_in_len': encoder_out.trs_idx_len, 'asr_out': asr_out}
+        else:
+            return x, extra
 
     def extract_features(
         self,
@@ -694,28 +712,8 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
                 - a dictionary with any model-specific outputs
         """
 
-        # TMP FOR MY MODEL'S DEBUGGING
-        #incremental_state = None
-
-        '''print(' - iTransformer, original prev_output_tokens shape: {}'.format(prev_output_tokens.size()))
-        print('   * prev_output_tokens:')
-        print(' **********')
-        print(prev_output_tokens)
-        sys.stdout.flush()'''
-
-        bsz, tgtlen = prev_output_tokens.size()
-        if encoder_out is not None:
-            srclen = encoder_out.encoder_out.size(0)
-        else:
-            srclen = tgtlen
-        #factor = float(tgtlen) / float(srclen)
-        idxs = [int(i * (float(tgtlen) / float(srclen))) for i in range(srclen)]
-        prev_output_tokens = prev_output_tokens[:,idxs]
-
-        '''print(' - iTransformer, source-size expanded prev_output_tokens shape: {}'.format(prev_output_tokens.size()))
-        print('   * prev_output_tokens:')
-        print(prev_output_tokens)
-        sys.stdout.flush()'''
+        trs_x = encoder_out.trs_out
+        trs_mask = encoder_out.trs_mask
 
         if alignment_layer is None:
             alignment_layer = self.num_layers - 1
@@ -729,15 +727,20 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
             else None
         )
 
+        bs, slen = prev_output_tokens.size ()
+        if encoder_out is not None:
+            srclen = encoder_out.encoder_out.size(0)
+        else:
+            srclen = slen
+        factor = float(slen) / float(srclen)
+        idxs = [int(i * factor) for i in range(srclen)]
+        prev_output_tokens = prev_output_tokens[:,idxs]
+        positions = positions[:, idxs] if positions is not None else None
+
         if incremental_state is not None:
             prev_output_tokens = prev_output_tokens[:, -1:]
             if positions is not None:
                 positions = positions[:, -1:]
-
-        # embed tokens and positions
-        #print(' * TransformerDecoder, prev_output_tokens shape: {}'.format(prev_output_tokens.size()))
-        #print(' * TransformerDecoder, prev_output_tokens: {}'.format(prev_output_tokens))
-        #sys.stdout.flush()
 
         x = self.embed_scale * self.embed_tokens(prev_output_tokens)
 
@@ -755,14 +758,21 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
-        #print(' * TransformerDecoder, decoder embedding size: {}'.format(x.size()))
-
         self_attn_padding_mask: Optional[Tensor] = None
-        if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
-            self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
-        # NOTE: The following statements differentiate the original decoder from the CTC decoder: blank tokens are masked too
-        if self_attn_padding_mask is not None:
-            self_attn_padding_mask[prev_output_tokens == self.blank_idx] = True
+        #if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
+        self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
+        # NOTE: The following statements differentiate the original decoder from the CTC decoder: blank tokens are masked too 
+        self_attn_padding_mask[prev_output_tokens == self.blank_idx] = True 
+
+        #prev_string = self.dictionary.string( prev_output_tokens[0,:] )
+        #if self.training and prev_output_tokens[0,1] == self.dictionary.bos():
+        #    prev_string = '<bos> ' + prev_string
+        #if prev_output_tokens[0,0] == self.dictionary.eos():
+        #    prev_string = '<eos> ' + prev_string
+        #if prev_output_tokens[0,0] == self.dictionary.bos():
+        #    prev_string = '<bos> ' + prev_string
+        #print('[DEBUG] CTCTransformerDecoder, prev_output_tokens[0]: {}'.format( prev_string ))
+        #sys.stdout.flush()
 
         # decoder layers
         attn: Optional[Tensor] = None
@@ -780,13 +790,16 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
             else:
-                self_attn_mask = None
-
-            #print(' * TransformerDecoder, encoder output size: {}'.format(encoder_state.size()))
+                self_attn_mask = None 
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = torch.empty(1).uniform_()
             if not self.training or (dropout_probability > self.decoder_layerdrop):
+
+                #print('[DEBUG] CTCTransformerDecoder, encoder_state shape: {}'.format(encoder_state.size()))
+                #print('[DEBUG]    * encoder_padding_mask is None ? {}'.format(encoder_out.encoder_padding_mask is None))
+                #sys.stdout.flush()
+
                 x, layer_attn, _ = layer(
                     x,
                     encoder_state,
@@ -803,6 +816,10 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
                 if layer_attn is not None and idx == alignment_layer:
                     attn = layer_attn.float().to(x)
 
+        #print('[DEBUG] CTCTransformerDecoder: SO FAR SO GOOD!')
+        #sys.stdout.flush()
+        #sys.exit(0)
+
         if attn is not None:
             if alignment_heads is not None:
                 attn = attn[:alignment_heads]
@@ -813,14 +830,8 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
         if self.layer_norm is not None:
             x = self.layer_norm(x)
 
-        '''print(' - iTransformer, final features shape: {}'.format(x.size()))
-        print(' ---------------')
-        sys.stdout.flush()'''
-
         # T x B x C -> B x T x C
         x = x.transpose(0, 1)
-
-        #print(' * TransformerDecoder, output size: {}'.format(x.size()))
 
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
@@ -832,10 +843,22 @@ class CTCTransformerDecoder(FairseqIncrementalDecoder):
         if self.adaptive_softmax is None:
             # project back to size of vocabulary
             if self.share_input_output_embed:
+
+                #print('[DEBUG] CTCTransformerDecoder.output_layer, using embedding weights as output layer')
+                #sys.stdout.flush()
+
                 return F.linear(features, self.embed_tokens.weight)
             else:
+
+                #print('[DEBUG] CTCTransformerDecoder.output_layer, using linear output layer')
+                #sys.stdout.flush()
+
                 return F.linear(features, self.embed_out)
         else:
+
+            #print('[DEBUG] CTCTransformerDecoder.output_layer, no feature transformation applied')
+            #sys.stdout.flush()
+
             return features
 
     def max_positions(self):
