@@ -21,7 +21,7 @@ grep "^P\-" ${model_output} > ${model_output}.scores
 # --clean-hyp removes blanks and duplicate tokens generated when training with CTC loss.
 # Remove this option if you trained the model with another loss (e.g. cross entropy)
 # --slu-out keeps only concepts from the raw output. Use this option if you want to score the model with Concept Error Rate (CER)
-python ${script_path}/compute_error_rate.py ${aux_opt} --clean-hyp --ref ${model_output}.ref --hyp ${model_output}.hyp --slu-scores ${model_output}.scores
+python ${script_path}/compute_error_rate.py ${aux_opt} --ref ${model_output}.ref --hyp ${model_output}.hyp --slu-scores ${model_output}.scores
 
 deactivate
 
